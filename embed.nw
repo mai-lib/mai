@@ -1,0 +1,363 @@
+/*@
+\chapter{Embedding}
+\label{embed}
+
+Besides the executable (\autoref{main}), the system can be built as a
+library, [[libmai]], so that other programs (an R package, a Python
+module, a notebook kernel) can run mai code in their own process. The
+library is every object file except [[main.o]], plus the small layer
+described here. Its interface is [[mai.h]], which uses only C types, so
+that a host need not see any of the compiler's or run-time's headers.
+
+There is a single interpreter per process: the global environment, the
+garbage collector and the VM stack are all process-wide, and none of it
+is safe to use from more than one thread at a time.
+
+==mai.h*/
+#ifndef MAI_H
+#define MAI_H
+//MAI_EXPORT//
+//mai status//
+//mai_type_t//
+//mai_value_t//
+//mai prototypes//
+#endif
+/*@
+
+The library is compiled with hidden symbol visibility, so that its many
+internal names cannot clash with a host's. Only the functions declared
+here are exported.
+
+==MAI_EXPORT*/
+#define MAI_EXPORT __attribute__((visibility("default")))
+/*@
+
+Every function that can fail returns one of these codes.
+
+==mai status*/
+enum
+{
+    MAI_OK = 0,     // success
+    MAI_EPARSE = 1, // syntax or compile error
+    MAI_ERUN = 2,   // run-time error
+    MAI_EARG = 3    // bad argument, unknown or incompatible global
+};
+/*@
+
+Values cross the interface as flat buffers of one of mai's three
+primitive element types. Anything else (a closure, a list of objects) is
+reported as [[MAI_OTHER]].
+
+==mai_type_t*/
+typedef enum
+{
+    MAI_NONE, MAI_BOOLEAN, MAI_INT, MAI_DOUBLE, MAI_OTHER
+} mai_type_t;
+/*@
+
+A [[mai_value_t]] describes a scalar ([[rank]] 0), a vector ([[rank]]
+1) or an array. Array elements are stored in column-major order, as in
+R. [[data]] is a boolean as one byte, an int as 32 bits, or a double.
+
+==mai_value_t*/
+typedef struct
+{
+    mai_type_t type;
+    int length;         // number of elements
+    int rank;           // 0 scalar, 1 vector, 2 or more array
+    const int *shape;   // rank extents; NULL unless rank >= 2
+    void *data;         // the elements
+} mai_value_t;
+/*@
+
+==mai prototypes*/
+MAI_EXPORT void mai_init(void);
+MAI_EXPORT void mai_fini(void);
+MAI_EXPORT int mai_eval(const char *code, char **out);
+MAI_EXPORT int mai_get(const char *name, mai_value_t *val);
+MAI_EXPORT int mai_set(const char *name, const mai_value_t *val);
+MAI_EXPORT void mai_free(void *ptr);
+/*@
+
+\section{Implementation}
+
+==embed.c*/
+//embed includes//
+//embed stack//
+//embed source//
+//mai_init//
+//mai_fini//
+//mai_eval//
+//mai_type_of//
+//mai_get//
+//mai_set//
+//mai_free//
+/*@
+
+==embed includes*/
+#include "global.h"
+#include "ir.h"
+#include "ast.h"
+#include "mai.h"
+#include <errno.h>
+/*@
+
+The executable keeps its VM stack in [[main.c]]; the library has its
+own.
+
+==embed stack*/
+static uint8_t embed_stack[65536];
+static bool embed_ready;
+/*@
+
+The [[source]] built-in calls back into whatever program it is linked
+into. The executable defines it in \autoref{main}; this is the same
+function for the library.
+
+==embed source*/
+rclosure_t *source(char *filename)
+{
+    int r;
+    rclosure_t *cl = NULL;
+    ast_t ast;
+
+    c_begin();
+    r = p_source(filename, &ast);
+    if(r == 0)
+        cl = compile(&ast, filename);
+    else if(r < 0)
+        c_error("sourcing %s - %s", filename, strerror(errno));
+    c_end();
+    return cl;
+}
+/*@
+
+Initialisation may be requested more than once, for the convenience of
+hosts that cannot easily tell whether it has happened.
+
+==mai_init*/
+void mai_init(void)
+{
+    if(embed_ready)
+        return;
+    runtime_init();
+    embed_ready = true;
+}
+/*@
+
+==mai_fini*/
+void mai_fini(void)
+{
+    if(!embed_ready)
+        return;
+    runtime_fini();
+    embed_ready = false;
+}
+/*@
+
+[[mai_eval]] parses, compiles and runs [[code]] at top level, as if it
+had been typed at the REPL, so definitions persist from one call to the
+next. If [[out]] is not [[NULL]] it receives a string, to be released
+with [[mai_free]]: the printed value of the last expression on success,
+or the error messages. Compiler messages are diverted into the same
+string through [[c_msgfp]]. Output from [[print]] and friends still goes
+to the process's standard output.
+
+==mai_eval*/
+int mai_eval(const char *code, char **out)
+{
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *os = open_memstream(&buf, &len);
+    rclosure_t *cl = NULL;
+    vm_ctx_t ctx;
+    ast_t ast;
+    int status;
+
+    if(!code || !os)
+    {
+        if(os)
+            fclose(os);
+        free(buf);
+        return MAI_EARG;
+    }
+    mai_init();
+    c_msgfp = os;
+    c_begin();
+    if(p_string(code, &ast) == 0)
+        cl = compile(&ast, "<embed>");
+    c_end();
+    c_msgfp = NULL;
+    if(!cl)
+        status = MAI_EPARSE;
+    else
+    {
+        vm_init_ctx(&ctx, embed_stack, sizeof(embed_stack));
+        gc_set_enabled(true);
+        status = vm_execute(&ctx, cl) == 0 ? MAI_OK : MAI_ERUN;
+        gc_set_enabled(false);
+        vm_fini_ctx(&ctx);
+        if(ctx.err_msg)
+        {
+            fputs(ctx.err_msg, os);
+            xfree(ctx.err_msg);
+            status = MAI_ERUN;
+        }
+        else if(status == MAI_OK)
+            r_print(os, ctx.ret_val);
+    }
+    fclose(os);
+    if(out)
+        *out = buf;
+    else
+        free(buf);
+    return status;
+}
+/*@
+
+Element types map one to one.
+
+==mai_type_of*/
+static mai_type_t mai_type_of(rtype_t *typ)
+{
+    if(typ == r_type_boolean)
+        return MAI_BOOLEAN;
+    if(typ == r_type_int)
+        return MAI_INT;
+    if(typ == r_type_double)
+        return MAI_DOUBLE;
+    return MAI_OTHER;
+}
+static rtype_t *mai_rtype(mai_type_t type)
+{
+    switch(type)
+    {
+    case MAI_BOOLEAN: return r_type_boolean;
+    case MAI_INT: return r_type_int;
+    case MAI_DOUBLE: return r_type_double;
+    default: return NULL;
+    }
+}
+/*@
+
+[[mai_get]] describes the value of a global without copying it. A global
+declared with a scalar type holds its value directly; any other holds an
+object, which may be a boxed scalar, a vector or an array. The buffer
+belongs to mai, and is only valid until the next call to [[mai_eval]] or
+[[mai_set]], since either may let the collector reclaim it.
+
+==mai_get*/
+int mai_get(const char *name, mai_value_t *val)
+{
+    rglobal_t *g;
+    robject_t *obj;
+    rtype_t *typ;
+
+    if(!name || !val || !embed_ready)
+        return MAI_EARG;
+    g = r_get_global(r_intern(name));
+    if(!g)
+        return MAI_EARG;
+    *val = (mai_value_t) { .type = MAI_OTHER };
+    if(g->decl && rtype_is_scalar(g->decl))
+    {
+        *val = (mai_value_t) { mai_type_of(g->decl), 1, 0, NULL, &g->val };
+        return MAI_OK;
+    }
+    obj = g->val.object;
+    typ = r_typeof(obj);
+    if(rtype_is_scalar(typ))
+        *val = (mai_value_t) { mai_type_of(typ), 1, 0, NULL, BOXPTR(obj) };
+    else if(rtype_is_vector(typ))
+    {
+        rvector_t *vec = (rvector_t *)obj;
+        *val = (mai_value_t) { mai_type_of(typ->elt), rvec_len(vec), 1,
+                               NULL, rvec_elts(vec) };
+    }
+    else if(rtype_is_array(typ))
+    {
+        rarray_t *arr = (rarray_t *)obj;
+        *val = (mai_value_t) { mai_type_of(typ->elt), arr->buf.length,
+                               arr->rank, arr->shape, arr->buf.elts };
+    }
+    if(val->type == MAI_OTHER)
+        val->data = NULL;
+    return MAI_OK;
+}
+/*@
+
+[[mai_set]] copies a host buffer into a global, creating the global if
+need be. A [[const]] global cannot be changed. A global declared with a
+type keeps it: a scalar declaration takes only a scalar of that type,
+and a container declaration only a value of the same container type.
+
+==mai_set*/
+int mai_set(const char *name, const mai_value_t *val)
+{
+    rtype_t *etyp, *typ;
+    robject_t *obj;
+    rglobal_t *g;
+    rsymbol_t *sym;
+
+    if(!name || !val || !embed_ready || !(etyp = mai_rtype(val->type)))
+        return MAI_EARG;
+    if(val->rank < 0 || val->length < 0 || (val->length && !val->data))
+        return MAI_EARG;
+    if(val->rank >= 2)
+    {
+        long n = 1;
+        if(!val->shape)
+            return MAI_EARG;
+        for(int i = 0; i < val->rank; i++)
+            n *= val->shape[i];
+        if(n != val->length)
+            return MAI_EARG;
+    }
+    else if(val->rank == 0 && val->length != 1)
+        return MAI_EARG;
+    sym = r_intern(name);
+    g = r_get_global(sym);
+    if(g && g->is_const)
+        return MAI_EARG;
+    if(g && g->decl && rtype_is_scalar(g->decl))
+    {
+        if(val->rank != 0 || g->decl != etyp)
+            return MAI_EARG;
+        memcpy(&g->val, val->data, rtype_eltsz(etyp));
+        return MAI_OK;
+    }
+    if(val->rank == 0)
+    {
+        obj = r_box(etyp, val->data);
+        typ = etyp;
+    }
+    else if(val->rank == 1)
+    {
+        typ = rvec_type_create(etyp);
+        rvector_t *vec = rvec_create(typ, val->length);
+        memcpy(rvec_elts(vec), val->data, val->length * rtype_eltsz(etyp));
+        obj = (robject_t *)vec;
+    }
+    else
+    {
+        typ = rarr_type_create(etyp);
+        rarray_t *arr = rarr_create(typ, val->rank, (int *)val->shape);
+        memcpy(arr->buf.elts, val->data, val->length * rtype_eltsz(etyp));
+        obj = (robject_t *)arr;
+    }
+    if(g && g->decl && g->decl != r_type_object && g->decl != typ)
+        return MAI_EARG;
+    if(!g)
+        g = r_create_global(sym, r_type_object, false);
+    g->val.object = obj;
+    return MAI_OK;
+}
+/*@
+
+==mai_free*/
+void mai_free(void *ptr)
+{
+    free(ptr);
+}
+/*@
+%*/

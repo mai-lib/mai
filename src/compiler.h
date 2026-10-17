@@ -19,5 +19,6 @@ rclosure_t *compile(ast_t *ast, char *name);
 void *c_intern(void *ptr);
 void c_begin();
 void c_end();
+extern FILE *c_msgfp;
 void c_messages(int level);
 void c_message_va(cmsglevel lvl, rsymbol_t *file, char *fmt, ...);

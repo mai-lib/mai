@@ -21,9 +21,12 @@ CMATH := $(CMATH) -fno-signed-zeros -fassociative-math
 ifdef DEBUG
 CDEBUG := -Og -g3 -ggdb -UNDEBUG -fstrict-aliasing
 endif
+# mai: -fPIC so that the same objects also make up build/libmai.so, which
+# exports only the functions in mai.h (internal names like `source` or
+# `compile` would otherwise clash with a host's)
 override CFLAGS := -std=c11 -fno-common $(CTUNE) $(CMATH) \
 	-I$(srcdir) -O3 -DNDEBUG $(CDEBUG) -Wall -Wstrict-aliasing -Winline \
-	-D_GNU_SOURCE $(CFLAGS)
+	-D_GNU_SOURCE -fPIC -fvisibility=hidden $(CFLAGS)
 #  -minline-all-stringops rubs valgrind the wrong way
 override LDFLAGS := -ggdb $(LDFLAGS)
 override LDLIBS := -lm -lreadline $(LDLIBS)

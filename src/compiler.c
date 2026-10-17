@@ -11,6 +11,7 @@ void *c_intern(void *ptr)
         gc_release(ptr);
     return obj;
 }
+FILE *c_msgfp;
 void c_messages(int level)
 {
     if(c_msgs)
@@ -21,7 +22,7 @@ void c_messages(int level)
         slist_foreach_safe(c_msgs, msg, tmp, next)
         {
             if(msg->level <= level)
-                fprintf(stderr, "%s: %s\n", lvlnames[msg->level], msg->string);
+                fprintf(c_msgfp ? c_msgfp : stderr, "%s: %s\n", lvlnames[msg->level], msg->string);
             xfree(msg->string);
             xfree(msg);
         }
