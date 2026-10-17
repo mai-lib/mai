@@ -1,0 +1,52 @@
+site_name: mai
+site_description: A compiled language for statistical computing
+site_url: https://mai-lib.github.io/mai/
+repo_url: https://github.com/mai-lib/mai
+repo_name: mai-lib/mai
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site
+strict: true
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.footer
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+nav:
+  - Home: README.md
+  - Getting started: getting-started.md
+  - Language guide: language-guide.md
+  - Differences from R: differences-from-r.md
+  - Built-in functions: builtins.md
+  - Performance: performance.md
+  - Internals: internals.md
+
+markdown_extensions:
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+
+hooks:
+  - .github/mkdocs_hooks.py
+
+# The docs link to ../examples and ../bench, which live outside docs/.
+# The hook rewrites those links to point at the files on GitHub.
+validation:
+  links:
+    unrecognized_links: ignore

@@ -1,2 +1,4 @@
 build/
 tests/io-tmp-*
+site/
+__pycache__/
