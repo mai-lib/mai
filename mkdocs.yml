@@ -32,7 +32,11 @@ nav:
   - Language guide: language-guide.md
   - Differences from R: differences-from-r.md
   - Built-in functions: builtins.md
+  - Worked examples: examples.md
   - Performance: performance.md
+  - Embedding: embedding.md
+  - Python (pymai): https://github.com/mai-lib/mai/tree/main/python
+  - R (rmai): https://mai-lib.github.io/rmai/
   - Internals: internals.md
 
 markdown_extensions:

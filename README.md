@@ -1,5 +1,8 @@
 # mai
 
+[![CI](https://github.com/mai-lib/mai/actions/workflows/ci.yml/badge.svg)](https://github.com/mai-lib/mai/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-mai--lib.github.io%2Fmai-blue)](https://mai-lib.github.io/mai/)
+
 **mai** is a compiled language for statistical computing. It looks a lot like R,
 but it is designed so that an optimising compiler can make ordinary loop-heavy
 code fast.
@@ -67,7 +70,7 @@ build/main               # start the interactive REPL
 To run mai from another program, `make lib` builds `build/libmai.so` and
 `build/libmai.a`; see [Embedding](docs/embedding.md). From Python,
 `pip install ./python` gives you the [pymai](python/README.md) package and a
-`%%mai` Jupyter cell magic.
+`%%mai` Jupyter cell magic. From R, use [rmai](https://github.com/mai-lib/rmai).
 
 When it starts without a file, the REPL loads `~/.maininit` if it exists
 (override this with the `INITFILE` environment variable).
@@ -96,7 +99,8 @@ Some differences from R that catch you out early:
 - `for` loops are C-style: `for(i = 1; i <= n; i = i + 1)`;
 - arguments are evaluated eagerly (no lazy evaluation or `substitute`).
 
-See the [documentation](docs/README.md) for a full guide, a
+See the [documentation](https://mai-lib.github.io/mai/) (also readable
+[here in `docs/`](docs/README.md)) for a full guide, a
 [differences from R](docs/differences-from-r.md) table and a
 [built-in function reference](docs/builtins.md). There are
 [worked examples](examples) in `examples/`, and the thesis's own in `src/*.src`.
