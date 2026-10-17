@@ -1,0 +1,15 @@
+4
+vector(boolean) [4]
+[1] false  true false false
+1.0
+true
+5
+vector(int) [5]
+[1] 1 2 3 4 5
+2
+vector(boolean) [2]
+[1]  true false
+4
+2.0
+
+read_vec: size of `io-tmp-i.bin` is not a whole number of elements.
