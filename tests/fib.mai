@@ -1,0 +1,11 @@
+# Fibonacci examples from section 1.2 of the thesis
+const fib_rec = function(n)
+    if(n <= 2) 1 else fib_rec(n - 2) + fib_rec(n - 1)
+const fib.arith = function(n) {
+    var sqrt5 = sqrt(5.0),
+        phi = (1 + sqrt5) / 2
+    as_int((phi ^ n - (1 - phi) ^ n) / sqrt5)
+}
+print(fib_rec(25))
+print(fib.arith(32))
+print(fib.arith(1:12))

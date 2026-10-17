@@ -1,0 +1,16 @@
+# element-wise arithmetic, comparison and reduction
+x = 1:10
+print(x * 2.5)
+print(x > 5)
+print(sum(x))
+print(length(x))
+print(x[3])
+y = dbl(3)
+y[2] = 4.5
+print(y)
+v = vec(a = 1, b = 2)
+print(v)
+print(typeof(1))
+print(typeof(1.0))
+print(typeof(1:3))
+print(true || false)

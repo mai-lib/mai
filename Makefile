@@ -15,7 +15,7 @@ DOC ?= final
 # XXX could remove this, at the cost of lifting the includes and build target above all
 .DEFAULT_GOAL := build
 
-.PHONY: all doc build $(admin)
+.PHONY: all doc build check $(admin)
 .SECONDARY: $(out).bbl
 
 all: build doc
@@ -103,6 +103,10 @@ endif
 # extract sources and run build
 build: $(sources)
 	$(MAKE) -f Build.mk
+
+# mai: run the smoke tests in tests/
+check: build
+	./tests/run.sh $(builddir)/main
 
 # bootstrap sources from a designated file
 #bootsrcs := (shell $(call nwchunks,$(boot)))

@@ -3,11 +3,17 @@
 #ifeq "$(shell hostname)" "charon"
 #CTUNE := -march=core2 -mtune=generic
 #else
-CTUNE := -march=native -mtune=native
+# mai: CTUNE may be overridden, e.g. `make CTUNE=` for a portable binary
+# (as CI does); the default tunes for the build machine as the thesis did.
+CTUNE ?= -march=native -mtune=native
 #endif
 
 # we don't use fp exceptions or errno, so don't ask for them. also, vectorize.
-CMATH := -fno-signaling-nans -fno-trapping-math -fno-math-errno -mfpmath=sse
+CMATH := -fno-signaling-nans -fno-trapping-math -fno-math-errno
+# mai: -mfpmath=sse is only meaningful (and accepted) on x86
+ifneq (,$(filter x86_64 i%86 amd64,$(shell uname -m)))
+CMATH := $(CMATH) -mfpmath=sse
+endif
 # we don't consider zero signed, and associativity is specified at the interpreter level.
 CMATH := $(CMATH) -fno-signed-zeros -fassociative-math
 
