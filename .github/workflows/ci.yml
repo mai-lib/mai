@@ -35,3 +35,22 @@ jobs:
 
       - name: Embedding library
         run: make lib CTUNE= && ./tests/embed/run.sh build
+
+  python:
+    name: python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y bison m4 libreadline-dev valgrind
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pymai
+        run: pip install './python[test]'
+
+      - name: Tests
+        run: pytest python/tests

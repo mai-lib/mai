@@ -65,7 +65,9 @@ build/main               # start the interactive REPL
 ```
 
 To run mai from another program, `make lib` builds `build/libmai.so` and
-`build/libmai.a`; see [Embedding](docs/embedding.md).
+`build/libmai.a`; see [Embedding](docs/embedding.md). From Python,
+`pip install ./python` gives you the [pymai](python/README.md) package and a
+`%%mai` Jupyter cell magic.
 
 When it starts without a file, the REPL loads `~/.maininit` if it exists
 (override this with the `INITFILE` environment variable).
@@ -120,6 +122,7 @@ numbers.
 | `examples/` | worked examples, each with its expected output (also run by `make check`) |
 | `docs/` | the documentation |
 | `bench/` | benchmarks against R |
+| `python/` | the pymai Python package |
 | `README` | the original build notes |
 
 The first commit on `main` is the thesis tarball, unmodified. Every change
