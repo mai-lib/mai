@@ -58,6 +58,17 @@ vectors and arrays and recycle the shorter operand.
 `srand(seed)`, `runif(n)`, `rnorm(n)` and `rand(min, max)` (a random int),
 all from MT19937-64.
 
+## Data exchange
+
+| Function | |
+| --- | --- |
+| `read_vec(file, type(T))` | read a file of raw `T` elements (`int` as 32-bit, `double` as 64-bit IEEE, `boolean` as one byte, native byte order) into a `vector(T)` |
+| `write_vec(x, file)` | write the elements of an `int`, `double` or `boolean` vector or array the same way, returning the count; arrays are written column-major |
+
+These are how [rmai](https://github.com/mai-lib/rmai) passes data between R
+and mai exactly. From R, `writeBin(x, f, size = 8)` and
+`readBin(f, "double", n)` speak the same format.
+
 ## Program and environment
 
 | Function | |
