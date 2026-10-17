@@ -91,7 +91,19 @@ Some differences from R that catch you out early:
 - `for` loops are C-style: `for(i = 1; i <= n; i = i + 1)`;
 - arguments are evaluated eagerly (no lazy evaluation or `substitute`).
 
-More worked examples are in `src/*.src` (from the thesis) and `tests/`.
+See the [documentation](docs/README.md) for a full guide, a
+[differences from R](docs/differences-from-r.md) table and a
+[built-in function reference](docs/builtins.md). There are
+[worked examples](examples) in `examples/`, and the thesis's own in `src/*.src`.
+
+## Performance
+
+Loop-heavy code runs 2.5 to 3.5 times faster than the same code in R.
+Long vectorised expressions are slower than R's built-ins. See
+[Performance](docs/performance.md) for details and how to reproduce the
+numbers.
+
+![mai vs R speedup per benchmark](docs/images/benchmarks.png)
 
 ## Repository layout
 
@@ -102,6 +114,9 @@ More worked examples are in `src/*.src` (from the thesis) and `tests/`.
 | `deps/` | generated dependency fragments so that `make build` works without noweb |
 | `Makefile`, `*.mk` | the original build system |
 | `tests/` | smoke tests: `*.mai` scripts with expected `*.out` output |
+| `examples/` | worked examples, each with its expected output (also run by `make check`) |
+| `docs/` | the documentation |
+| `bench/` | benchmarks against R |
 | `README` | the original build notes |
 
 The first commit on `main` is the thesis tarball, unmodified. Every change

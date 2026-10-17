@@ -1,0 +1,15 @@
+# Estimate pi by throwing darts at the unit square: a loop that would be
+# slow in R unless vectorised is fine to write directly here.
+
+srand(2018)
+const estimate_pi = function(int n) : double {
+    var hits = 0
+    for(int i = 1; i <= n; i = i + 1) {
+        var u = runif(2)
+        if(u[1] * u[1] + u[2] * u[2] <= 1.0)
+            hits = hits + 1
+    }
+    4.0 * hits / n
+}
+print(estimate_pi(1000))
+print(estimate_pi(1000000))

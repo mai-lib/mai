@@ -1,0 +1,38 @@
+# Functions are values. Arguments are evaluated eagerly and bound by
+# position or name; defaults work as in R.
+
+area = function(w, h = 1) w * h
+print(area(3))
+print(area(3, 4))
+print(area(h = 10, w = 2))
+
+# Closures capture their defining environment.
+make_counter = function() {
+    var n = 0
+    function() { n = n + 1; n }
+}
+tick = make_counter()
+tick()
+tick()
+print(tick())
+
+# Higher-order functions. There is no lapply() built in, but a typed map is
+# a few lines, and the compiler can inline small const functions like it.
+const map = function(vector x, function fn, type etyp = ret_type(typeof(fn))) {
+    var n = length(x), res = vector(etyp, n)
+    for(i = 1; i <= n; i = i + 1)
+        res[i] = fn(x[i])
+    res
+}
+const square = function(double x) : double x * x
+print(map(1.0 * 1:5, square))
+
+# return() exits early.
+sign = function(x) {
+    if(x > 0) return("positive")
+    if(x < 0) return("negative")
+    "zero"
+}
+print(sign(3))
+print(sign(-1))
+print(sign(0))

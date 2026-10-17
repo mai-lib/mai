@@ -1,0 +1,11 @@
+benchmark,language,seconds
+closest,mai,0.350989
+closest,R,0.92
+fib,mai,0.077398
+fib,R,0.197
+harmonic,mai,0.126097
+harmonic,R,0.321
+regression,mai,0.380733
+regression,R,1.347
+vecsum,mai,0.100571
+vecsum,R,0.052

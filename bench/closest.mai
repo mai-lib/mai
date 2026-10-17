@@ -1,0 +1,21 @@
+# nearest neighbour by explicit double loop (thesis section 1.2.2)
+const eucl.dist = function(x, y) : double sqrt(sum((x - y) * (x - y)))
+const closest = function(array(double) xs, array(double) ys) : vector(int) {
+    var lx = shape(xs)[2], ly = shape(ys)[2], res = int(lx)
+    for(i = 1; i <= lx; i = i + 1) {
+        let idx = -1, d = Inf, x = xs[,i]
+        for(j = 1; j <= ly; j = j + 1) {
+            let r = eucl.dist(x, ys[,j])
+            if(r < d) { idx = j; d = r; }
+        }
+        res[i] = idx
+    }
+    res
+}
+const mkarr = function(int d, int n) : array(double) {
+    let res = array(type(double), vec(d, n), 0.0)
+    res[] = rnorm(n * d)
+    res
+}
+const xa = mkarr(100, 500), ya = mkarr(100, 500)
+const run = function() closest(xa, ya)

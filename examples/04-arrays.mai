@@ -1,0 +1,30 @@
+# Arrays are column-major and created with array(type, shape, fill).
+
+m = array(type(double), vec(2, 3), 0.0)
+m[1, 2] = 5.0
+m[, 3] = 7.0            # assign a whole column
+print(m)
+print(shape(m))
+print(rank(m))          # number of dimensions
+print(m[, 2])           # extract a column as a vector
+print(m * 2.0)          # arithmetic is element-wise
+print(sum(m))
+
+# Matrix multiplication written as plain loops: the compiler turns the
+# scalar inner loop into specialised, unboxed instructions.
+const matmul = function(array(double) a, array(double) b) : array(double) {
+    var n = shape(a)[1], k = shape(a)[2], p = shape(b)[2]
+    let res = array(type(double), vec(n, p), 0.0)
+    for(int i = 1; i <= n; i = i + 1)
+        for(int j = 1; j <= p; j = j + 1) {
+            var s = 0.0
+            for(int l = 1; l <= k; l = l + 1)
+                s = s + a[i, l] * b[l, j]
+            res[i, j] = s
+        }
+    res
+}
+a = array(type(double), vec(2, 2), 0.0)
+a[, 1] = vec(1.0, 3.0)
+a[, 2] = vec(2.0, 4.0)
+print(matmul(a, a))

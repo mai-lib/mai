@@ -1,0 +1,18 @@
+# Vectors and arrays are passed by reference: a function that assigns into
+# its argument changes the caller's data. Copy explicitly when you need to.
+
+zero_first = function(v) { v[1] = 0; nil }
+
+x = 1:5
+zero_first(x)
+print(x)                 # x itself was modified
+
+y = 1:5
+zero_first(1 * y)        # arithmetic creates a new vector, so y is untouched
+print(y)
+
+# Scalars are values, so rebinding inside a function never leaks out.
+bump = function(n) { n = n + 1; n }
+k = 1
+print(bump(k))
+print(k)
