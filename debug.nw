@@ -1,0 +1,470 @@
+/*@
+\chapter{TEMP DEBUG}
+
+\ldots is what it says on the tin.
+
+==debug.c*/
+#include "global.h"
+#include "ir.h"
+#include "vm/vm_ops.h"
+
+const char *cnode_names[] =
+{
+    "LAMBDA", "CALL", "CALL_FAST", "BUILTIN",
+    "SET", "BIND", "REF", "IF", "RETURN",
+    "CONST", "COPY", "PHI",
+};
+
+// ir dump
+
+static void dump_value(cnode_t *node)
+{
+    if(node)
+        printf("%d", node->id);
+    else
+        printf("(nil)");
+}
+
+static void dump_array(cnode_array_t *args)
+{
+    int i;
+
+    array_foreach(args, i)
+    {
+        if(i>0)
+            printf(", ");
+        dump_value(aref(args, i));
+    }
+}
+
+static void dump_call(cnode_array_t *args, rsymbol_t **names)
+{
+    int i;
+
+    array_foreach(args, i)
+    {
+        if(i>0)
+            printf(", ");
+        if(names && names[i])
+            printf("%s=", names[i]->string);
+        dump_value(aref(args, i));
+    }
+}
+
+static void dump_node(cnode_t *node)
+{
+    //printf("%s %d.%d: %s ", r_symstr(node->file), node->block->id, node->id, cnode_names[node->type]);
+    printf("%d.%d: %s ", node->block->id, node->id, cnode_names[node->type]);
+
+    switch(node->type)
+    {
+    case CN_IF:
+        dump_value(node->ifelse.cond);
+        break;
+    case CN_RETURN:
+        dump_value(node->ret.value);
+        break;
+    case CN_CALL:
+    case CN_CALL_FAST:
+        dump_value(node->call.target);
+        printf(" (");
+        dump_call(&node->call.args, (node->type == CN_CALL) ? adata(&node->call.names) : NULL);
+        printf(")");
+        break;
+    case CN_LAMBDA:
+        printf("(function %d <%p>", node->lambda.function->id, node->lambda.function);
+        if(alen(&node->lambda.closure) > 0)
+        {
+            printf("; ");
+            dump_array(&node->lambda.closure);
+        }
+        printf(")");
+        break;
+    case CN_CONST:
+        r_print(stdout, node->constant);
+        break;
+    case CN_SET:
+        printf("%s ", node->set.var->name->string);
+        dump_value(node->set.value);
+        break;
+    case CN_BIND:
+        if(node->set.var)
+            printf("%s ", node->set.var->name->string);
+        else
+            printf("(argbits) ");
+        dump_value(node->set.value);
+        break;
+    case CN_REF:
+        printf("%s", node->ref.var->name->string);
+        if(!cvar_is_global(node->ref.var))
+            printf(" <%p>", node->ref.var->local.binder);
+        break;
+    case CN_PHI:
+        dump_array(&node->phi.args);
+        break;
+    case CN_BUILTIN:
+        assert(node->builtin.bi);
+        if(node->builtin.bi->name)
+            printf("`%s`", node->builtin.bi->name);
+        else
+            printf("<%p>", node->builtin.bi);
+        if(node->builtin.optype)
+        {
+            printf("@");
+            r_print(stdout, node->builtin.optype);
+        }
+        printf(" (");
+        dump_array(&node->builtin.args);
+        printf(")");
+        break;
+    case CN_COPY:
+        dump_value(node->copy.value);
+        break;
+    }
+    if(node->decl)
+    {
+        printf(" : ");
+        r_print(stdout, node->decl);
+    }
+    if(alen(&node->users) > 0)
+    {
+        printf("\t(used by ");
+        dump_array(&node->users);
+        printf(")");
+    }
+    printf("\n");
+}
+
+
+static void dump_block_links(char *str, cblock_array_t *blocks)
+{
+    int i;
+
+    if(alen(blocks) > 0)
+    {
+        printf("(%s ", str);
+        array_foreach(blocks, i)
+        {
+            if(i>0)
+                printf(", ");
+            printf("%d", aref(blocks, i)->id);
+        }
+        printf(")\n");
+    }
+}
+
+static void dump_block(cblock_t *block)
+{
+    cnode_t *node;
+
+    printf("\nblock %d. ", block->id);
+    if(block->start != INT_MIN)
+        printf("(%d - %d)\n", block->start, block->end);
+    else
+        printf("(empty)\n");
+    dump_block_links("in:", &block->pred);
+
+    list_foreach_entry(&block->cnode_head, node, cnode_list)
+        dump_node(node);
+
+    dump_block_links("out:", &block->succ);
+}
+
+static void dump_vars(cfunction_t *fn)
+{
+    cvar_t *var;
+    bool n = false;
+
+    list_foreach_entry(&fn->cvar_head, var, cvar_list)
+    {
+        if(n)
+            printf(", ");
+        else
+            n = true;
+
+        switch(var->type)
+        {
+        case LEXICAL:
+            printf("%s%s%s",
+                   var->is_const ? "const " : "",
+                   var->local.is_closed ? "closed " : "",
+                   var->local.is_arg ? "arg " : "local ");
+            break;
+        case GLOBAL_INT:
+            printf("%s.i ", var->is_const ? "const" : "global");
+            break;
+        case GLOBAL_EXT:
+            printf("%s.e ", var->is_const ? "const" : "global");
+            break;
+        }
+        if(var->decl)
+        {
+            r_print(stdout, var->decl);
+            printf(" ");
+        }
+        printf("%s", var->name->string);
+    }
+    if(n)
+        printf("\n");
+}
+
+static void dump_closure(cvar_array_t *vars)
+{
+    int i;
+
+    if(alen(vars) > 0)
+    {
+        printf("closure: ");
+        array_foreach(vars, i)
+        {
+            cvar_t *var = aref(vars, i);
+            if(i>0)
+                printf(", ");
+            if(var->is_const)
+                printf("const ");
+            if(var->decl)
+            {
+                r_print(stdout, var->decl);
+                printf(" ");
+            }
+            printf("%s", var->name->string);
+        }
+        printf("\n");
+    }
+}
+
+static void dump_fn_id(cfunction_t *fn)
+{
+    int id = fn->id;
+    if(fn->parent)
+    {
+        dump_fn_id(fn->parent);
+        printf(".");
+    }
+    printf("%d", id);
+}
+
+static void dump_fn_name(cfunction_t *fn)
+{
+    printf("function ");
+    dump_fn_id(fn);
+    if(fn->node)
+        printf(" %s ", r_symstr(fn->node->file));
+    printf(" <%p> : ", fn);
+    r_print(stdout, fn->cl_type);
+    printf("\n");
+}
+
+void ir_dump(cfunction_t *fn)
+{
+    cblock_t *block;
+    cfunction_t *child;
+
+    dump_fn_name(fn);
+    dump_vars(fn);
+    dump_closure(&fn->closure);
+
+    // blocks in list (usually rdfo)
+    list_foreach_entry(&fn->cblock_head, block, cblock_list)
+        dump_block(block);
+
+    printf("\n\n");
+
+    list_foreach_entry(&fn->cfunc_head, child, cfunc_list)
+        ir_dump(child);
+}
+
+
+
+#define NAME ""
+#define NAMEboolean ".b"
+#define NAMEint ".i"
+#define NAMEdouble ".d"
+#define NAME8 ".8"
+#define NAME32 ".32"
+#define NAME64 ".64"
+#define NAMEboolean2int ".b.i"
+#define NAMEboolean2double ".b.d"
+#define NAMEint2boolean ".i.b"
+#define NAMEint2double ".i.d"
+#define NAMEdouble2int ".d.i"
+#define NAMEdouble2boolean ".d.b"
+
+
+// asm dump
+#define STR(name, suffix...) #name PASTE2(NAME,suffix)
+#define OP_DEF(def...) [ENUM(def)] = STR(def)
+static const char *const opnames[] =
+{
+    OPS_ALL
+};
+#undef OP_DEF
+
+op_code_t disasm_op(op_code_t **pip)
+{
+    vm_instr_t instr = *(vm_instr_t *)*pip;
+    *pip += sizeof(vm_instr_t);
+    for(int i = 0; i < lengthof(opnames); i++)
+    {
+        if(vm_instr[i] == instr)
+            return i;
+    }
+    printf("*** label %p not found!", instr);
+    return -1;
+}
+
+#define STK  printf("%-4hd", FETCH(op_stack_t))
+#define OFS  printf("%-4hu", FETCH(op_offset_t))
+#define LBL  printf("0x%0X", FETCH(op_offset_t))
+#define OBJ  asm_dump_const(FETCH(op_offset_t), fn, consts)
+#define DIS(os...) os; break;
+
+// XXX copied from vm/vm.c
+#define ADVANCE(n) ((ip += (n)) - (n))
+#define FETCH(ctype) (*((ctype *)ADVANCE(sizeof(ctype))))
+#define SFETCH() FETCH(op_stack_t)
+#define OFETCH() FETCH(op_offset_t)
+//
+
+static void asm_dump_const(op_offset_t idx, cfunction_t *fn, robject_array_t *consts)
+{
+    robject_t *obj = aref(consts,idx);
+    //printf("%-4hu", idx);       // XXX dup format
+    //printf("%4s", "# ");
+    if(idx < fn->nfuncs)
+        printf("<child fn %d>", idx);
+    else
+        r_print(stdout, obj);
+    printf(" ");
+}
+
+static op_code_t *asm_dump_call_uni(op_code_t *ip, cfunction_t *fn, robject_array_t *consts)
+{
+    static const char *subnames[] = { ".end", ".kwd", ".pos", ".rest", ".omit" };
+    for(op_code_t subop; (subop = *ip++); )
+    {
+        printf("\n%4s\t%4s%-10s", "", "", subnames[subop]);
+        switch(subop)
+        {
+        case OP_call_kwd: DIS(OBJ, STK);
+        case OP_call_pos: DIS(STK);
+        case OP_call_rest: DIS(STK);
+        case OP_call_omit: break;
+        case OP_call_end: return ip;
+        }
+    }
+    // NOTREACHED
+    return ip;
+}
+
+static op_code_t *asm_dump_lambda(op_code_t *ip)
+{
+    static const char *subnames[] = { ".end", ".mov.8", ".mov.32", ".mov.64" };
+    for(op_code_t subop; (subop = *ip++); )
+    {
+        printf("\n%4s\t%4s%-10s", "", "", subnames[subop]); // XXX dup format
+        if(subop == OP_lambda_end)
+            break;
+        STK;
+    }
+    return ip;
+}
+
+void asm_dump(cfunction_t *fn, op_code_array_t *code, robject_array_t *consts)
+{
+    dump_fn_name(fn);
+
+    // for(op_code_t *ip = code->ptr; ip < code->ptr + code->length; ip++)
+    //     printf("%02X ", *ip);
+    // printf("\n\n");
+
+    for(op_code_t *ip = code->ptr; ip < code->ptr + code->length; )
+    {
+        printf("%04tx\t", ip - code->ptr);
+        op_code_t op = disasm_op(&ip);
+        printf("%-14s", opnames[op]);
+        switch(op)
+        {
+        case OP_call_uni: DIS(STK, ip = asm_dump_call_uni(ip, fn, consts));
+        case OP_call_fast: DIS(STK);
+        case OP_ret: DIS(STK);
+        case OP_complete_box: DIS(STK, STK);
+        case OP_missing: DIS(STK, STK, OFS);
+        case OP_frame: DIS(OFS, printf("0x%0x", FETCH(argbits_t)));
+        case OP_jump: DIS(LBL);
+        case OP_if: DIS(STK, LBL);
+        case OP_lambda: DIS(STK, OBJ, ip = asm_dump_lambda(ip));
+        case OP_defvar: DIS(OBJ, OBJ);
+        case OP_getvar_uni: DIS(STK, OBJ);
+        case OP_setvar_uni: DIS(STK, OBJ);
+        case OP_const: DIS(STK, OBJ);
+        case OP_cellmake: DIS(STK, OBJ);
+        case OP_check: DIS(STK, OBJ);
+
+        case OP_andboolean: DIS(STK, STK, STK);
+        case OP_orboolean: DIS(STK, STK, STK);
+        case OP_notboolean: DIS(STK, STK);
+#define DO_CONV(a,b) case ENUM(conv, CONV(a, b)): DIS(STK, STK);
+        OPS_CONVERSION(DO_CONV)
+
+#define CWIDTH(w) PASTE3(uint, w, _t)
+#define FWIDTH(w) PASTE2(FW, w)
+#define FW8 "0x%0hhX"
+#define FW32 "0x%0X"
+#define FW64 "0x%0llX"
+
+#define DO_WIDTH(w) case ENUM(mov,w): DIS(STK,STK);                     \
+        case ENUM(literal,w): DIS(STK, printf(FWIDTH(w), FETCH(CWIDTH(w)))); \
+        case ENUM(env,w): DIS(STK,OFS);                                 \
+        case ENUM(complete,w): DIS(STK);                                \
+        case ENUM(getvar,w): DIS(STK, OBJ);                             \
+        case ENUM(setvar,w): DIS(STK, OBJ, OFS);                        \
+        case ENUM(cellget,w): DIS(STK, STK);                            \
+        case ENUM(cellset,w): DIS(STK, STK);                            \
+        case ENUM(setelt,w): DIS(STK, STK, STK);                        \
+        case ENUM(setel2,w): DIS(STK, STK, STK, STK);
+
+        DO_WIDTH(8)
+        DO_WIDTH(32)
+        DO_WIDTH(64)
+
+#define DO_ARITH(t) case ENUM(add,t): DIS(STK, STK, STK);               \
+        case ENUM(sub,t): DIS(STK, STK, STK);                           \
+        case ENUM(mul,t): DIS(STK, STK, STK);                           \
+        case ENUM(div,t): DIS(STK, STK, STK);                           \
+        case ENUM(pow,t): DIS(STK, STK, STK);                           \
+        case ENUM(neg,t): DIS(STK, STK);                                \
+        case ENUM(lth,t): DIS(STK, STK, STK);                           \
+        case ENUM(lte,t): DIS(STK, STK, STK);                           \
+        case ENUM(gth,t): DIS(STK, STK, STK);                           \
+        case ENUM(gte,t): DIS(STK, STK, STK);
+#define DO_SCALAR(t) case ENUM(eql,t): DIS(STK, STK, STK);              \
+        case ENUM(neq,t): DIS(STK, STK, STK);                           \
+        case ENUM(is_na,t): DIS(STK, STK);                              \
+        case ENUM(box,t): DIS(STK, STK);                                \
+        case ENUM(unbox,t): DIS(STK, STK);
+#define DO_GETELT(t) case ENUM(getelt,t): DIS(STK, STK, STK);           \
+        case ENUM(getel2,t): DIS(STK, STK, STK, STK);
+
+        DO_GETELT(ptr)
+        DO_SCALAR(double)
+        DO_GETELT(double)
+        DO_ARITH(double)
+        DO_SCALAR(int)
+        DO_GETELT(int)
+        DO_ARITH(int)
+        DO_SCALAR(boolean)
+        DO_GETELT(boolean)
+
+        default:
+            printf("*** unknown opcode %d, bailing\n", op);
+            return;
+        }
+        printf("\n");
+    }
+    printf("\n\n");
+}
+
+/*@ %
+
+%*/

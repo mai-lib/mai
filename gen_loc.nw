@@ -1,0 +1,600 @@
+/*@
+\chapter{Location Allocation}
+\label{gen_loc}
+
+The values that the virtual machine (\autoref{vm}) operates upon are
+stored on a \textit{stack}. A stack location is addressed with a signed
+offset from the VM's \textit{base pointer} register
+(\autoref{vm:frame}). Location allocation is the process of assigning
+stack locations to the values produced by the nodes in a function,
+according to their types and lifetimes.
+
+==gen_loc.c*/
+//includes//
+//preassignment//
+//local_t//
+//linear scan//
+//concrete locations//
+//init_locs//
+//gen_locations//
+/*@
+
+
+\section{Abstract Locations}
+\label{gen_loc:loc}
+
+Before their concrete stack locations can be computed, each node is
+first assigned an \textit{abstract location}, represented as a [[loc_t]]
+structure. Its [[.index]] is interpreted relative to the \textit{storage
+  base} specified by the [[.base]] field. The storage base chosen for a
+node depends on the node's size, type and usage. Two nodes with the same
+[[.index]] and [[.base]] will occupy the same concrete location.
+
+==loc_t*/
+typedef struct
+{
+    locbase base;
+    unsigned index;
+} loc_t;
+/*@
+
+[[BASE_8]], [[_32]], [[_64]] and [[_PTR]] denote storage for local
+scalar booleans, integers, doubles, and pointers to objects,
+respectively. The formal arguments to a function are stored at
+[[BASE_ARG]]. [[BASE_HINT]] is a request to the allocator that the value
+be stored at the same location, if possible, as that of another node.
+Values without special requirements are provisionally initialised to
+[[BASE_NONE]].
+
+==locbase*/
+typedef enum
+{
+    BASE_8 = SC_BOOLEAN,
+    BASE_32 = SC_INT,
+    BASE_64 = SC_DOUBLE,
+    BASE_PTR,
+    BASE_ARG,
+    BASE_HINT,
+    BASE_NONE
+} locbase;
+/*@
+
+Each node which is [[UNASSIGNED]] is allocated a location at one of the
+[[LOCAL_BASES]]. The [[SCALAR_BASES]] are segregated from [[BASE_PTR]],
+to simplify garbage collection.
+
+==locbase*/
+#define LOCAL_BASES BASE_ARG
+#define SCALAR_BASES (BASE_64+1)
+#define UNASSIGNED BASE_HINT
+/*@
+
+The storage base suitable for the type of value produced by a [[node]] is
+returned by the [[base_for]] helper function.
+
+==base_for*/
+static inline locbase base_for(cnode_t *node)
+{
+    rtype_t *type = decl_type(node->decl);
+
+    return rtype_is_scalar(type)
+        ? rscal_code(type)
+        : BASE_PTR;
+}
+/*@
+
+The [[size_base]] helper returns the number of bytes taken by a value in
+a storage [[base]].
+
+==size_base*/
+static inline size_t size_base(locbase base)
+{
+    static const int base_sizes[] = { 1, 4, 8, sizeof(robject_t *) };
+    return base_sizes[base];
+}
+/*@
+
+
+\section{Entry Point}
+
+The module entry point, [[gen_locations]], computes the [[bp]]-relative
+offset in the VM stack for each node in the function [[fn]]. The
+[[live]] ranges (computed in \autoref{gen_range}) provide the lifetime
+information for each node; the [[locs]] array stores their abstract
+locations.
+
+Some nodes are preassigned specific locations by [[args_assign]] and
+[[phi_assign]]. Locations for the remainder are allocated by
+[[loc_alloc]] which also returns, in the [[nlocs]] array, the number of
+values stored at each of the [[LOCAL_BASES]]. [[loc_bases]] then
+computes the offsets and sizes of these, writing the former to the
+[[base_ofs]] array and the latter to [[*pscalsz]] and [[*psz]].
+
+The concrete stack offset of each node can then be computed by
+[[loc_offsets]]; the resulting [[ofs]] array, indexed in the usual
+fashion by node [[.id]], being returned as the result.
+
+==gen_locations*/
+op_stack_t *gen_locations(cfunction_t *fn, liveranges_t *live,
+                          op_offset_t *pscalsz, op_offset_t *psz)
+{
+    loc_t *locs = init_locs(fn);
+    op_offset_t base_ofs[LOCAL_BASES];
+    unsigned nlocs[LOCAL_BASES];
+    op_stack_t *ofs;
+
+    args_assign(fn, locs);
+    phis_assign(fn, live, locs);
+    loc_alloc(fn, live, locs, nlocs);
+    loc_bases(base_ofs, nlocs, pscalsz, psz);
+    ofs = loc_offsets(fn, base_ofs, locs);
+    liveranges_free(fn, live);
+    xfree(locs);
+    return ofs;
+}
+/*@
+
+Every node begins with location [[.base]] set to [[BASE_NONE]].
+
+==init_locs*/
+static inline loc_t *init_locs(cfunction_t *fn)
+{
+    loc_t *locs = xcalloc(fn->nnodes, sizeof(*locs));
+    for(int i = 0; i < fn->nnodes; i++)
+        locs[i].base = BASE_NONE;
+    return locs;
+}
+/*@
+
+
+\section{Preassignment}
+
+The [[BIND]] nodes corresponding to the formal arguments of the function
+are found at known offsets in the incoming call frame. [[PHI]] nodes and
+their arguments are linked by a mechanism analogous to the ``register
+hints'' of \citet{wimmer10}.
+
+==preassignment*/
+//args_assign//
+//cmp_node_id//
+//phi_assign_hints//
+//phis_assign//
+/*@
+
+[[args_assign]] assigns to [[BIND]] nodes, in the order they appear in
+the [[.entry]] block of function [[fn]], an [[.index]] at [[BASE_ARG]]
+(no [[BIND]] nodes appear elsewhere; they were removed during SSA
+conversion).
+
+==args_assign*/
+static void args_assign(cfunction_t *fn, loc_t *locs)
+{
+    int argi = 0;
+    cblock_t *block = NULL;
+    cnode_t *node;
+
+    block = list_entry(fn->entry, block, cblock_list);
+    list_foreach_entry(&block->cnode_head, node, cnode_list)
+    {
+        if(node->type != CN_BIND)
+            continue;
+        locs[node->id] = (loc_t) {
+            .base = BASE_ARG,
+            .index = argi++
+        };
+    }
+}
+/*@
+
+To minimise copying during SSA deconstruction (\autoref{gen_unssa}) it
+is desirable that, where possible, a [[PHI]] node and its arguments are
+allocated the same concrete location. [[phis_assign]] connects these
+`$\phi$-related' nodes with ``location hints''.
+%FIXME deconstruction vs destruction
+
+==phis_assign*/
+static void phis_assign(cfunction_t *fn, liveranges_t *live, loc_t *locs)
+{
+    range_t *range;
+
+    list_foreach_entry(&live->range_head, range, range_list)
+        if(range->node->type == CN_PHI)
+            phi_assign_hints(locs, range->node);
+}
+/*@
+
+[[phi_assign_hints]] initialises the locations of the [[phi]] and its
+arguments. Placed in the array [[arr]] and sorted in program order (i.e.
+increasing [[.id]]), each $\phi$-related [[node]] is examined.
+
+==phi_assign_hints*/
+static void phi_assign_hints(loc_t *locs, cnode_t *phi)
+{
+    cnode_array_t arr = ARRAY_INIT;
+    cnode_t *node, *tail = NULL;
+
+    array_copy(&arr, &phi->phi.args);
+    array_push(&arr, phi);
+    qsort(arr.ptr, arr.length, sizeof(cnode_t *), cmp_node_id);
+    array_foreach_entry(&arr, node)
+    {
+        //assign hint//
+    }
+    array_fini(&arr);
+}
+/*@
+
+A sequence of hinted locations forms a chain -- with [[.base]] set to
+[[BASE_HINT]], the [[.index]] field of each is set to the [[.id]] of the
+preceding node.
+
+Only an uninitialised [[node]] will be assigned, but if this one is
+already hinted, the chain can continue from it. If this is the first
+[[node]], it begins the chain and stays at [[BASE_NONE]]. Otherwise, the
+hint is assigned and the [[tail]] advanced.
+
+==assign hint*/
+loc_t *loc = &locs[node->id];
+
+if(loc->base != BASE_NONE)
+{
+    if(loc->base == BASE_HINT)
+        tail = node;
+}
+else if(!tail)
+    tail = node;
+else if(node != tail)
+{
+    *loc = (loc_t) {
+        .base = BASE_HINT,
+        .index = tail->id
+    };
+    tail = node;
+}
+/*@
+
+The [[qsort]] call uses the [[cmp_node_id]] helper to sort the nodes by
+[[.id]].
+
+==cmp_node_id*/
+static int cmp_node_id(const void *a, const void *b)
+{
+    cnode_t *x = *(cnode_t **)a, *y = *(cnode_t **)b;
+    return x->id - y->id;
+}
+/*@
+
+
+\section{Linear Scan}
+
+Each node could be given a separate, unique stack offset, but this would
+waste space; most values are not live over the entire function. We
+allocate locations to nodes in a single \textit{linear scan}. This can
+produce code of nearly the same quality as a conventional
+graph-colouring register allocator, while being faster and simpler
+\citep{traub98}.
+
+==linear scan*/
+//find_free_index//
+//loc_alloc//
+/*@
+
+Each storage base tracks the current allocation state with a [[local_t]]
+structure. It holds the lists of live ranges that are [[.active]] and
+[[.inactive]], and an array of flags recording whether each index in the
+storage base is [[.used]] by a value.
+
+==local_t*/
+typedef struct
+{
+    list_t active, inactive;
+    ARRAY(bool) used;
+} local_t;
+/*@
+
+The [[loc_alloc]] function assigns, to each node, an abstract location
+for its value that doesn't interfere with any other. The algorithm
+employed is that of \citet[Figure 2]{wimmer05}, with insights from
+\citet[][our ``live range'' corresponding to their ``lifetime
+  interval'']{wimmer10}. It performs linear scan with lifetime holes,
+but without range splitting or spilling.
+
+==loc_alloc*/
+void loc_alloc(cfunction_t *fn, liveranges_t *live, loc_t *locs, unsigned nlocs[])
+{
+    local_t locals[LOCAL_BASES];
+    list_t *unhandled = &live->range_head;
+    range_t *cur;
+
+    //allocate locations//
+}
+/*@
+
+The elements of the [[locals]] array are first initialised with empty
+lists and arrays.
+
+==allocate locations*/
+for(int i = 0; i < LOCAL_BASES; i++)
+{
+    local_t *local = &locals[i];
+
+    *local = (local_t) {
+        .active = LIST_INIT(local->active),
+        .inactive = LIST_INIT(local->inactive),
+        .used = ARRAY_INIT
+    };
+}
+/*@
+
+While there are still nodes with [[unhandled]] ranges, the range [[cur]]
+is taken from the head of the list. This occurs in order of increasing
+[[.start]] point, as the list is sorted (\autoref{gen_range:path}). If
+the node's location [[loc]] is not [[UNASSIGNED]], its allocation is
+skipped. The [[local]] state for the [[.node]]'s storage [[base]] is
+consulted.
+
+==allocate locations*/
+list_while_entry(unhandled, cur, range_list)
+{
+    range_t *range, *tmp;
+    locbase base = base_for(cur->node);
+    local_t *local = &locals[base];
+    loc_t *loc = &locs[cur->node->id];
+
+    list_remove(&cur->range_list);
+    if(loc->base < UNASSIGNED)
+        continue;
+    //allocate range//
+}
+/*@
+
+The scan advances to the [[.start]] position of the range [[cur]]. Each
+[[.active]] [[range]] at this storage base is examined. If it has ended,
+it's removed from the list, and the [[.index]] that its node occupied is
+marked as no longer [[.used]]. If it has a lifetime hole at this
+position, it's moved to the [[.inactive]] list, with its node's index
+also marked unused.
+
+==allocate range*/
+list_foreach_entry_safe(&local->active, range, tmp, range_list)
+{
+    if(range->end <= cur->start)
+    {
+        list_remove(&range->range_list);
+        aset(&local->used, locs[range->node->id].index, false);
+    }
+    else if(!range_covers(range, cur->start))
+    {
+        aset(&local->used, locs[range->node->id].index, false);
+        list_remove(&range->range_list);
+        list_add(&local->inactive, &range->range_list);
+    }
+}
+/*@
+
+Then each [[.inactive]] [[range]] is examined in a similar manner. If it
+has has ended, it's removed as well; if it now covers the current
+position, it's reactivated and its node's index again marked as
+[[.used]].
+
+Note that this is always safe -- two values in SSA form only interfere
+if one is live at the definition of the other \citep[Section
+  III.A]{boissinot08}, and the end of a lifetime hole is not a
+definition.
+
+==allocate range*/
+list_foreach_entry_safe(&local->inactive, range, tmp, range_list)
+{
+    if(range->end <= cur->start)
+        list_remove(&range->range_list);
+    else if(range_covers(range, cur->start))
+    {
+        list_remove(&range->range_list);
+        list_add(&local->active, &range->range_list);
+        aset(&local->used, locs[range->node->id].index, true);
+    }
+}
+/*@
+
+The unset elements of the [[.used]] array now accurately reflect the
+available indices. [[find_free_index]] returns one; it's marked, the
+node's location is assigned its [[index]] and [[base]], and the node's
+range becomes [[.active]].
+
+==allocate range*/
+unsigned index = find_free_index(local, locs, loc);
+
+aset(&local->used, index, true);
+*loc = (loc_t) {
+    .base = base,
+    .index = index
+};
+list_add_before(&local->active, &cur->range_list);
+/*@
+
+After all ranges have been processed, the length of each storage base's
+[[.used]] array is equal to the maximum number of values live
+simultaneously at that base. This is copied to the corresponding element
+of [[nlocs]].
+
+The [[local]] list heads are unlinked, as they will become invalid when
+the function returns.
+
+==allocate locations*/
+for(int i = 0; i < LOCAL_BASES; i++)
+{
+    local_t *local = &locals[i];
+
+    nlocs[i] = alen(&local->used);
+    array_fini(&local->used);
+    list_remove(&local->inactive);
+    list_remove(&local->active);
+}
+/*@
+
+The [[find_free_index]] function returns an available index in the
+[[local]] storage base. If the location [[loc]] was earlier initialised
+to [[BASE_HINT]], it will take the same [[.index]] as the specified
+[[other]] node, if that isn't presently being [[.used]].
+
+Otherwise, if an unused index is available, it's returned. The array is
+extended and the newly added index returned in the event all others are
+occupied.
+
+==find_free_index*/
+static unsigned find_free_index(local_t *local, loc_t *locs, loc_t *loc)
+{
+    unsigned i;
+
+    if(loc->base == BASE_HINT)
+    {
+        loc_t *other = &locs[loc->index];
+
+        if(!aref(&local->used, other->index))
+            return other->index;
+    }
+    array_foreach(&local->used, i)
+        if(!aref(&local->used, i))
+            return i;
+    array_extend(&local->used, 1);
+    return i;
+}
+/*@
+
+As [[loc_alloc]] doesn't split intervals within a range, a value will
+never change its location across a control-flow edge. This reduces the
+resolution phase of \citet[Section 6]{wimmer10} to SSA deconstruction
+only, which occurs in \autoref{gen_unssa}.
+
+
+\section{Concrete Locations}
+\label{gen_loc:ofs}
+
+The stack frame is subdivided, with an area for each storage base. All
+local scalar values with the same width are stored together, as are
+local pointers. This increases overhead compared to an optimal packing,
+but has a very simple implementation. After the sizes of these areas are
+computed, abstract locations can be made concrete.
+
+==concrete locations*/
+//loc_bases//
+//arg_offset//
+//local_offset//
+//loc_offsets//
+/*@
+
+[[loc_bases]] writes the start offset of each local storage base to
+[[base_ofs]].
+
+They are laid out one after the other at the beginning of the stack
+frame; [[BASE_8]] followed by [[BASE_32]] then [[BASE_64]]. [[*pscalsz]]
+is assigned their total size in bytes.
+
+[[BASE_PTR]] comes after the scalars. Its size is added to the total and
+the result assigned to [[*psz]]. Exceeding the maximum addressable local
+stack space is a fatal error.
+
+==loc_bases*/
+static void loc_bases(op_offset_t *base_ofs, unsigned nlocs[],
+                      op_offset_t *pscalsz, op_offset_t *psz)
+{
+    size_t sz = 0;
+
+    for(locbase i = BASE_8; i < SCALAR_BASES; i++)
+    {
+        base_ofs[i] = sz;
+        sz += nlocs[i] * size_base(i);
+    }
+    *pscalsz = sz;
+    if(sz > SHRT_MAX)
+        fatal("out of local scalar stack space.");
+    base_ofs[BASE_PTR] = sz;
+    sz += nlocs[BASE_PTR] * size_base(BASE_PTR);
+    if(sz > SHRT_MAX)
+        fatal("out of local stack space.");
+    *psz = sz;
+}
+/*@
+
+Finally, [[loc_offsets]] can compute the concrete stack location, as an
+offset in bytes from the VM base pointer, from the abstract location
+[[loc]] assigned to each [[node]]. They are returned in the [[ofs]]
+array.
+
+==loc_offsets*/
+static op_stack_t *loc_offsets(cfunction_t *fn, op_offset_t *base_ofs,
+                               loc_t *locs)
+{
+    op_stack_t *ofs = xcalloc(fn->nnodes, sizeof(*ofs));
+    cblock_t *block;
+
+    list_foreach_entry(&fn->cblock_head, block, cblock_list)
+    {
+        cnode_t *node;
+
+        list_foreach_entry(&block->cnode_head, node, cnode_list)
+        {
+            loc_t *loc = &locs[node->id];
+
+            if(!cnode_yields_value(node))
+                continue;
+            ofs[node->id] = (loc->base == BASE_ARG)
+                          ? arg_offset(fn, loc)
+                          : local_offset(base_ofs, loc);
+        }
+    }
+    return ofs;
+}
+/*@
+
+[[arg_offset]] returns the offset for the function [[fn]]'s argument
+with the given [[index]] at [[BASE_ARG]].
+
+The first, with index [[0]], is always the implicit [[argbits]] argument
+(\autoref{call}). The [[.offset]]s of the remainder have already been
+computed, and are specified by the function [[fn]]'s signature
+(\autoref{callable:sig}).
+
+==arg_offset*/
+static inline op_stack_t arg_offset(cfunction_t *fn, loc_t *loc)
+{
+    funsig_t *sig = fn->cl_type->sig;
+
+    return -(sig->argsz + sizeof(vm_act_rec_t)) +
+            (!loc->index ? 0 : sig->args[loc->index - 1].offset);
+}
+/*@
+
+[[local_offset]] returns the offset in the stack frame for the node with
+the given [[index]] at [[base]].
+
+==local_offset*/
+static inline op_stack_t local_offset(op_offset_t *base_ofs, loc_t *loc)
+    { return base_ofs[loc->base] + size_base(loc->base) * loc->index; }
+/*@
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+#include "ir.h"
+// for vm_act_rec_t
+#include "vm/vm_ops.h"
+#include "gen.h"
+#include "gen_range.h"
+/*@
+
+%% the first arg is always argbits, which is an [[argbits_t]] typedef of
+%% [[rint_t]]. it's counted in [[.argsz]] (and so each arg's [[.offset]]),
+%% but not in [[.nargs]]. if the function takes a rest vector, it's the
+%% last arg and always optional.
+
+==gen.h*/
+//locbase//
+//loc_t//
+//base_for//
+//size_base//
+/*@
+
+% */

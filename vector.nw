@@ -1,0 +1,1411 @@
+/*@
+\chapter{Vectors and Arrays}
+\label{vector}
+
+The one-dimensional \textit{vector} and multidimensional \textit{array}
+comprise the collection types provided by the runtime. They are not as
+fundamental as they would be in a genuine \textit{collection-oriented}
+language \citep{blelloch90}.
+
+==rt/vector.c*/
+//includes//
+//buffers//
+//printing//
+//vectors//
+//arrays//
+//types//
+//rtype_vec_init//
+//rt_install_vec_types//
+/*@
+
+
+\section{Containers}
+
+Vectors and arrays augment a base \textit{buffer} with additional
+fields. The [[rbuf_t]] structure is the first member in these objects.
+The [[.elts]] field points to an allocation of unmanaged memory
+containing [[.length]] elements.
+
+==rbuf_t*/
+typedef struct
+{
+    robject_t base;
+    int length;
+    void *elts;
+} rbuf_t;
+/*@
+
+The [[rvec_elts]] and [[rvec_len]] accessors are macros for convenient
+use on either kind of container (despite the prefix.)
+
+%% FIXME rename these plx
+==rvec accessors*/
+#define rvec_elts(_b) ((_b)->buf.elts)
+#define rvec_len(_b)  ((_b)->buf.length)
+/*@
+
+%% XXX this is kind of an obtrusive digression, but oh well?
+
+\subsection{Types}
+
+An object holding a buffer is of some \textit{container type}. This type
+is either a [[VECTOR]] or an [[ARRAY]], and holds the buffer's
+\textit{element type} in its [[.elt]] field.
+
+%% FIXME rbuf_elt_type? rbuf_etyp??
+==elt_type*/
+static inline rtype_t *elt_type(const rbuf_t *buf)
+{
+    rtype_t *typ = r_typeof(buf);
+    assert(rtype_is_container(typ) && typ->elt);
+    return typ->elt;
+}
+/*@ %
+
+Only objects with types that are subtypes (\autoref{type:subtype}) of
+the element type can be held in the buffer (it's homogeneous just when
+this is true of the element type alone, as [[r_subtype(x, x)]] is true
+for all [[x]].)
+
+==types*/
+//cntrdesc_t//
+//cntr_type_create//
+//cntr_type_from_spec//
+//cntr_descs//
+//type_creates//
+/*@
+
+A [[cntrdesc_t]] structure describes a kind of container types.
+[[.cons]] is the constructor descriptor; [[.ptype]] holds the address of
+the type which is created from it. The [[.ops]] callbacks are used for
+instances of (this kind of) container type.
+
+==cntrdesc_t*/
+typedef struct
+{
+    consdesc_t cons;
+    rtype_t **ptype;
+    const typeops_t *ops;
+} cntrdesc_t;
+/*@ %
+
+Vectors and arrays share a [[cons.from_spec]] callback.
+
+==cntr_descs*/
+static const cntrdesc_t cntr_vec = {
+    .cons = {
+        .from_spec = cntr_type_from_spec,
+        .kind = RT_VECTOR
+    },
+    .ptype = &r_type_vector,
+    .ops = &vec_ops
+};
+static const cntrdesc_t cntr_arr = {
+    .cons = {
+        .from_spec = cntr_type_from_spec,
+        .kind = RT_ARRAY
+    },
+    .ptype = &r_type_array,
+    .ops = &arr_ops
+};
+/*@ %
+
+Given a [[cntrdesc_t]] and an element type, creating an instance of that
+kind is simple.
+
+==cntr_type_create*/
+rtype_t *cntr_type_create(const cntrdesc_t *cntr, rtype_t *etyp)
+{
+    return rtype_create(cntr->cons.kind, etyp, cntr->ops, NULL);
+}
+/*@ %
+
+Creating an instance from a type specifier is not much more complicated.
+Since the [[consdesc_t]] is contained within a [[cntrdesc_t]], the
+address of the latter can be recovered from the former.
+
+If no arguments are provided, the type constructor itself is returned,
+as it's a supertype of all its instances. Otherwise, the single argument
+specifies the element type.
+
+==cntr_type_from_spec*/
+static rtype_t *cntr_type_from_spec(const consdesc_t *cons,
+                                    unsigned nargs, ast_t *args)
+{
+    const cntrdesc_t *cntr = container_of(cons, cntrdesc_t, cons);
+
+    if(nargs == 0)
+        return *cntr->ptype;
+    else if(nargs == 1)
+    {
+        rtype_t *etyp = rtype_from_spec(&args[0]);
+        if(etyp)
+            return cntr_type_create(cntr, etyp);
+    }
+    return NULL;
+}
+/*@ %
+
+Wrappers allow convenient creation of vector and array types.
+
+==type_creates*/
+rtype_t *rvec_type_create(rtype_t *etyp)
+    { return cntr_type_create(&cntr_vec, etyp); }
+rtype_t *rarr_type_create(rtype_t *etyp)
+    { return cntr_type_create(&cntr_arr, etyp); }
+/*@ %
+
+
+\subsection{Buffers}
+
+==buffers*/
+//buf_scal_equal//
+//buf_obj_equal//
+//rbuf_equal//
+//buf_scal_hash//
+//buf_obj_hash//
+//rbuf_hash//
+//rbuf_gc//
+//rbuf_free//
+//rbuf_create//
+/*@
+
+Creating a buffer requests a managed object ([[sz]] bytes large, of
+container type [[typ]]) and enough unmanaged memory for [[length]]
+elements. Buffers may not be resized in-place.
+
+==rbuf_create*/
+static inline void *rbuf_create(rtype_t *typ, unsigned length, size_t sz)
+{
+    assert(rtype_is_container(typ));
+    void *elts;
+    size_t vecsz = length * rtype_eltsz(typ->elt);
+    rbuf_t *buf = gc_alloc_vec(typ, sz, vecsz, &elts);
+
+    buf->elts = elts;
+    buf->length = length;
+    return buf;
+}
+/*@ %
+
+Two buffers are equal if they have equal element type, length, and
+contents.
+
+==rbuf_equal*/
+static inline bool rbuf_equal(const rbuf_t *x, const rbuf_t *y)
+{
+    rtype_t *xt = elt_type(x), *yt = elt_type(y);
+
+    if(xt != yt)
+        return false;
+    if(x->length != y->length)
+        return false;
+    return rtype_is_scalar(xt)
+        ? buf_scal_equal(x, y, xt)
+        : buf_obj_equal(x, y);
+}
+/*@ %
+
+As an optimisation, scalar buffers can have their memory compared
+directly, since that's how scalar equality is defined
+(\autoref{scalar:ops}).
+
+==buf_scal_equal*/
+static inline bool
+buf_scal_equal(const rbuf_t *x, const rbuf_t *y, rtype_t *typ)
+    { return !memcmp(x->elts, y->elts, x->length * rscal_size(typ)); }
+/*@ %
+
+Buffers containing objects must compare the corresponding elements with
+[[r_equal]].
+
+==buf_obj_equal*/
+static inline bool buf_obj_equal(const rbuf_t *x, const rbuf_t *y)
+{
+    robject_t **vx = x->elts, **vy = y->elts;
+    for(int i=0; i < x->length; i++)
+        if(!r_equal(vx[i], vy[i]))
+            return false;
+    return true;
+}
+/*@ %
+
+The hash of a buffer is the hash of its elements and the hash of its type.
+
+==rbuf_hash*/
+static inline uint32_t rbuf_hash(const rbuf_t *buf)
+{
+    uint32_t hash = r_hash(r_typeof(&buf->base));
+    rtype_t *etyp = elt_type(buf);
+
+    return rtype_is_scalar(etyp)
+        ? buf_scal_hash(buf, hash, etyp)
+        : buf_obj_hash(buf, hash);
+}
+/*@ %
+
+As with equality, a buffer of scalars can have its memory hashed directly.
+
+==buf_scal_hash*/
+static inline uint32_t
+buf_scal_hash(const rbuf_t *buf, uint32_t hash, rtype_t *etyp)
+{
+    size_t vecsz = buf->length * rtype_eltsz(etyp);
+    return hash_code_seed(buf->elts, vecsz, hash);
+}
+/*@ %
+
+Each element in a buffer of objects is hashed, their values contributing
+to the result.
+
+==buf_obj_hash*/
+static inline uint32_t buf_obj_hash(const rbuf_t *buf, uint32_t hash)
+{
+    robject_t **elts = buf->elts;
+    for(int i = 0; i < buf->length; i++)
+        hash = hash_roll(hash, r_hash(elts[i]));
+    return hash;
+}
+/*@ %
+
+Reference objects contained in a buffer must be marked during garbage
+collection.
+
+==rbuf_gc*/
+static inline void rbuf_gc(rbuf_t *buf)
+{
+    if(!rtype_is_scalar(elt_type(buf)))
+    {
+        robject_t **elts = buf->elts;
+        for(int i = 0; i < buf->length; i++)
+            gc_mark(elts[i]);
+    }
+}
+/*@ %
+
+A buffer (of nonzero length) has unmanaged memory allocated to hold its
+elements, so is responsible for its deallocation upon destruction.
+
+==rbuf_free*/
+static inline void rbuf_free(rbuf_t *buf)
+{
+    if(buf->elts)
+        gc_free_vec(buf->elts, buf->length * rtype_eltsz(elt_type(buf)));
+}
+/*@ %
+
+Vectors and arrays may be \textit{named} -- that is, contain
+human-readable symbolic metadata. This isn't stored in the buffer, so
+depends on the collection's type.
+
+==is_named*/
+static inline bool is_named(const robject_t *obj)
+{
+    rtype_t *type = r_typeof(obj);
+    if(rtype_is_vector(type))
+        return rvec_is_named((rvector_t *)obj);
+    else if(rtype_is_array(type))
+        return rarr_is_named((rarray_t *)obj);
+    return false;
+}
+/*@ %
+
+
+\section{Vectors}
+
+A vectors is a dense, ordered, fixed-length collection of elements. The
+[[rvector_t]] structure begins with a buffer having [[VECTOR]] type.
+
+==rvector_t*/
+typedef struct rvector_s rvector_t;
+typedef struct rvector_s
+{
+    rbuf_t buf;
+    rvector_t *names;
+} rvector_t;
+/*@
+
+When the [[.names]] field is non-[[NULL]], it points to a vector of
+symbols, each element of which names the corresponding element of
+[[.buf.elts]].
+
+==rvec_is_named*/
+static inline bool rvec_is_named(const rvector_t *vec)
+    { return vec->names != NULL; }
+/*@
+
+==vectors*/
+//rvec_create//
+//rvec_add_names//
+//rvec_free//
+//rvec_gc//
+//rvec_hash//
+//rvec_equal//
+//rvec_print//
+//vec_ops//
+/*@
+
+Vectors are created without element names.
+
+==rvec_create*/
+rvector_t *rvec_create(rtype_t *typ, unsigned length)
+{
+    assert(rtype_is_vector(typ));
+    rvector_t *vec = rbuf_create(typ, length, sizeof(rvector_t));
+    vec->names = NULL;
+    return vec;
+}
+/*@ %
+
+[[rvec_add_names]] initialises and attaches a name vector to [[vec]],
+returning it to the caller (note that it allocates memory; since this
+may invoke the garbage collector, [[vec]] needs to be reachable from
+some GC root.)
+
+%% XXX remove memset when names are guaranteed to be populated
+==rvec_add_names*/
+rvector_t *rvec_add_names(rvector_t *vec)
+{
+    int len = rvec_len(vec);
+    assert(!vec->names);
+    vec->names = rvec_create(r_type_vec_symbol, len);
+    memset(rvec_elts(vec->names), 0, len * sizeof(rsymbol_t *));
+    return vec->names;
+}
+/*@ %
+
+The buffer's hash is combined with the name vector's, if the latter is
+present.
+
+==rvec_hash*/
+static uint32_t rvec_hash(const void *ptr)
+{
+    const rvector_t *vec = ptr;
+    uint32_t hash = rbuf_hash(&vec->buf);
+    if(vec->names)
+        return hash_roll(hash, r_hash(vec->names));
+    return hash;
+}
+/*@ %
+
+The elements and element names of two vectors must be equal for them to
+be considered equal.
+
+==rvec_equal*/
+static bool rvec_equal(const void *xp, const void *yp)
+{
+    const rvector_t *x = xp, *y = yp;
+    if(!rbuf_equal(&x->buf, &y->buf)
+       || rvec_is_named(x) != rvec_is_named(y))
+        return false;
+    return r_equal(x->names, y->names);
+}
+/*@ %
+
+Vectors have a slightly more verbose printed representation than in R.
+The first line is a header; the elements follow on the next, though the
+exact format differs depending on whether or not they are scalars
+(\autoref{vector:print}).
+
+==rvec_print*/
+static void rvec_print(FILE *fp, const void *ptr)
+{
+    const rvector_t *vec = ptr;
+    rtype_t *etyp = elt_type(&vec->buf);
+    rsymbol_t **names = vec->names ? rvec_elts(vec->names) : NULL;
+
+    print_vec_hdr(fp, vec);
+    if(rtype_is_scalar(etyp))
+        print_vec_scal(fp, etyp->scal, rvec_elts(vec), names, rvec_len(vec));
+    else
+        print_vec_obj(fp, rvec_elts(vec), names, rvec_len(vec));
+}
+/*@ %
+
+Aside from (possibly) marking the contents of the buffer, a vector also
+needs to mark its name vector when one is present.
+
+==rvec_gc*/
+static void rvec_gc(void *ptr)
+{
+    rvector_t *vec = ptr;
+    rbuf_gc(&vec->buf);
+    gc_mark(vec->names);
+}
+/*@ %
+
+The unmanaged memory holding the buffer's elements needs explicit
+deallocation.
+
+==rvec_free*/
+static void rvec_free(void *ptr)
+{
+    rbuf_free(ptr);
+}
+/*@ %
+
+==vec_ops*/
+static const typeops_t vec_ops = {
+    .free = rvec_free,
+    .gc = rvec_gc,
+    .hash = rvec_hash,
+    .equal = rvec_equal,
+    .print = rvec_print
+};
+/*@ %
+
+
+\section{Arrays}
+
+An array is a dense, multi-dimensional collection with a fixed shape.
+[[.buf.type]] is of kind [[ARRAY]]. Elements are stored at [[.buf.elts]]
+in column-major order. The extents of the array are recorded in
+[[.shape]], and its dimension in [[.rank]].
+
+==rarray_t*/
+typedef struct
+{
+    rbuf_t buf;
+    int rank;
+    int *shape;
+    rvector_t *dimnames;
+} rarray_t;
+/*@ %
+
+If [[.dimnames]] is non-[[NULL]], the array is named. Each
+(non-[[NULL]]) element of this vector is itself a vector of names for
+the indices of the corresponding dimension.
+
+==rarr_is_named*/
+static inline bool rarr_is_named(const rarray_t *arr)
+    { return arr->dimnames != NULL; }
+/*@
+
+Two arrays \textit{conform} if they have the same dimensions -- that is,
+their ranks and shapes are equal.
+
+==rarr_conform*/
+static inline bool rarr_conform(const rarray_t *x, const rarray_t *y)
+    { return rarr_shape_conform(x->rank, y->rank, x->shape, y->shape); }
+/*@
+
+==rarr_shape_conform*/
+static inline bool rarr_shape_conform(int xr, int yr, int *xs, int *ys)
+    { return (xr == yr) && !memcmp(xs, ys, sizeof(int) * xr); }
+/*@
+
+==arrays*/
+//arr_length//
+//rarr_create_buf//
+//rarr_set_shape//
+//rarr_create//
+//rarr_add_names//
+//rarr_free//
+//rarr_gc//
+//rarr_hash//
+//rarr_equal//
+//rarr_print//
+//arr_ops//
+/*@ %
+
+Creating an array is a matter of creating the underlying buffer and
+initialising the [[.shape]] field (these functions are split out so that
+they are available to the vectorised arithmetic subsystem in
+\autoref{arith}.)
+
+==rarr_create*/
+rarray_t *rarr_create(rtype_t *typ, int rank, int *dims)
+{
+    assert(rank >= 0);
+    int len = arr_length(rank, dims);
+    rarray_t *arr = rarr_create_buf(typ, len);
+    rarr_set_shape(arr, rank, dims);
+    return arr;
+}
+/*@ %
+
+[[.buf]] must have length equal to the product of the provided
+dimensions.
+
+==arr_length*/
+static int arr_length(int rank, int *dims)
+{
+    int len = rank > 0 ? 1 : 0;
+    for(int i = 0; i < rank; i++)
+        len *= dims[i];
+    return len;
+}
+/*@ %
+
+As per vectors, arrays are created without dimnames.
+
+==rarr_create_buf*/
+rarray_t *rarr_create_buf(rtype_t *typ, int len)
+{
+    rarray_t *arr = rbuf_create(typ, len, sizeof(rarray_t));
+
+    arr->rank = 0;
+    arr->shape = NULL;
+    arr->dimnames = NULL;
+    return arr;
+}
+/*@ %
+
+The [[.shape]] of an array is stored out-of-line in unmanaged memory
+(the provided dimensions are not sanity checked against [[.buf.length]];
+this function is not user-visible.)
+
+==rarr_set_shape*/
+void rarr_set_shape(rarray_t *arr, int rank, int *dims)
+{
+    size_t sz = rank * sizeof(int);
+    int *shape = rank > 0 ? xmalloc(sz) : NULL;
+
+    memcpy(shape, dims, sz);
+    arr->rank = rank;
+    if(arr->shape)
+        xfree(arr->shape);
+    arr->shape = shape;
+}
+/*@ %
+
+Adding dimnames to an array creates and initialises a new vector,
+assigning it to [[.dimnames]] (the note from [[rvec_add_names]] applies
+in this case, too.) Each dimension can then have its indices named by
+setting its corresponding element to a vector of symbols with correct
+length.
+
+==rarr_add_names*/
+rvector_t *rarr_add_names(rarray_t *arr)
+{
+    assert(!arr->dimnames);
+    arr->dimnames = rvec_create(r_type_vec_names, arr->rank);
+    memset(rvec_elts(arr->dimnames), 0, arr->rank * sizeof(rvector_t *));
+    return arr->dimnames;
+}
+/*@ %
+
+The hash of an array additionally includes the hash of its shape.
+
+==rarr_hash*/
+static uint32_t rarr_hash(const void *ptr)
+{
+    const rarray_t *arr = ptr;
+    uint32_t hash = rbuf_hash(&arr->buf);
+    hash = hash_code_seed(arr->shape, arr->rank * sizeof(int), hash);
+    if(arr->dimnames)
+        return hash_roll(hash, r_hash(arr->dimnames));
+    return hash;
+}
+
+/*@ %
+
+Two arrays are equal if their shapes conform, and their elements and
+dimnames are equal.
+
+==rarr_equal*/
+static bool rarr_equal(const void *xp, const void *yp)
+{
+    const rarray_t *x = xp, *y = yp;
+
+    if(!rarr_conform(x, y)
+       || !rbuf_equal(&x->buf, &y->buf)
+       || rarr_is_named(x) != rarr_is_named(y))
+        return false;
+    return r_equal(x->dimnames, y->dimnames);
+}
+/*@ %
+
+Arrays are printed in a similar manner to vectors; the header line is
+followed by the elements, with a different format for scalars.
+
+==rarr_print*/
+static void rarr_print(FILE *fp, const void *ptr)
+{
+    const rarray_t *arr = ptr;
+    rtype_t *etyp = elt_type(&arr->buf);
+    rvector_t **dimnames = arr->dimnames ? rvec_elts(arr->dimnames) : NULL;
+
+    print_arr_hdr(fp, arr);
+    if(rtype_is_scalar(etyp))
+        print_arr_scal(fp, etyp->scal, rvec_elts(arr), dimnames,
+                       arr->rank, arr->shape);
+    else
+        print_arr_obj(fp, rvec_elts(arr), dimnames,
+                      arr->rank, arr->shape);
+}
+/*@ %
+
+The dimnames vector must be marked, as well as the elements in the
+buffer (depending on type.)
+
+==rarr_gc*/
+static void rarr_gc(void *ptr)
+{
+    rarray_t *arr = ptr;
+    rbuf_gc(&arr->buf);
+    gc_mark(arr->dimnames);
+}
+/*@ %
+
+In addition to the buffer, [[.shape]] must be deallocated.
+
+==rarr_free*/
+static void rarr_free(void *ptr)
+{
+    rarray_t *arr = ptr;
+    rbuf_free(&arr->buf);
+    if(arr->shape)
+        xfree(arr->shape);
+}
+/*@ %
+
+==arr_ops*/
+static const typeops_t arr_ops = {
+    .free = rarr_free,
+    .gc = rarr_gc,
+    .hash = rarr_hash,
+    .equal = rarr_equal,
+    .print = rarr_print
+};
+/*@ %
+
+
+\section{Printing}
+
+The printed representations of vectors and arrays take into account
+element type, presence of (dim)names, and user-specified options.
+
+Various fields (names sometimes, scalars always) are tabulated by
+computing the maximum printed width of the values in each column, then
+padding each element with whitespace to ensure horizontal alignment.
+
+==printing*/
+//clip_to_max//
+//clip_npieces//
+//name_width//
+//names_width//
+//scalfmt_t//
+//scalfmt_init//
+//scalfmt_width//
+//idx_width//
+//print_name//
+//printing vectors//
+//printing arrays//
+/*@
+
+Users may specify with [[opt.print_max]] a maximum number of elements to
+print. [[clip_to_max]] returns [[true]] if its input was reduced due to
+exceeding this value.
+%% XXX bad name?
+
+==clip_to_max*/
+static inline bool clip_to_max(int *plen)
+{
+    if(*plen > opt.print_max)
+    {
+        *plen = opt.print_max;
+        return true;
+    }
+    return false;
+}
+/*@
+
+If a `piece' consists of [[piecelen]] elements, and there are
+[[*npieces]] to print, [[clip_npieces]] adjusts the latter when the
+total number of elements exceeds the specified maximum. In this case, it
+returns [[true]].
+
+==clip_npieces*/
+static bool clip_npieces(int *npieces, int piecelen)
+{
+    int len = *npieces * piecelen;
+    bool truncated = clip_to_max(&len);
+
+    if(piecelen > 0)
+    {
+        // divide into pieces
+        div_t r = div(len, piecelen);
+        *npieces = r.quot + (r.rem > 0);
+    }
+    return truncated;
+}
+/*@
+
+Users may also specify a maximum printed name length with
+[[opt.print_name_max]]. [[name_width]] returns the number of characters
+in a name, respecting this limit.
+
+==name_width*/
+static inline int name_width(rsymbol_t *name)
+{
+    int l = strlen(r_symstr(name));
+    return min(l, opt.print_name_max);
+}
+/*@
+
+[[names_width]] returns the number of characters taken by the longest
+name of those it's given.
+
+==names_width*/
+static int names_width(rsymbol_t **names, int len)
+{
+    int width = 0;
+    for(int i = 0; i < len; i++)
+    {
+        int w = name_width(names[i]);
+        width = max(width, w);
+    }
+    return width;
+}
+/*@ %
+
+This can be taken into account when computing the width of a column
+containing names (possibly amongst other things,) so that its elements
+can be printed in right-justified fields of equal width (which is used
+as both precision and width specifier, since [[name]] might need to be
+truncated.)
+
+==print_name*/
+static void print_name(FILE *fp, rsymbol_t *name, int width)
+{
+    fprintf(fp, "%*.*s", width, width, r_symstr(name));
+}
+/*@ %
+
+An index value (if not otherwise named) is printed as an integer, so its
+width is that of an equivalent [[r_type_int]].
+%% XXX??
+
+==idx_width*/
+static inline int idx_width(int i)
+{
+    const scaldesc_t *intscal = r_type_int->scal;
+    return intscal->width(&i, 0, NULL);
+}
+/*@
+
+The maximum printed [[.width]] can be found for a column (or vector) of
+scalars, but some types need additional [[.data]].
+
+==scalfmt_t*/
+typedef struct
+{
+    int width;
+    void *data;
+} scalfmt_t;
+/*@
+
+[[scalfmt_width]] updates [[fmt]] with just this value, computed over
+the [[len]] scalar elements at [[eptr]].
+
+==scalfmt_width*/
+static inline void scalfmt_width(scalfmt_t *fmt, const scaldesc_t *scal,
+                                 uint8_t *eptr, int len)
+{
+    for(int i = 0; i < len; i++, eptr += scal->size)
+        fmt->width = scal->width(eptr, fmt->width, fmt->data);
+}
+/*@ %
+
+Since other values can be printed in the same column, [[scalfmt_init]]
+takes an initial value of width as input.
+
+==scalfmt_init*/
+#define scalfmt_init(w, s) \
+    (scalfmt_t) { .width = (w), .data = scalprint_init(s) }
+/*@
+
+
+\subsection{Printing Vectors}
+
+==printing vectors*/
+//print_vec_hdr//
+//print_vec_scal_elts//
+//print_vec_scal_names//
+//print_vec_obj//
+//print_vec_scal//
+/*@
+
+The header line of a vector prints as ``[[vector(type) [length]]]''.
+
+==print_vec_hdr*/
+static void print_vec_hdr(FILE *fp, const rvector_t *vec)
+{
+    r_print(fp, r_typeof(vec));
+    fprintf(fp, " [%d]", rvec_len(vec));
+}
+/*@
+
+When the vector doesn't have scalar element type, each element is
+[[r_print]]ed on a line of its own. The line is prefixed with a
+``[[name:]]'' (if the vector has them) or an ``[[[index]:]] '' (if not.)
+
+The maximum printed [[width]] of these prefixes defines the width of the
+field in which each is right justified. A trailing ``[[...]]'' signifies
+the output was [[truncated]] at user request.
+
+==print_vec_obj*/
+static void print_vec_obj(FILE *fp, robject_t **objs, rsymbol_t **names,
+                          int len)
+{
+    int width = names
+        ? names_width(names, len)
+        : idx_width(len);
+    bool truncated = clip_to_max(&len);
+
+    for(int i = 0; i < len; i++)
+    {
+        fprintf(fp, "\n");
+        if(names)
+            print_name(fp, names[i], width);
+        else
+            fprintf(fp, "[%*d]", width, i + 1);
+        fprintf(fp, ": ");
+        r_print(fp, objs[i]);
+    }
+
+    if(truncated)
+        fprintf(fp, "\n ...");
+}
+/*@ %
+
+A vector of scalars prints more compactly, at the cost of some extra
+work up-front. It is also [[truncated]] with ``[[...]]'' if necessary.
+
+==print_vec_scal*/
+static void print_vec_scal(FILE *fp, const scaldesc_t *scal, void *elts,
+                           rsymbol_t **names, int len)
+{
+    uint8_t *eptr = elts;
+    bool truncated = clip_to_max(&len);
+    //print vector//
+    if(truncated)
+        fprintf(fp, " ...");
+}
+/*@ %
+
+All elements are printed in fields of identical width -- equal to the
+maximum required by any element in the vector. The maximum width of the
+element names is also taken into account, if they are present.
+
+==print vector*/
+scalfmt_t fmt = scalfmt_init(names ? names_width(names, len) : 0, scal);
+scalfmt_width(&fmt, scal, elts, len);
+/*@
+
+The printed representation of the vector may span multiple lines. If
+element names are absent, each begins with ``[[[index]]]'', [[nch]]
+characters wide, with the index right-justified in a field of
+[[iwidth]].
+
+==print vector*/
+int iwidth = idx_width(len);
+int nch = names ? 0 : iwidth + 2;
+/*@
+
+The user option [[opt.print_line]] specifies the number of characters
+after which a line should be broken. Until this limit is exceeded,
+[[linech]] accumulates the widths of elements (including leading spaces)
+so as to compute [[llen]], the number of elements to print on a single
+line. [[lsz]] is the size in bytes of the line's worth of elements (as
+scalar types differ in size.)
+
+==print vector*/
+int linech = nch, llen = 0;
+size_t lsz = scal->size;
+for(int i = 0; i < len; i++)
+{
+    linech += fmt.width + 1;
+    if(linech > opt.print_line && i > 0)
+        break;
+    llen++;
+}
+lsz *= llen;
+/*@
+
+Each line is printed while advancing the index [[i]] and pointer
+[[eptr]]. [[plen]] accounts for a trailing partial line if [[llen]] does
+not divide [[len]].
+
+==print vector*/
+for(int i = 0; i < len; i += llen, eptr += lsz)
+{
+    int plen = min(llen, len - i);
+
+    fprintf(fp, "\n");
+    if(!names)
+        fprintf(fp, "[%*d]", iwidth, i + 1);
+    print_vec_scal_elts(fp, scal, eptr, plen, fmt);
+    if(names)
+        print_vec_scal_names(fp, names + i, plen, fmt.width);
+}
+/*@
+
+The [[scal.print]] callback is invoked for each element in the line\ldots
+
+==print_vec_scal_elts*/
+static inline void
+print_vec_scal_elts(FILE *fp, const scaldesc_t *scal, uint8_t *eptr,
+                    int len, scalfmt_t fmt)
+{
+    for(int i = 0; i < len; i++, eptr += scal->size)
+    {
+        fprintf(fp, " ");
+        scal->print(fp, eptr, fmt.width, fmt.data);
+    }
+}
+/*@
+
+\ldots and if names are present, each is printed below its corresponding
+element.
+
+==print_vec_scal_names*/
+static inline void print_vec_scal_names(FILE *fp, rsymbol_t **names,
+                                        int len, int width)
+{
+    fprintf(fp, "\n");
+    for(int i = 0; i < len; i++)
+    {
+        fprintf(fp, " ");
+        print_name(fp, names[i], width);
+    }
+}
+/*@
+
+
+\subsection{Printing Arrays}
+\label{vector:print}
+
+==printing arrays*/
+//idxs_advance//
+//idxs_init//
+//idx_name//
+//print_idxs//
+//print_arr_hdr//
+//print_arr_obj//
+//print_arr_scal_elts//
+//slice_width//
+//print_col_idxs//
+//print_slice//
+//print_slices//
+//print_arr_scal//
+/*@
+
+An array's header line is similar to a vector's, with shape instead of
+length: ``[[array(type) [rows,cols,...]]]''.
+
+==print_arr_hdr*/
+static void print_arr_hdr(FILE *fp, const rarray_t *arr)
+{
+    r_print(fp, r_typeof(arr));
+    fprintf(fp, " [");
+    for(int i = 0; i < arr->rank; i++)
+    {
+        if(i > 0)
+            fprintf(fp, ", ");
+        fprintf(fp, "%d", arr->shape[i]);
+    }
+    fprintf(fp, "]");
+}
+/*@
+
+To step through an array an element at a time, a set of indices are
+tracked, one per dimension. [[idxs_init]] zeros its input, accumulating
+and returning the number of elements in the array.
+
+==idxs_init*/
+static inline int idxs_init(int rank, int *shape, int *idxs)
+{
+    int len = 1;
+    for(int i = 0; i < rank; i++)
+    {
+        idxs[i] = 0;
+        len *= shape[i];
+    }
+    return len;
+}
+/*@
+
+Arrays are column-major, so the leftmost index increases fastest when
+advancing [[idxs]] through the array.
+
+==idxs_advance*/
+static inline void idxs_advance(int rank, int *shape, int *idxs)
+{
+    for(int i = 0; i < rank; i++)
+    {
+        if(++idxs[i] >= shape[i])
+            idxs[i] = 0;
+        else
+            break;
+    }
+}
+/*@
+
+Like vectors, an array without scalar element type prints each element
+on its own line, with a prefix indicating its position in the container.
+The output may be [[truncated]].
+
+If [[dimnames]] is non-[[NULL]], each element corresponds to a dimension
+of the array, and is either [[NULL]] or an [[rvector_t]] of index names.
+In this last case, the names are printed in lieu of numeric indices for
+that dimension.
+
+==print_arr_obj*/
+static void print_arr_obj(FILE *fp, robject_t **objs, rvector_t **dimnames,
+                          int rank, int *shape)
+{
+    int *idxs = alloca(rank * sizeof(int));
+    int len = idxs_init(rank, shape, idxs);
+    bool truncated = clip_to_max(&len);
+
+    for(int i = 0; i < len; i++)
+    {
+        fprintf(fp, "\n[");
+        print_idxs(fp, idxs, rank, dimnames);
+        fprintf(fp, "]: ");
+        r_print(fp, objs[i]);
+        idxs_advance(rank, shape, idxs);
+    }
+    if(truncated)
+        fprintf(fp, "\n ...");
+}
+/*@ %
+
+The prefix is printed as ``[[[row,col,...]: ]]'', with each index either
+a name or number.
+
+==print_idxs*/
+static inline void print_idxs(FILE *fp, int *idxs, int rank,
+                              rvector_t **dimnames)
+{
+    for(int i = 0; i < rank; i++)
+    {
+        int idx = idxs[i];
+
+        if(i > 0)
+            fprintf(fp, ",");
+        if(dimnames && dimnames[i])
+            fprintf(fp, "%s", r_symstr(idx_name(dimnames[i], idx)));
+        else
+            fprintf(fp, "%d", idx + 1);
+    }
+}
+/*@
+
+Given an element of [[dimnames]] and an index in the corresponding
+dimension, [[idx_name]] extracts the corresponding name.
+
+==idx_name*/
+static inline rsymbol_t *idx_name(rvector_t *names, int i)
+    { return ((rsymbol_t **)rvec_elts(names))[i]; }
+/*@
+
+The printed representation of an array of scalars depends on its rank.
+Arrays of zero rank produce no further output; arrays of rank one can
+reuse [[print_vec_scal]]. Arrays of higher rank are printed as a
+sequence of two-dimensional \textit{slices}.
+
+==print_arr_scal*/
+static void print_arr_scal(FILE *fp, const scaldesc_t *scal, void *elts,
+                           rvector_t **dimnames, int rank, int *shape)
+{
+    switch(rank)
+    {
+    case 0:
+        break;
+    case 1:
+        print_vec_scal(fp, scal, elts,
+                       dimnames ? rvec_elts(dimnames[0]) : NULL,
+                       shape[0]);
+        break;
+    case 2:
+        print_slice(fp, scal, elts, dimnames, shape);
+        break;
+    default:
+        print_slices(fp, scal, elts, dimnames, rank, shape);
+        break;
+    }
+}
+/*@ %
+
+If more than one slice is to be printed, they are considered as elements
+of an array of two fewer dimensions, with rank [[rrank]], shape
+[[rshape]] and length [[len]]. This reduced-rank array is then stepped
+through, and each slice ([[slicelen]] elements in length, [[ssz]] bytes
+in size) printed.
+
+If the number of elements exceeds the user's specified maximum, the
+output will be [[truncated]].
+
+A slice has a header line of the form ``[[[,,idx,idx,...]]]'',
+indicating the index of the first element (the leading two indices are
+omitted as they'll always be [[1]].)
+
+==print_slices*/
+static void print_slices(FILE *fp, const scaldesc_t *scal, uint8_t *eptr,
+                         rvector_t **dimnames, int rank, int *shape)
+{
+    int rrank = rank - 2, *rshape = shape + 2;
+    int slicelen = shape[0] * shape[1];
+    int *idxs = alloca(rrank * sizeof(int));
+    int len = idxs_init(rrank, rshape, idxs);
+    bool truncated = clip_npieces(&len, slicelen);
+    size_t ssz = slicelen * scal->size;
+
+    for(int i = 0; i < len; i++, eptr += ssz)
+    {
+        fprintf(fp, "\n\n[,,");
+        print_idxs(fp, idxs, rrank, dimnames ? dimnames + 2 : NULL);
+        fprintf(fp, "]");
+        print_slice(fp, scal, eptr, dimnames, shape);
+        idxs_advance(rrank, rshape, idxs);
+    }
+    if(truncated)
+        fprintf(fp, "\n ...");
+}
+/*@
+
+Convenient synonyms are defined for row and columns counts and names.
+The slice may be [[truncated]]; if so, fewer rows will be printed.
+
+==print_slice*/
+static void print_slice(FILE *fp, const scaldesc_t *scal, uint8_t *eptr,
+                        rvector_t **dimnames, int *shape)
+{
+    rvector_t *rownames = dimnames ? dimnames[0] : NULL,
+              *colnames = dimnames ? dimnames[1] : NULL;
+    int nrows = shape[0], ncols = shape[1];
+    size_t csz = scal->size * nrows;
+    bool truncated = clip_npieces(&nrows, ncols);
+    //print slice//
+    if(truncated)
+        fprintf(fp, "\n ...");
+}
+/*@
+
+The slice is printed in one or more \textit{chunks} of columns. Each
+chunk prints as a header line followed by [[nrows]] rows.
+
+Row indices share a single field width, [[riwidth]]. This takes [[nch]]
+characters -- if the rows aren't named, the index prints as
+``[[[idx,]]]'', so adds 3.
+
+==print slice*/
+int riwidth = rownames
+    ? names_width(rvec_elts(rownames), nrows)
+    : idx_width(nrows);
+int nch = rownames ? riwidth : riwidth + 3;
+/*@
+
+Each column has a separate [[scalfmt_t]], unlike vectors where one is
+shared by all elements. A column index contributes its total width to
+the [[.width]] of its column, but might have a different field width,
+stored in [[ciwidths]].
+
+==print slice*/
+int *ciwidths = alloca(ncols * sizeof(int));
+scalfmt_t *fmts = alloca(ncols * sizeof(scalfmt_t));
+
+for(int i=0; i<ncols; i++)
+    fmts[i] = scalfmt_init(0, scal);
+slice_width(scal, eptr, fmts, ciwidths, colnames, nrows, ncols);
+/*@
+
+Stepping through the array by column, the index width provides the
+initial value of [[.width]] for the scalar elements. If column names are
+not present, the printed representation ``[[[,idx]]]'' adds 3
+characters, the same as row indices.
+
+==slice_width*/
+static void
+slice_width(const scaldesc_t *scal, uint8_t *eptr, scalfmt_t *fmts,
+            int *ciwidths, rvector_t *colnames, int nrows, int ncols)
+{
+    size_t csz = scal->size * nrows;
+
+    for(int i = 0; i < ncols; i++, eptr += csz)
+    {
+        int iwidth = colnames
+            ? name_width(idx_name(colnames, i))
+            : idx_width(i + 1);
+
+        ciwidths[i] = iwidth;
+        fmts[i].width = colnames ? iwidth : 3 + iwidth;
+        scalfmt_width(&fmts[i], scal, eptr, nrows);
+    }
+}
+/*@
+
+Printing one chunk advances column index [[i]] to [[end]], and initial element
+pointer [[eptr]] by the corresponding number of bytes.
+
+==print slice*/
+for(int i = 0, end = 0; i < ncols; eptr += (end - i) * csz, i = end)
+{
+    //print line//
+}
+/*@
+
+[[linech]] records the number of characters printed on a line. Column
+widths (and separating spaces) are accumulated, updating [[end]], until
+either all have been accounted for or the specified line length is
+exceeded.
+
+==print line*/
+int linech = nch;
+for(int j = i; j < ncols; j++)
+{
+    linech += fmts[j].width + 1;
+    if(linech > opt.print_line && j > i)
+        break;
+    end++;
+}
+/*@
+
+Indenting past the row index aligns the chunk header line.
+
+==print line*/
+fprintf(fp, "\n%*s", nch, "");
+print_col_idxs(fp, i, end, fmts, ciwidths, colnames);
+/*@
+
+This contains the indices of columns from [[i]] to [[end]]. In the
+absence of names, the bracketed index is right-justified in its field.
+
+==print_col_idxs*/
+static inline void print_col_idxs(FILE *fp, int i, int end, scalfmt_t *fmts,
+                                  int *ciwidths, rvector_t *colnames)
+{
+    for(; i < end; i++)
+    {
+        fprintf(fp, " ");
+        if(colnames)
+            print_name(fp, idx_name(colnames, i), fmts[i].width);
+        else
+            fprintf(fp, "%*s[,%*d]",
+                    max(fmts[i].width - ciwidths[i] - 3, 0), "",
+                    ciwidths[i], i + 1);
+    }
+}
+/*@
+
+Each row is printed on one line, starting with the row index. [[rptr]]
+is set to point to the start of the row, and is stepped by one element,
+since arrays are stored in column-major order.
+
+==print line*/
+uint8_t *rptr = eptr;
+for(int j = 0; j < nrows; j++, rptr += scal->size)
+{
+    fprintf(fp, "\n");
+    if(rownames)
+        print_name(fp, idx_name(rownames, j), riwidth);
+    else
+        fprintf(fp, "[%*d,]", riwidth, j + 1);
+    print_arr_scal_elts(fp, scal, rptr, i, end, csz, fmts);
+}
+/*@
+
+Elements on a row are printed similarly to those in a vector, except
+each has its own [[scalfmt_t]].
+
+==print_arr_scal_elts*/
+static inline void
+print_arr_scal_elts(FILE *fp, const scaldesc_t *scal, uint8_t *eptr,
+                    int i, int end, int csz, scalfmt_t *fmts)
+{
+    for(; i < end; i++, eptr += csz)
+    {
+        fprintf(fp, " ");
+        scal->print(fp, eptr, fmts[i].width, fmts[i].data);
+    }
+}
+/*@
+
+
+\section{Initialisation}
+
+A convenience function allows the creation and installation of a vector
+type with a specified element type.
+
+==rtype_vec_init*/
+static inline rtype_t *rtype_vec_init(rtype_t *elt_type, const char *name)
+{
+    rtype_t *type = rvec_type_create(elt_type);
+    rtype_install(type, name);
+    return type;
+}
+/*@ %
+
+The type constructors [[r_type_vector]] and [[r_type_array]] are
+installed as ``[[vector]]'' and ``[[array]]''; instances required
+by some builtins are saved in [[r_type_vec_]] globals, and installed
+under (hopefully) familiar names.
+
+==rt_install_vec_types*/
+rtype_t *r_type_vector, *r_type_array,
+        *r_type_vec_symbol, *r_type_vec_names, *r_type_vec_object,
+        *r_type_vec_boolean, *r_type_vec_int, *r_type_vec_double;
+
+void rt_install_vec_types()
+{
+    r_type_vector = rtype_cons_init(&cntr_vec.cons, "vector");
+    r_type_array = rtype_cons_init(&cntr_arr.cons, "array");
+    r_type_vec_object = rtype_vec_init(r_type_object, "list");
+    r_type_vec_symbol = rtype_vec_init(r_type_symbol, "names");
+    r_type_vec_names = rtype_vec_init(r_type_vec_symbol, "dimnames");
+    r_type_vec_boolean = rtype_vec_init(r_type_boolean, "logical");
+    r_type_vec_int = rtype_vec_init(r_type_int, "integer");
+    r_type_vec_double = rtype_vec_init(r_type_double, "numeric");
+}
+/*@ %
+
+
+\section*{Miscellanea}
+
+%% .c
+==includes*/
+#include "global.h"
+#include "rt/builtin.h"
+#include "ast.h"
+/*@ %
+
+%% .h
+==rt/vector.h*/
+//rbuf_t//
+//rvector_t//
+//rarray_t//
+//externs//
+//prototypes//
+//elt_type//
+//rvec accessors//
+//rvec_is_named//
+//rarr_is_named//
+//is_named//
+//rarr_shape_conform//
+//rarr_conform//
+/*@
+
+==externs*/
+extern rtype_t *r_type_vector, *r_type_array,
+    *r_type_vec_symbol, *r_type_vec_names, *r_type_vec_object,
+    *r_type_vec_boolean, *r_type_vec_int, *r_type_vec_double;
+/*@ %
+
+==prototypes*/
+rtype_t *rvec_type_create(rtype_t *elt_type);
+rvector_t *rvec_create(rtype_t *typ, unsigned length);
+rvector_t *rvec_add_names(rvector_t *vec);
+
+rtype_t *rarr_type_create(rtype_t *etyp);
+rarray_t *rarr_create_buf(rtype_t *typ, int length);
+void rarr_set_shape(rarray_t *arr, int rank, int *dims);
+rarray_t *rarr_create(rtype_t *typ, int rank, int *dims);
+rvector_t *rarr_add_names(rarray_t *arr);
+
+void rt_install_vec_types();
+/*@ %
+
+%*/

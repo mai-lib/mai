@@ -1,0 +1,2088 @@
+/*@
+%% XXX name maybe?
+\chapter{AST Conversion}
+\label{ir_convert}
+
+Given an abstract syntax tree parsed from a user program (\autoref{parser:ast}),
+\textit{conversion} creates from it the functions, variables, blocks and
+nodes (\autoref{ir}) upon which the rest of the compiler will operate.
+%% XXX "semantic analysis", cite Aho & Ullman??
+
+==ir_convert.c*/
+//includes//
+//diagnostics//
+//environments//
+//building//
+//bindings//
+//forms//
+//conversion//
+//check_resolve//
+//resolve_global//
+//ir_convert//
+/*@
+
+
+\section{Environments}
+
+Lexically nested constructs give rise to linked \textit{environments}.
+
+==environments*/
+//function env//
+//lexical env//
+//loop env//
+/*@
+
+
+\subsection{Function Environment}
+
+The function environment [[funenv_t]] tracks the function
+(\autoref{ir:func})currently being converted\ldots
+
+==function env*/
+//funenv_t//
+//fun_open//
+//fun_add_block//
+//fun_close//
+/*@
+
+\ldots in the [[.function]] field. The [[.cblock_head]] list contains
+the basic blocks (\autoref{ir:block}) which will form its body, in no particular order.
+
+==funenv_t*/
+typedef struct funenv
+{
+    cfunction_t *function;
+    list_t cblock_head;
+} funenv_t;
+/*@
+
+[[fun_open]] initialises the environment [[fun]], lexically nested
+inside its [[parent]] (which is [[NULL]] if the former is the
+\textit{top-level function}, created in \autoref{ir_convert:ir_convert}.)
+
+==fun_open*/
+static funenv_t *fun_open(funenv_t *fun, funenv_t *parent)
+{
+    fun->function = cfunc_create(parent ? parent->function : NULL);
+    list_init(&fun->cblock_head);
+    return fun;
+}
+/*@
+
+A new block is created, added to the function, and returned by
+[[fun_add_block]].
+
+==fun_add_block*/
+static cblock_t *fun_add_block(funenv_t *fun)
+{
+    cblock_t *block = cblock_create();
+    list_add(&fun->cblock_head, &block->cblock_list);
+    return block;
+}
+/*@
+
+When conversion of a function's body is complete, [[fun_close]]
+initialises the [[.function]]'s [[entry]] block and computes the type of
+the closures that it will create, taking arguments and return type
+[[ret_type]] into account. The resulting [[cfunction_t]] is returned.
+
+At this point the blocks are still in the environment's [[.cblock_head]]
+list. Starting at [[entry]], [[cfunc_rdfo]] traverses the control-flow
+graph, relinking blocks into [[fn]]'s list in reverse-depth-first order
+(\autoref{ir_pre:rdfo}).
+
+==fun_close*/
+static cfunction_t *fun_close(funenv_t *fun, cblock_t *entry,
+                              rtype_t *ret_type)
+{
+    cfunction_t *fn = fun->function;
+
+    fn->entry = entry;
+    fn->cl_type = cfunc_type(fn, ret_type);
+    cfunc_rdfo(fn);
+    return fn;
+}
+/*@
+
+Unreachable blocks should not be created in the first place (it would be
+nice to verify this, but [[assert]]s have sufficed so far.)
+
+
+\subsection{Lexical Environment}
+
+A named lexical variable is \textit{bound} to a value by some syntactic
+construct. The variable refers to that value only within the
+\textit{scope} of the construct.
+% XXX cite something for bound, free variables?!
+
+==lexical env*/
+//lexenv_t//
+//env_add//
+//env_add_global//
+//env_find//
+//env_find_add//
+//env_open//
+//env_close//
+/*@
+
+A [[lexenv_t]] is associated with each scope during conversion.
+[[.parent]] points outward to the enclosing environment. [[.vars]] maps
+[[rsymbol_t]] names to [[cvar_t]] variables; it's lazily created, and
+initially [[NULL]]. The distinct, shared [[.global]] environment is
+outside all others.
+
+==lexenv_t*/
+typedef struct lexenv lexenv_t;
+typedef struct lexenv
+{
+    hashmap_t *vars;
+    lexenv_t *parent;
+    lexenv_t *global;
+} lexenv_t;
+/*@
+
+[[env_open]] enters an environment [[env]] for a new scope within
+[[parent]]. If the latter is [[NULL]], it's the outermost, so must be
+the [[.global]] itself.
+
+==env_open*/
+static lexenv_t *env_open(lexenv_t *env, lexenv_t *parent)
+{
+    *env = (lexenv_t) {
+        .vars = NULL,
+        .parent = parent,
+        .global = parent ? parent->global : env,
+    };
+    return env;
+}
+/*@
+
+[[.vars]] is freed by [[env_close]] when leaving the scope.
+
+==env_close*/
+static void env_close(lexenv_t *env)
+{
+    if(env->vars)
+        hashmap_free(env->vars);
+}
+/*@
+
+[[env_find]] recursively searches for a variable of given [[name]] in
+the [[.vars]] of each [[lexenv_t]], in the list starting at [[env]] and
+proceeding by [[.parent]]. [[NULL]] is returned on failure.
+
+==env_find*/
+static cvar_t *env_find(lexenv_t *env, rsymbol_t *name)
+{
+    bool found = false;
+    cvar_t *var;
+
+    if(env->vars)
+    {
+        var = hashmap_get(env->vars, name, &found);
+        if(found)
+            return var;
+    }
+    if(env->parent)
+        return env_find(env->parent, name);
+    return NULL;
+}
+/*@
+
+[[env_add_global]] creates a new variable, adding it to the [[.global]]
+environment. Initially of [[.type]] [[GLOBAL_EXT]], it could be declared
+later in the input, or have its [[.extl.global]] field resolved to some
+[[rglobal_t]] at conversion's end.
+
+==env_add_global*/
+static cvar_t *env_add_global(lexenv_t *env, rsymbol_t *name)
+{
+    cvar_t *var = cvar_create(name, GLOBAL_EXT, NULL);
+
+    var->extl.global = NULL;
+    env_add(env->global, var);
+    return var;
+}
+/*@
+
+[[env_add]] extends [[env]] with [[var]]. Variables of the same name in
+enclosing environments are \textit{shadowed}; together with
+[[env_find]], this accomplishes $\alpha$-renaming. Within a single
+environment, a later binding will replace an earlier one. [[.vars]] is
+created if the environment is currently empty.
+%cite lambda calculus
+
+==env_add*/
+static cvar_t *env_add(lexenv_t *env, cvar_t *var)
+{
+    if(!env->vars)
+        env->vars = hashmap_create(rsym_hash, ptr_eq);
+    hashmap_set(env->vars, var->name, var);
+    return var;
+}
+/*@
+
+When [[env_find_add]] is called, if no variable of that [[name]] can be
+found, one is created and added to the global environment.
+
+==env_find_add*/
+static cvar_t *env_find_add(lexenv_t *env, rsymbol_t *name)
+{
+    cvar_t *var = env_find(env, name);
+
+    if(var)
+        return var;
+    return env_add_global(env, name);
+}
+/*@
+
+
+\subsection{Loop Environment}
+
+The loop environment keeps track of the blocks to which the
+``[[break]]'' and ``[[continue]]'' keywords will branch -- these being
+the [[.brk]] and [[.cont]] fields, respectively.
+
+==loop env*/
+typedef struct
+{
+    cblock_t *brk, *cont;
+} loopenv_t;
+/*@
+
+
+\section{Building}
+
+A \textit{builder} structure represents the context in which conversion
+takes place, appending nodes (\autoref{ir:node}) to the function under
+construction.
+
+==building*/
+//ir_builder_t//
+//prototypes//
+//is_top_level//
+//ir_open//
+//ir_build//
+//ir_extend//
+//build_constant//
+//build_ref//
+//build_call//
+//build_phi//
+//build_if//
+//build_set//
+//build_return//
+//build_bind//
+//build_lambda//
+//build_builtin//
+//constant_from_literal//
+/*@
+
+
+\subsection{IR Builder}
+
+An [[ir_builder_t]] simplifies construction of control and value flow.
+The [[.head]] and [[.tail]] fields track the single entry and exit
+blocks in the connected subgraph. If the last node built computes a
+[[.value]], that is also tracked.
+
+[[.fun]], [[.env]] and [[.loop]] point to the environments currently in
+effect. When [[.pfailed]] is non-[[NULL]], it points to a flag which
+will be set if an error should be encountered during conversion.
+
+==ir_builder_t*/
+typedef struct ir_builder
+{
+    rsymbol_t *file;
+    cblock_t *head, *tail;
+    bool *pfailed;
+    cnode_t *value;
+    funenv_t *fun;
+    lexenv_t *env;
+    loopenv_t *loop;
+} ir_builder_t;
+/*@
+
+The [[ir_error]] macro sets this flag, and emits the given message as an
+[[ERROR]]. [[ir_warning]] does just the latter, and at the [[WARNING]]
+level.
+
+==diagnostics*/
+#define ir_error(ir, fmt, args...) do {                         \
+        if(ir->pfailed) *ir->pfailed = true;                    \
+        c_message_va(C_ERROR, ir->file, fmt, ##args);           \
+    } while (0)
+#define ir_warning(ir, fmt, args...)                            \
+    c_message_va(C_WARNING, ir->file, fmt, ##args)
+/*@
+
+A convenience predicate returns [[true]] when the immediately enclosing
+function is at top level.
+
+==is_top_level*/
+static inline bool is_top_level(ir_builder_t *ir)
+    { return !ir->fun->function->parent; }
+/*@
+
+Initialised with [[ir_open]], a builder [[ir]] can begin afresh, or
+share the environments (and [[.pfailed]]) of an[[other]]. Either way, a
+new block is added to the function under construction.
+
+==ir_open*/
+static ir_builder_t *ir_open(ir_builder_t *ir, ir_builder_t *other)
+{
+    if(other)
+        *ir = *other;
+    assert(ir->fun);
+    ir->head = ir->tail = fun_add_block(ir->fun);
+    ir->value = NULL;
+    return ir;
+}
+/*@
+
+[[ir_build]] constructs a node of given [[type]]. It's appended to the
+[[.tail]] of the builder; [[.value]] is updated if it yields a value
+(and is not a [[BIND]]; their values aren't to be used directly, yet.)
+
+==ir_build*/
+static cnode_t *ir_build(ir_builder_t *ir, cnodetype type)
+{
+    cnode_t *node = cnode_append(ir->tail, type);
+    node->file = ir->file;
+    if(type != CN_BIND && cnode_yields_value(node))
+        ir->value = node;
+    else
+        ir->value = NULL;
+    return node;
+}
+/*@
+
+[[ir_extend]] advances [[ir]] so that further construction may continue
+from the [[.tail]] of [[other]] with the [[.value]] of the latter.
+
+==ir_extend*/
+static ir_builder_t *ir_extend(ir_builder_t *ir, ir_builder_t *other)
+{
+    ir->tail = other->tail;
+    ir->value = other->value;
+    return ir;
+}
+/*@
+
+
+\subsection{Nodes}
+
+A set of convenience functions are used to construct the various
+[[.type]]s of [[cnode_t]].
+
+The constant object to which a [[CONST]] node refers is first interned
+in the compiler's constant table. The node's type [[.decl]] is also
+initialised at this point, as it is unlikely to change.
+
+==build_constant*/
+static cnode_t *build_constant(ir_builder_t *ir, robject_t *ptr)
+{
+    cnode_t *node = ir_build(ir, CN_CONST);
+    robject_t *obj = c_intern(ptr);
+
+    node->constant = obj;
+    node->decl = r_typeof(obj);
+    return node;
+}
+/*@
+
+The [[.var]] field of a [[REF]] node is initialised to the variable
+found by [[name]] in the enclosing environment(s). A free variable is
+assumed to be global.
+
+==build_ref*/
+static cnode_t *build_ref(ir_builder_t *ir, rsymbol_t *name)
+{
+    cnode_t *node = ir_build(ir, CN_REF);
+
+    node->ref.var = env_find_add(ir->env, name);
+    return node;
+}
+/*@
+
+The invocation of a [[target]] begins as a [[CALL]] node; later
+optimisation may replace it with an equivalent [[CALL_FAST]] or
+[[BUILTIN]]. [[names]], together with [[args]], have their ownership
+transferred to the node.
+
+==build_call*/
+static cnode_t *build_call(ir_builder_t *ir, cnode_t *target,
+                           cnode_array_t *args, rsymbol_array_t *names)
+{
+    cnode_t *node = ir_build(ir, CN_CALL);
+
+    node->call.target = target;
+    node->call.args = *args;
+    node->call.names = *names;
+    return node;
+}
+/*@
+
+An [[IF]] node only has the condition [[cond]] to initialise, as the
+branches are represented by successor blocks in the control flow.
+
+==build_if*/
+static cnode_t *build_if(ir_builder_t *ir, cnode_t *cond)
+{
+    cnode_t *node = ir_build(ir, CN_IF);
+
+    node->ifelse.cond = cond;
+    return node;
+}
+/*@
+
+A [[PHI]] node, as constructed, joins values from the [[left]] and
+[[right]] edges incoming to a control-flow join.
+
+==build_phi*/
+static cnode_t *build_phi(ir_builder_t *ir, cnode_t *left, cnode_t *right)
+{
+    cnode_t *node = ir_build(ir, CN_PHI);
+    cnode_array_t *args = &node->phi.args;
+
+    assert(left && right);
+    array_init(args, 2);
+    array_push(args, left);
+    array_push(args, right);
+    return node;
+}
+/*@
+
+[[RETURN]] can be explicit or implied. In the latter case, [[nil]] will
+be returned if no meaningful value is available.
+
+==build_return*/
+static cnode_t *build_return(ir_builder_t *ir)
+{
+    cnode_t *prev = ir->value ? ir->value : build_constant(ir, NULL),
+            *node = ir_build(ir, CN_RETURN);
+
+    node->ret.value = prev;
+    return node;
+}
+/*@
+
+The value of a [[SET]] node comes from the right-hand side of the
+assignment.
+
+==build_set*/
+static cnode_t *build_set(ir_builder_t *ir, cvar_t *var, cnode_t *val)
+{
+    cnode_t *node = ir_build(ir, CN_SET);
+
+    node->set.var = var;
+    node->set.value = ir->value = val;
+    return node;
+}
+/*@
+
+A [[BIND]] node introduces the variable [[var]] with optional initial
+[[val]] and type [[decl]]. To preserve flexibility, it's added to the
+environment in a separate step.
+
+==build_bind*/
+static cnode_t *build_bind(ir_builder_t *ir, cvar_t *var,
+                           rtype_t *decl, cnode_t *val)
+{
+    cnode_t *node = ir_build(ir, CN_BIND);
+
+    node->set.value = val;
+    node->set.var = var;
+    node->decl = decl;
+    return node;
+}
+/*@
+
+When a [[LAMBDA]] is constructed for a [[cfunction_t]], the [[.node]]
+backpointer can be initialised, as they are in one-to-one relation.
+
+==build_lambda*/
+static cnode_t *build_lambda(ir_builder_t *ir, cfunction_t *fn)
+{
+    cnode_t *node = ir_build(ir, CN_LAMBDA);
+
+    array_init(&node->lambda.closure, 0);
+    node->lambda.function = fn;
+    fn->node = node;
+    return node;
+}
+/*@
+
+A [[BUILTIN]] node usually results from optimisation, but can also be
+constructed directly.
+
+==build_builtin*/
+static cnode_t *build_builtin(ir_builder_t *ir, const cbuiltin_t *bi,
+                              cnode_array_t *args, rtype_t *optype, rtype_t *decl)
+{
+    cnode_t *node = ir_build(ir, CN_BUILTIN);
+
+    node->decl = decl;
+    node->builtin.bi = bi;
+    node->builtin.args = *args;
+    node->builtin.optype = optype;
+    return node;
+}
+/*@
+
+
+\subsection{Constants}
+
+Literals in the input AST are converted to [[robject_t]]s referenced by
+[[CONST]] nodes.
+
+[[INT]], [[DOUBLE]] and [[STRING]] literals become the appropriate type
+of object. No distinction is made between the various [[.type]]s of
+[[.symbol]]. A [[TOKEN]] is also a symbol, albeit named via [[ast_str]].
+
+==constant_from_literal*/
+static robject_t *constant_from_literal(ast_t *ast)
+{
+    switch(ast->type)
+    {
+    case AST_INT: return r_box(r_type_int, &ast->integer);
+    case AST_DOUBLE: return r_box(r_type_double, &ast->dfloat);
+    case AST_STRING: return (robject_t *)rstr_create(ast->string);
+    case AST_TOKEN: return (robject_t *)r_intern(ast_str(ast));
+    case AST_QUOTED:
+    case AST_SYMBOL:
+    case AST_NAME:
+        return (robject_t *)ast->symbol;
+    case AST_INVALID: return NULL;
+    default: break;
+    }
+    return NULL; /* NOTREACHED */
+}
+/*@
+
+
+\section{Entry Point}
+\label{ir_convert:ir_convert}
+
+The entry point to this module is [[ir_convert]]. It returns a nullary
+[[cfunction_t]], the body of which contains the IR equivalent of the
+input [[ast]].
+
+==ir_convert*/
+cfunction_t *ir_convert(ast_t *ast, char *filename)
+{
+    cfunction_t *function;
+    funenv_t fun;
+    lexenv_t global_env, env;
+    bool failed = false;
+    //convert toplevel//
+}
+/*@
+
+The global lexical environment [[global_env]] is distinct from (and the
+parent of) the lexical environment [[env]] of the top-level function.
+This allows distinguishing e.g. ``[[global x]]'' from ``[[let x]]''.
+
+==convert toplevel*/
+env_open(&global_env, NULL);
+ir_builder_t ir = {
+    .fun = fun_open(&fun, NULL),
+    .env = env_open(&env, &global_env),
+    .file = filename ? r_intern(filename) : NULL,
+    .pfailed = &failed
+};
+ir_open(&ir, NULL);
+/*@
+
+The input is converted by [[convert_file]]. If control flow continues
+through it, a [[RETURN]] node is appended. Free variables have been
+collected in [[global_env]]; resolution picks up declared types and
+constant values from the runtime environment.
+
+==convert toplevel*/
+if(convert_file(&ir, ast))
+    build_return(&ir);
+function = fun_close(&fun, ir.head, NULL);
+env_close(&env);
+if(global_env.vars)
+    hashmap_map(global_env.vars, resolve_global, &ir);
+env_close(&global_env);
+/*@
+
+[[NULL]] is returned on conversion failure.
+
+==convert toplevel*/
+if(failed)
+{
+    cfunc_free(function);
+    return NULL;
+}
+return function;
+/*@
+
+If the [[global]] corresponding to the free variable [[var]] exists in
+the runtime global environment, [[check_resolve]] copies any reliable
+information from its declaration and verifies that it wasn't declared
+more than once.
+
+The [[cvar_t]] is to share the top-level [[cfunction_t]]'s lifetime, so
+is added to the latter's list of variables.
+
+==resolve_global*/
+static void resolve_global(const void *key, void *value, void *ptr)
+{
+    ir_builder_t *ir = ptr;
+    cvar_t *var = value;
+    rglobal_t *global = r_get_global(var->name);
+    cfunction_t *fn = ir->fun->function;
+
+    if(global && !check_resolve(var, global))
+        *ir->pfailed = true;
+
+    assert(cvar_is_global(var));
+    assert(list_isempty(&var->cvar_list));
+    list_add(&fn->cvar_head, &var->cvar_list);
+}
+/*@
+
+An existing global (\ref{rt:global}) may not be redeclared. If declared
+explicitly, it may not be removed -- so its type [[.decl]] and constancy
+[[.is_const]] are invariants which will hold for the lifetime of the
+system, and the compiler can rely on them.
+
+==check_resolve*/
+static inline bool check_resolve(cvar_t *var, rglobal_t *global)
+{
+    if(var->type == GLOBAL_INT)
+    {
+        c_error("duplicate %s definition `%s`",
+                var->is_const ? "const" : "global", r_symstr(var->name));
+        return false;
+    }
+    if(global->decl)
+    {
+        var->extl.global = global;
+        var->decl = global->decl;
+        var->is_const = global->is_const;
+    }
+    return true;
+}
+/*@
+
+
+\section{Conversion}
+
+Conversion proceeds through the recursive destructuring of an [[ast_t]]
+by [[.type]].
+
+==conversion*/
+//convert_literal//
+//convert_symbol//
+//convert_token//
+//convert_node//
+//convert_stmt//
+//convert_expr//
+/*@
+
+A [[convert_]] function returns [[true]] when control flow continues
+through the IR it creates -- this is not the case for [[BREAK]],
+[[CONTINUE]], [[RETURN]], or when an error is encountered.
+
+In addition, some callers expect the conversion of a subtree [[ast]] to
+produce a [[.value]]. The grammar does not enforce this; instead,
+[[convert_expr]] returns [[true]] when the constraint is satisfied,
+signalling an error otherwise (if one hasn't been, already.)
+
+==convert_expr*/
+static bool convert_expr(ir_builder_t *ir, ast_t *ast)
+{
+    if(convert_stmt(ir, ast) && ir->value)
+        return true;
+    if(ir->pfailed && !*ir->pfailed)
+        ir_error(ir, "statement found where expression expected.");
+    return false;
+}
+/*@
+
+[[convert_stmt]] is the fundamental conversion function. [[INT]],
+[[DOUBLE]], [[QUOTED]] and [[STRING]] literal [[ast]]s are handled by
+[[convert_literal]]. Unquoted [[SYMBOL]]s, denoting references to
+variables, are handled by [[convert_symbol]]. A [[NODE]] requires
+further destructuring by [[convert_node]]. The single tokens [[BREAK]]
+and [[CONTINUE]] become control flow in [[convert_loop_exit]]; no others
+are valid.
+
+==convert_stmt*/
+static bool convert_stmt(ir_builder_t *ir, ast_t *ast)
+{
+    switch(ast->type)
+    {
+    case AST_INT:
+    case AST_DOUBLE:
+    case AST_QUOTED:
+    case AST_STRING:
+        return convert_literal(ir, ast);
+    case AST_SYMBOL:
+        return convert_symbol(ir, ast);
+    case AST_NODE:
+        return convert_node(ir, ast);
+    case AST_TOKEN:
+        if(ast->token == BREAK || ast->token == CONTINUE)
+            return convert_loop_exit(ir, ast);
+        /* fallthrough */
+    default:
+        ir_error(ir, "invalid AST of type %d", ast->type);
+    }
+    return false; /* NOTREACHED, ideally */
+}
+/*@
+
+For a literal, a [[CONST]] node is built\ldots
+
+==convert_literal*/
+static bool convert_literal(ir_builder_t *ir, ast_t *ast)
+{
+    build_constant(ir, constant_from_literal(ast));
+    return true;
+}
+/*@
+
+\ldots and, for a variable reference, a [[REF]] node (although
+``[[...]]'' is not valid at the top level.)
+
+==convert_symbol*/
+static bool convert_symbol(ir_builder_t *ir, ast_t *ast)
+{
+    if(ast_is_rest(ast) && is_top_level(ir))
+    {
+        ir_error(ir, "invalid reference to `...`.");
+        return false;
+    }
+    build_ref(ir, ast->symbol);
+    return true;
+}
+/*@
+
+[[convert_node]] begins by extracting the first element [[fst]] from
+[[arr]], which is used to determine the interpretation of those that
+follow.
+
+==convert_node*/
+static bool convert_node(ir_builder_t *ir, ast_t *ast)
+{
+    ast_array_t *arr = ast->children;
+    ast_t *fst = aptr(arr, 0);
+
+    //check token//
+    switch(fst->token)
+    {
+        //convert form//
+    }
+    //convert operator//
+}
+/*@
+
+We treat the [[NODE]] somewhat like a LISP list, and it's depicted as
+such. It falls into one of the following cases, depending on the
+syntactic construct which gave rise to it.
+%cite lisp, and find the correct term of art for 'list' -- application? combination?
+
+\subsubsection*{($expression$ $[expressions\ldots]$)}
+
+If not headed by a [[TOKEN]], the [[ast]] represents a \textit{function
+  call}, with the other elements expressions to be evaluated as actual
+arguments.
+
+==check token*/
+if(fst->type != AST_TOKEN)
+    return convert_call(ir, fst, arr);
+/*@
+
+Certain [[TOKEN]]s denote \textit{special forms}. These can introduce
+control flow, or modify the environment. Their conversion functions may
+interpret the other elements in [[arr]] specially -- perhaps as lists of
+declarations, or type specifiers. Converting each is a matter of passing
+the appropriate elements to its conversion function.
+
+\subsubsection*{(let $declarations$), (var $declarations$)}
+
+==convert form*/
+case LET:
+case VAR: assert(alen(arr) == 2);
+    return convert_let(ir, aptr(arr, 1), fst->token == LET);
+/*@
+
+\subsubsection*{(global $declarations$), (const $declarations$)}
+
+==convert form*/
+case GLOBAL:
+case CONST: assert(alen(arr) == 2);
+    return convert_global(ir, aptr(arr, 1), fst->token == CONST);
+/*@
+
+\subsubsection*{(function $[returntype]$ ($[arguments\ldots]$) $body$)}
+
+==convert form*/
+case FUNCTION: assert(alen(arr) == 4);
+    return convert_lambda(ir, rtype_from_spec(aptr(arr, 1)),
+                          aptr(arr, 2)->children, aptr(arr, 3));
+/*@
+
+\subsubsection*{(\{ $[statements\ldots]$)}
+
+==convert form*/
+case '{':
+    return convert_prog(ir, arr);
+/*@
+
+\subsubsection*{(if $condition$ $consequent$ $[alternative]$)}
+
+``[[if]]'' has an optional ``[[else]]''.
+
+==convert form*/
+case IF: assert(alen(arr) == 3 || alen(arr) == 4);
+    return convert_ifelse(ir, aptr(arr, 1), aptr(arr, 2),
+                          (alen(arr) == 4) ? aptr(arr, 3) : NULL);
+/*@
+
+\subsubsection*{(or $expression$ $expression$), (and $expression$ $expression$)}
+
+==convert form*/
+case OR: assert(alen(arr) == 3);
+    return convert_or(ir, aptr(arr, 1), aptr(arr, 2));
+case AND: assert(alen(arr) == 3);
+    return convert_and(ir, aptr(arr, 1), aptr(arr, 2));
+/*@
+
+\subsubsection*{(= $place$ $expression$)}
+
+==convert form*/
+case '=': assert(alen(arr) == 3);
+    return convert_set(ir, aptr(arr, 1), aptr(arr, 2));
+/*@
+
+\subsubsection*{(return $expression$)}
+
+==convert form*/
+case RET: assert(alen(arr) == 2);
+    return convert_return(ir, aptr(arr, 1));
+/*@
+
+\subsubsection*{(while $condition$ $body$)}
+
+A ``[[while]]'' loop is just a ``[[for]]'' loop without declarations or an
+iteration expression.
+
+==convert form*/
+case WHILE: assert(alen(arr) == 3);
+    return convert_loop(ir, &ast_null, aptr(arr, 1), &ast_null,
+                        aptr(arr, 2));
+/*@
+
+\subsubsection*{(for $[declarations]$ $condition$ $[iteration]$ $body$)}
+
+==convert form*/
+case FOR: assert(alen(arr) == 5);
+    return convert_loop(ir, aptr(arr, 1), aptr(arr, 2), aptr(arr, 3),
+                        aptr(arr, 4));
+/*@
+
+\subsubsection*{(type $specifier$)}
+
+==convert form*/
+case TYPE: assert(alen(arr) == 2);
+    return convert_literal_type(ir, aptr(arr, 1));
+/*@
+
+\subsubsection*{(include $string$)}
+
+==convert form*/
+case INCLUDE: assert(alen(arr) == 2);
+    return convert_include(ir, aptr(arr, 1));
+/*@
+
+\subsubsection*{(+ $expression$), (\textendash{} $expression$)}
+
+Unary ``[[+]]'' is a no-op. Unary ``[[-]]'' becomes a call to
+``[[0-]]''.
+
+==convert form*/
+case '+':
+    if(alen(arr) == 2)
+        return convert_expr(ir, aptr(arr, 1));
+    /* fallthrough */
+case '-':
+    if(alen(arr) == 2)
+        return convert_token(ir, "0-", arr);
+    /* fallthrough */
+default:
+    break;
+/*@
+
+\subsubsection*{($operator$ $[expressions\ldots]$)}
+
+==convert operator*/
+return convert_token(ir, ast_str(fst), arr);
+/*@
+
+If not a special form, the [[ast]] represents a function call, with
+[[fst]] referring to a variable of the same [[name]] (the synthetic
+[[ast]] will be converted to a [[REF]].)
+
+==convert_token*/
+static inline bool
+convert_token(ir_builder_t *ir, const char *name, ast_array_t *arr)
+{
+    ast_t ast = {
+        .type = AST_SYMBOL,
+        .symbol = r_intern(name),
+    };
+    return convert_call(ir, &ast, arr);
+}
+
+/*@
+
+
+\section{Bindings}
+
+Some special forms bind variables in the global or lexical environments.
+The ASTs they take as input have a common shape; helper functions exist
+to simplify their conversion.
+
+==bindings*/
+//varbind_t//
+//bind_from_decl//
+//binds_from_decls//
+//binds_finalize//
+//convert_initexpr//
+/*@ %
+
+An array of [[varbind_t]] structures is populated with the declarations
+or arguments from an input [[NODE]]. The [[.var]] field points to the
+variable being bound; [[.expr]] to the initialising expression, if any.
+Some forms will convert this in a separate pass, setting [[.node]] to
+the resulting initial value.
+
+==varbind_t*/
+typedef struct
+{
+    cvar_t *var;
+    union
+    {
+        ast_t *expr;
+        cnode_t *node;
+    };
+} varbind_t;
+typedef ARRAY(varbind_t) varbind_array_t;
+typedef cvar_t *(*varbind_fn)(rsymbol_t *, rtype_t *, void *);
+/*@
+
+[[binds_from_decls]] destructures the ASTs from [[decls]] into
+[[binds]].
+
+==binds_from_decls*/
+static void binds_from_decls(ast_array_t *decls, varbind_array_t *binds,
+                             varbind_fn varfn, void *data)
+{
+    int i;
+
+    array_init(binds, alen(decls));
+    array_resize(binds, alen(decls));
+    array_foreach(decls, i)
+        bind_from_decl(aptr(decls, i), aptr(binds, i), varfn, data);
+}
+/*@
+
+[[bind_from_decl]] initialises a [[bind]] from the [[ast]] of a
+declaration.
+
+==bind_from_decl*/
+static void bind_from_decl(ast_t *ast, varbind_t *bind, varbind_fn varfn,
+                           void *data)
+{
+    rsymbol_t *name;
+    ast_t *tspec = NULL, *expr = NULL;
+
+    if(ast->type == AST_NAME)
+    {
+        //simple//
+    }
+    else
+    {
+        //complex//
+    }
+    //bind//
+}
+/*@
+
+An input [[NAME]] is simple -- it only specifies the variable [[name]].
+
+==simple*/
+name = ast->symbol;
+/*@
+
+An input [[NODE]] has one of the forms \textbf{($type$ $name$)},
+\textbf{($name$ $init$)}, or \textbf{($type$ $name$ $init$)}. They're
+distinguished by the [[.type]] of the second element [[snd]], and the
+number of [[.children]].
+
+==complex*/
+assert(ast->type == AST_NODE);
+ast_array_t *arr = ast->children;
+assert(alen(arr) == 2 || alen(arr) == 3);
+ast_t *fst = aptr(arr, 0);
+ast_t *snd = aptr(arr, 1);
+
+if(snd->type == AST_NAME)
+{
+    tspec = fst;
+    name = snd->symbol;
+    if(alen(arr) == 3)
+        expr = aptr(arr, 2);
+}
+else
+{
+    name = fst->symbol;
+    expr = snd;
+}
+/*@
+
+The [[.var]] field is initialised by the [[varfn]] callback; taking
+[[name]], type from specifier [[tspec]], and supplied [[data]]. The
+initialising expression is stored in [[.expr]].
+
+==bind*/
+*bind = (varbind_t) {
+    .var = varfn(name, rtype_from_spec(tspec), data),
+    .expr = expr
+};
+/*@
+
+The special form conversion function will call [[binds_finalize]] when
+it's finished with the [[binds]] array. If [[open]] is [[true]],
+conversion is to continue, so any local variables are are added to their
+functions' lists. Otherwise we are aborting, so they're freed instead.
+
+==binds_finalize*/
+static void binds_finalize(varbind_array_t *binds, bool open)
+{
+    varbind_t *bind;
+
+    array_foreach_ptr(binds, bind)
+    {
+        if(!cvar_is_global(bind->var))
+        {
+            cfunction_t *fn = bind->var->local.binder;
+            if(open)
+                list_add_before(&fn->cvar_head, &bind->var->cvar_list);
+            else
+                cvar_free(bind->var);
+        }
+    }
+    array_fini(binds);
+}
+/*@
+
+In the absence of an initialising expression, a variable is given an
+appropriate zero value for its declared type. [[convert_initexpr]]
+implements this convention.
+
+==convert_initexpr*/
+static bool convert_initexpr(ir_builder_t *ir, varbind_t *bind)
+{
+    if(bind->expr)
+        return convert_expr(ir, bind->expr);
+    return build_constant(ir, nil_init(bind->var->decl));
+}
+/*@
+
+
+\section{Forms}
+
+%% XXX back-references to the grammar rules which construct these asts?
+==forms*/
+//let and var//
+//globals//
+//lambda//
+//convert_prog//
+//convert_actuals//
+//convert_call//
+//convert_branch//
+//extend_join//
+//convert_ifelse//
+//convert_or//
+//convert_and//
+//set_expandp//
+//convert_set_expand//
+//convert_set//
+//convert_return//
+//convert_loop//
+//convert_loop_exit//
+//convert_literal_type//
+//convert_file//
+//convert_include//
+/*@ %
+
+
+\subsection{File}
+
+The [[ast]] returned by the parser is a [[NODE]], all of whose elements
+are statements (as opposed to the block passed to [[convert_prog]],
+where the first element is ``[[{]]''.)
+
+==convert_file*/
+static bool convert_file(ir_builder_t *ir, ast_t *ast)
+{
+    bool open = true;
+    assert(ast->type == AST_NODE);
+    for(int i = 0; i < alen(ast->children) && open; i++)
+        open = convert_stmt(ir, aptr(ast->children, i));
+    return open;
+}
+/*@
+
+
+\subsection{Let and Var}
+
+``[[let]]'' and ``[[var]]'' are similar enough that they are converted
+by a single function.
+
+==let and var*/
+//convert_let_binds//
+//convert_var_binds//
+//local_create//
+//convert_let//
+/*@
+
+[[decls]] are first destructured into [[binds]], with new variables
+created by the [[local_create]] callback. The bindings are then
+converted by either [[convert_let_binds]] or [[convert_var_binds]],
+responsible for the semantic difference between the forms. The previous
+[[.value]] is restored to [[ir]]; declarations do not disrupt value
+flow.
+
+==convert_let*/
+static bool convert_let(ir_builder_t *ir, ast_t *decls, bool is_let)
+{
+    cnode_t *val = ir->value;
+    varbind_array_t binds;
+    bool open;
+
+    binds_from_decls(decls->children, &binds, local_create, ir);
+    open = is_let ?
+        convert_let_binds(ir, &binds) :
+        convert_var_binds(ir, &binds);
+    binds_finalize(&binds, open);
+    ir->value = val;
+    return open;
+}
+/*@
+
+Each variable being introduced is [[LEXICAL]], and belongs to the
+function under conversion. It's optimistically assumed to be a constant
+-- [[.is_const]] will be reset if an assignment is subsequently seen.
+
+==local_create*/
+static cvar_t *local_create(rsymbol_t *name, rtype_t *decl, void *data)
+{
+    ir_builder_t *ir = data;
+    cvar_t *var = cvar_create(name, LEXICAL, decl);
+
+    var->is_const = true;
+    var->local.binder = ir->fun->function;
+    return var;
+}
+/*@
+
+``[[let]]'' assigns initial values to its variables in parallel. The
+first pass over [[binds]] converts each initialising expression, saving
+a pointer to the node that results. This is then associated with its
+variable by a [[BIND]] node built in the second pass. The lexical
+environment is augmented in the second pass so that names in the initial
+expressions refer to variables outside the scope of the ``[[let]]''.
+
+==convert_let_binds*/
+static bool convert_let_binds(ir_builder_t *ir, varbind_array_t *binds)
+{
+    varbind_t *bind;
+
+    array_foreach_ptr(binds, bind)
+    {
+        if(!convert_initexpr(ir, bind))
+            return false;
+        bind->node = ir->value;
+    }
+    array_foreach_ptr(binds, bind)
+    {
+        build_bind(ir, bind->var, bind->var->decl, bind->node);
+        env_add(ir->env, bind->var);
+    }
+    return true;
+}
+/*@
+
+``[[var]]'' assigns initial values to its variables sequentially. A
+single pass suffices to convert each initialising expression, build the
+[[BIND]] node, and augment the environment.
+
+==convert_var_binds*/
+static bool convert_var_binds(ir_builder_t *ir, varbind_array_t *binds)
+{
+    varbind_t *bind;
+
+    array_foreach_ptr(binds, bind)
+    {
+        if(!convert_initexpr(ir, bind))
+            return false;
+        build_bind(ir, bind->var, bind->var->decl, ir->value);
+        env_add(ir->env, bind->var);
+    }
+    return true;
+}
+/*@
+
+
+\subsection{Globals}
+
+``[[global]]'' and ``[[const]]'' are also converted by a single
+function.
+
+==globals*/
+//global_create//
+//convert_global_binds//
+//convert_global//
+/*@
+
+These forms may only occur at top level. Similar to [[convert_let]],
+declarations are destructured and variables created before IR nodes are
+built.
+
+==convert_global*/
+static bool convert_global(ir_builder_t *ir, ast_t *decls, bool is_const)
+{
+    cnode_t *val = ir->value;
+    varbind_array_t binds;
+    bool open;
+
+    if(!is_top_level(ir))
+    {
+        ir_error(ir, "`%s` only allowed at top level.",
+                 is_const ? "const" : "global");
+        return false;
+    }
+
+    binds_from_decls(decls->children, &binds, global_create, ir);
+    open = convert_global_binds(ir, &binds, is_const);
+    binds_finalize(&binds, open);
+    ir->value = val;
+    return open;
+}
+/*@
+
+The [[global_create]] callback first searches the global environment for
+a variable of given [[name]]; if not found, it's created and added. It
+is an error for [[var]] to have been declared previously, but it may
+have been referred to by code already converted (and so be present as a
+[[GLOBAL_EXT]].) Regardless, the variable is a [[GLOBAL_INT]], with
+declared type [[decl]].
+
+==global_create*/
+static cvar_t *global_create(rsymbol_t *name, rtype_t *decl, void *data)
+{
+    ir_builder_t *ir = data;
+    cvar_t *var = env_find(ir->env->global, name);
+
+    if(!var)
+        var = env_add_global(ir->env, name);
+    else if(var->type == GLOBAL_INT)
+        ir_error(ir, "duplicate global declaration `%s`",
+                 r_symstr(var->name));
+    var->type = GLOBAL_INT;
+    var->decl = decl;
+    return var;
+}
+/*@
+
+Converting the [[binds]] is a matter of converting each initialising
+expression (its presence is mandatory when the form is ``[[const]]'')
+and building the [[SET]] which, when executed, will assign the initial
+value to the variable. Its [[.intl.set]] refers to this node; the
+compiler can make use of it during optimisation; [[.is_const]] depends
+on which form is being converted.
+
+==convert_global_binds*/
+static bool convert_global_binds(ir_builder_t *ir, varbind_array_t *binds,
+                                 bool is_const)
+{
+    varbind_t *bind;
+
+    array_foreach_ptr(binds, bind)
+    {
+        if(is_const && !bind->expr)
+        {
+            ir_error(ir, "`const` must have an initial value.");
+            return false;
+        }
+        if(!convert_initexpr(ir, bind))
+            return false;
+        bind->var->is_const = is_const;
+        bind->var->intl.set = build_set(ir, bind->var, ir->value);
+    }
+    return true;
+}
+/*@
+
+
+\subsection{Lambda}
+\label{ir_convert:lambda}
+
+A ``[[function]]'' expression is converted to a [[LAMBDA]] node and
+associated [[cfunction_t]].
+
+==lambda*/
+//convert_default//
+//convert_arg_binds//
+//arg_create//
+//convert_formals//
+//convert_lambda//
+/*@
+
+An [[inner]] builder is opened, with function and lexical environments
+nested within the context of [[ir]]. After checking against maximum
+arity, the argument bindings are converted; their scope is the body,
+which is converted next. A [[RETURN]] is appended if the latter didn't
+end in one. The [[LAMBDA]] node is built in the outer context,
+initialised with the new [[cfunction_t]] returned by [[fun_close]].
+
+==convert_lambda*/
+static bool convert_lambda(ir_builder_t *ir, rtype_t *ret_type,
+                           ast_array_t *args, ast_t *body)
+{
+    funenv_t fun;
+    lexenv_t env;
+    ir_builder_t inner = {
+        .fun = fun_open(&fun, ir->fun),
+        .env = env_open(&env, ir->env),
+        .pfailed = ir->pfailed,
+        .file = ir->file
+    };
+
+    ir_open(&inner, NULL);
+    if(alen(args) > sizeof(argbits_t)*8)
+        ir_error(ir, "too many arguments.");
+    else if(convert_formals(&inner, args) && convert_stmt(&inner, body))
+        build_return(&inner);
+    env_close(&env);
+    build_lambda(ir, fun_close(&fun, inner.head, ret_type));
+    assert(list_isempty(&fun.cblock_head) || *ir->pfailed);
+    return true;
+}
+/*@
+
+The first [[BIND]] node built in the function has a [[NULL]] variable,
+and will receive the value of the implicit [[argbits]] argument
+containing the argument presence bitflags, as per the calling
+convention (\autoref{call}).
+
+[[decls]] is destructured to [[binds]], as usual. [[convert_arg_binds]]
+will build conditionals for evaluating any default expressions, so is
+passed the [[bits]] node.
+
+==convert_formals*/
+static bool convert_formals(ir_builder_t *ir, ast_array_t *decls)
+{
+    varbind_array_t binds;
+    bool open = true;
+    cnode_t *bits = build_bind(ir, NULL, r_type_int, NULL);
+
+    binds_from_decls(decls, &binds, arg_create, ir);
+    open = convert_arg_binds(ir, &binds, bits);
+    binds_finalize(&binds, open);
+    return open;
+}
+/*@
+
+The [[arg_create]] callback creates [[LEXICAL]] variables (assumed
+constant, like [[local_create]]) with the [[.is_arg]] flag set.
+
+==arg_create*/
+static cvar_t *arg_create(rsymbol_t *name, rtype_t *decl, void *data)
+{
+    ir_builder_t *ir = data;
+    cvar_t *var = cvar_create(name, LEXICAL, decl);
+
+    var->is_const = true;
+    var->local.binder = ir->fun->function;
+    var->local.is_arg = true;
+    var->local.is_optional = false;
+    return var;
+}
+/*@
+
+[[convert_arg_binds]] proceeds in two passes, similar to
+[[convert_let_binds]]. The first pass builds [[BIND]] nodes in the
+function entry block, in the same order as the arguments.
+
+If the rest vector ``[[...]]'' is present, it must be the last
+argument, and without declared type or default expression (it's always
+[[.is_optional]] with type [[vector(object)]].)
+
+When a binding has an initialising expression, this provides the default
+value for the argument if the latter is omitted in a call; so the
+variable [[.is_optional]].
+
+The second pass builds conditionals for default expressions where
+needed, and adds the variables to the lexical environment. Later default
+expressions may reference the values of the arguments which precede
+them.
+
+==convert_arg_binds*/
+static bool convert_arg_binds(ir_builder_t *ir, varbind_array_t *binds,
+                              cnode_t *bits)
+{
+    int i;
+
+    array_foreach(binds, i)
+    {
+        varbind_t *bind = aptr(binds, i);
+
+        if(bind->var->name == r_sym_rest)
+        {
+            if(i != alen(binds)-1 || bind->var->decl || bind->expr)
+            {
+                ir_error(ir, "invalid '...' declaration.");
+                return false;
+            }
+            bind->var->decl = r_type_vec_object;
+            bind->var->local.is_optional = true;
+        }
+        else if(bind->expr)
+        {
+            bind->var->local.is_optional = true;
+        }
+        build_bind(ir, bind->var, bind->var->decl, NULL);
+    }
+    array_foreach(binds, i)
+    {
+        varbind_t *bind = aptr(binds, i);
+
+        if(bind->expr && !convert_default(ir, bind, i, bits))
+            return false;
+        env_add(ir->env, bind->var);
+    }
+    return true;
+}
+/*@
+
+[[convert_default]] builds a conditional which assigns [[bind.expr]] to
+[[bind.var]] in case the corresponding argument is omitted:
+
+\textbf{(if ([[missing]] $i$ $bits$) (= $arg_i$ $expr$))}
+
+\noindent{}The [[missing]] [[BUILTIN]] returns [[true]] when the [[i]]th
+bit of [[bits]] is unset. [[i]] is constant so, in a somewhat dubious
+hack, it's boxed, interned, and stashed in the node's
+[[.builtin.optype]] field.
+
+Control flow after the conditional is built along the lines of
+[[convert_if]], except that since it's evaluated for effect, there's no
+need for unifying values with a [[PHI]] in the join block.
+
+==convert_default*/
+extern const cbuiltin_t missing;
+static bool convert_default(ir_builder_t *ir, varbind_t *bind, argbits_t i,
+                            cnode_t *bits)
+{
+    ir_builder_t tb, jn;
+    robject_t *idx = c_intern(r_box(r_type_int, &i));
+    cnode_array_t args;
+
+    array_init(&args, 1);
+    array_push(&args, bits);
+    build_builtin(ir, &missing, &args, (rtype_t *)idx, r_type_boolean);
+    build_if(ir, ir->value);
+
+    ir_open(&tb, ir);
+    link_blocks(tb.head, ir->tail);
+    if(!convert_expr(&tb, bind->expr))
+        return false;
+    build_set(&tb, bind->var, tb.value);
+
+    ir_open(&jn, ir);
+    link_blocks(jn.head, tb.tail);
+    link_blocks(jn.head, ir->tail);
+    ir_extend(ir, &jn);
+    return true;
+}
+/*@
+
+
+\subsection{Block}
+
+A nested lexical environment is entered for the duration of a
+brace-delimited block -- the scope of variables introduced by ``[[let]]''
+and ``[[var]]'' is the remainder of the block in which they occur.
+
+Conversion of subexpressions proceeds in order with [[convert_stmt]];
+they're not required to produce values, as none but the last can be used
+by other nodes. If control flow leaves the block, the loop ends early.
+
+==convert_prog*/
+static bool convert_prog(ir_builder_t *ir, ast_array_t *arr)
+{
+    lexenv_t env;
+    bool open = true;
+    ir_builder_t inner = *ir;
+
+    inner.env = env_open(&env, ir->env);
+    for(int i = 1; i < alen(arr) && open; i++)
+        open = convert_stmt(&inner, aptr(arr, i));
+    env_close(&env);
+    ir_extend(ir, &inner);
+    return open;
+}
+/*@
+
+
+\subsection{Call}
+
+The value of the [[fst]] expression is the [[target]] of the call.
+Actual arguments, collected into [[args]] by [[convert_actuals]], may be
+named; when none are, the [[names]] array is superfluous and can be
+emptied. The [[CALL]] node takes possession of the arrays when built.
+
+==convert_call*/
+static bool convert_call(ir_builder_t *ir, ast_t *fst, ast_array_t *arr)
+{
+    cnode_array_t args;
+    rsymbol_array_t names;
+    cnode_t *target;
+    bool has_names = false;
+
+    if(!convert_expr(ir, fst))
+        return false;
+    target = ir->value;
+
+    if(!convert_actuals(ir, &args, &names, arr, &has_names))
+        return false;
+
+    if(!has_names)
+        array_clear(&names);
+    array_shrink(&args);
+    array_shrink(&names);
+    build_call(ir, target, &args, &names);
+    return true;
+}
+/*@
+
+Each actual argument has an element at the same index in the [[args]]
+and [[names]] arrays. The number of elements in the call expression
+is an upper bound on their length. It's an error if there are more
+arguments than an [[argbits_t]] can represent.
+
+The elements of [[arr]] are examined in order. Each may be a [[NAME]],
+[[INVALID]], or an arbitrary [[ast]] denoting an expression.
+
+==convert_actuals*/
+static bool
+convert_actuals(ir_builder_t *ir, cnode_array_t *args, rsymbol_array_t *names,
+                ast_array_t *arr, bool *pnamed)
+{
+    rsymbol_t *name = NULL;
+
+    array_init(args, alen(arr)-1);
+    array_init(names, alen(arr)-1);
+    for(int i = 1; i < alen(arr); i++)
+    {
+        ast_t *ast = aptr(arr, i);
+
+        switch(ast->type)
+        {
+        case AST_NAME:
+            //named//
+            break;
+        case AST_INVALID:
+            //omitted//
+            break;
+        default:
+            //expression//
+            break;
+        }
+    }
+
+    if(alen(args) <= sizeof(argbits_t)*8)
+        return true;
+    ir_error(ir, "too many arguments.");
+fail:
+    array_fini(args);
+    array_fini(names);
+    return false;
+}
+/*@ %
+
+When a [[NAME]] is encountered, the symbol is stored in [[name]] to be
+used by the next element, and [[pnamed]] is set.
+
+==named*/
+*pnamed = true;
+name = ast->symbol;
+/*@
+
+[[INVALID]] denotes an omitted argument, which is represented with a
+[[NULL]] node and name.
+
+==omitted*/
+array_push(args, NULL);
+array_push(names, NULL);
+/*@
+
+Anything else is assumed to be an expression and converted as such. The
+occurrence of the rest vector ``[[...]]'' requests that its elements
+also be considered as arguments to the call; it's explicitly named to
+signal this to the backend.
+
+After the node and its [[name]] (if any) are appended to the arrays, the
+latter is reset.
+
+==expression*/
+if(!convert_expr(ir, ast))
+    goto fail;
+if(ast_is_rest(ast))
+{
+    *pnamed = true;
+    name = r_sym_rest;
+}
+array_push(args, ir->value);
+array_push(names, name);
+name = NULL;
+/*@
+
+
+\subsection{If-Else}
+
+An [[IF]] node is built with the value of the ``[[if]]'' expression's
+converted conditional [[cond]]. At run-time, when this evaluates to
+[[true]], the VM will transfer control to the first successor of the
+block which the node ends; when [[false]], the second. The consequent
+expression [[texpr]] is thus converted (built on branch [[tb]]) before
+the alternative [[fexpr]] (branch [[fb]].)
+
+If control flow continues from one or both branches, the [[ir]] builder
+is extended.
+
+==convert_ifelse*/
+static bool convert_ifelse(ir_builder_t *ir, ast_t *cond,
+                           ast_t *texpr, ast_t *fexpr)
+{
+    ir_builder_t tb, fb;
+    bool topen, fopen;
+
+    if(!convert_expr(ir, cond))
+        return false;
+    build_if(ir, ir->value);
+
+    topen = convert_branch(&tb, ir, texpr);
+    fopen = convert_branch(&fb, ir, fexpr);
+
+    if(topen && fopen)
+        extend_join(ir, &tb, &fb);
+    else if(topen)
+        ir_extend(ir, &tb);
+    else if(fopen)
+        ir_extend(ir, &fb);
+    return topen || fopen;
+}
+/*@
+
+A new builder is opened for each branch. The [[ast]] to be converted may
+be missing -- ``[[else]]'' is optional. If it yields no value, a [[nil]]
+is synthesised to provide one. A control-flow edge is added from the end
+of the [[ir]] builder to the start of the branch [[br]].
+
+==convert_branch*/
+static inline bool convert_branch(ir_builder_t *br, ir_builder_t *ir,
+                                  ast_t *ast)
+{
+    bool open = true;
+
+    ir_open(br, ir);
+    if(ast)
+        open = convert_stmt(br, ast);
+    if(!br->value)
+        build_constant(br, NULL);
+    link_blocks(br->head, ir->tail);
+    return open;
+}
+/*@
+
+Control flow from both branches is merged by [[extend_join]]. A new
+builder [[jn]] is opened and a [[PHI]] built to merge the values from
+consequent [[tb]] and alternative [[fb]]. Control-flow edges are added,
+in the same order as the [[PHI]] arguments, from the end of each branch
+to the start of the join. The [[ir]] builder can then be extended.
+
+==extend_join*/
+static inline void extend_join(ir_builder_t *ir, ir_builder_t *tb,
+                               ir_builder_t *fb)
+{
+    ir_builder_t jn;
+
+    ir_open(&jn, ir);
+    build_phi(&jn, tb->value, fb->value);
+    link_blocks(jn.head, tb->tail);
+    link_blocks(jn.head, fb->tail);
+    ir_extend(ir, &jn);
+}
+/*@
+
+
+\subsection{And \& Or}
+
+Short-circuiting ``[[||]]'' and ``[[&&]]'' are syntactic sugar for
+``[[if]]'':
+
+\textbf{(if $left$ [[true]] $right$)}
+
+==convert_or*/
+static bool convert_or(ir_builder_t *ir, ast_t *lexpr, ast_t *rexpr)
+{
+    ast_t stub = {
+        .type = AST_SYMBOL,
+        .symbol = r_intern("true")
+    };
+    return convert_ifelse(ir, lexpr, &stub, rexpr);
+}
+/*@
+
+\indent{}\textbf{(if $left$ $right$ [[false]])}
+
+==convert_and*/
+static bool convert_and(ir_builder_t *ir, ast_t *lexpr, ast_t *rexpr)
+{
+    ast_t stub = {
+        .type = AST_SYMBOL,
+        .symbol = r_intern("false")
+    };
+    return convert_ifelse(ir, lexpr, rexpr, &stub);
+}
+/*@
+
+(the [[REF]] nodes which are built for these will be optimised later to
+[[CONST]]s)
+
+
+\subsection{Assignment}
+
+The left-hand-side [[lhs]] of an assignment expression must be a
+[[SYMBOL]] if it doesn't denote a \textit{set expansion}.
+
+The variable [[var]] which it names is added as a global if it's not
+found in the enclosing environment(s). Assigning to a [[LEXICAL]]
+variable clears its [[.is_const]] flag. The right-hand-side expression
+[[rhs]] is converted, and a [[SET]] node built.
+
+==convert_set*/
+static bool convert_set(ir_builder_t *ir, ast_t *lhs, ast_t *rhs)
+{
+    if(set_expandp(lhs))
+        return convert_set_expand(ir, lhs->children, rhs);
+    if(lhs->type != AST_SYMBOL)
+    {
+        ir_error(ir, "no set-expansion for expression.");
+        return false;
+    }
+
+    cvar_t *var = env_find_add(ir->env, lhs->symbol);
+
+    if(!cvar_is_global(var))
+        var->is_const = false;
+    if(!convert_expr(ir, rhs))
+        return false;
+    build_set(ir, var, ir->value);
+    return true;
+}
+/*@
+
+[[set_expandp]] returns [[true]] in the case of an [[ast]] that looks
+like a call to a named function with at least one argument.
+
+==set_expandp*/
+static bool set_expandp(ast_t *ast)
+{
+    if(ast->type == AST_NODE && alen(ast->children) >= 2)
+    {
+        ast_t *fst = aptr(ast->children, 0);
+        return fst->type == AST_SYMBOL || fst->type == AST_TOKEN;
+    }
+    return false;
+}
+/*@
+
+Set-expansion, as in R (and Lisp,) is syntactic sugar which generates a
+call to a specially named function in place of the assignment:
+%cite the R source I guess?
+
+\textbf{(= ([[name]] $target$ $args\ldots$) $rhs$)} $\rightarrow$
+\textbf{([[name=]] $target$ $rhs$ $args\ldots$)}
+
+\noindent{}A copy of [[rhs]] is inserted into the left-hand-side [[arr]] as the
+third element. [[rhs]] itself is replaced by [[INVALID]], to avoid a
+double free. The expansion is converted as a call to the function [[fst]] with
+``[[=]]'' appended to its [[name]].
+
+==convert_set_expand*/
+static bool convert_set_expand(ir_builder_t *ir, ast_array_t *arr, ast_t *rhs)
+{
+    ast_t *fst = aptr(arr, 0), new;
+    char *name;
+
+    asprintf(&name, "%s=", ast_str(fst));
+    new = (ast_t) {
+        .type = AST_SYMBOL,
+        .symbol = r_intern(name),
+    };
+    xfree(name);
+    array_insert(arr, 2, *rhs);
+    *rhs = (ast_t) { .type = AST_INVALID };
+    return convert_call(ir, &new, arr);
+}
+/*@
+
+
+\subsection{Return}
+
+``[[return]]'' builds a [[RETURN]] node with the converted [[expr]], and
+signals to its caller that control flow has ended.
+
+==convert_return*/
+static bool convert_return(ir_builder_t *ir, ast_t *expr)
+{
+    if(convert_expr(ir, expr))
+        build_return(ir);
+    return false;
+}
+/*@
+
+
+\subsection{Loops}
+
+``[[while]]'' and ``[[for]]'' loops are converted by the same function.
+Several builders are used; some may be absent or empty, depending on the
+which input subexpressions are present. After the built blocks are
+linked together, ignoring back edges, control flows in order:
+
+\textbf{[[prehead]] $\rightarrow$ [[header]] $\rightarrow$ [[inner]]
+  $\rightarrow$ [[footer]] $\rightarrow$ [[after]]}.
+
+==convert_loop*/
+static bool convert_loop(ir_builder_t *ir, ast_t *decls, ast_t *cond,
+                         ast_t *iter, ast_t *body)
+{
+    ir_builder_t prehead, header, inner, footer, after;
+    lexenv_t env;
+    cblock_t *next;
+    bool open;
+    //convert loop//
+    open = true;
+out:
+    if(!ast_is_omitted(decls))
+        env_close(&env);
+    return open;
+}
+/*@
+
+From the [[ir]] builder, control flow enters the loop through the
+pre-header [[prehead]]. If declarations are present, a new lexical
+environment [[env]] is opened to limit their scope to the loop body.
+Initialising expressions are converted, and variables added, by
+[[convert_let]].
+
+==convert loop*/
+ir_open(&prehead, ir);
+link_blocks(prehead.head, ir->tail);
+if(!ast_is_omitted(decls))
+{
+    prehead.env = env_open(&env, ir->env);
+    open = convert_let(&prehead, decls, true);
+    if(!open)
+        goto out;
+}
+/*@
+
+The loop [[header]] follows, containing the converted conditional
+[[cond]] and ending in an [[IF]] node. [[next]] initially points to the
+header start.
+
+==convert loop*/
+ir_open(&header, &prehead);
+open = convert_expr(&header, cond);
+next = header.head;
+link_blocks(header.head, prehead.tail);
+if(!open)
+    goto out;
+build_if(&header, header.value);
+/*@
+
+A post-loop builder [[after]] provides a target block for the loop
+environment.
+
+==convert loop*/
+ir_open(&after, ir);
+/*@
+
+If an iterator subexpression is present, the loop [[footer]] is opened
+to contain it, converted as a statement; [[next]] now points to the
+footer start.
+
+==convert loop*/
+if(!ast_is_omitted(iter))
+{
+    ir_open(&footer, &prehead);
+    open = convert_stmt(&footer, iter);
+    next = footer.head;
+}
+/*@
+
+Now the loop environment of the [[inner]] builder may be initialised:
+``[[break]]'' entails a jump to the beginning of [[after]], and
+``[[continue]]'' to [[next]] (either header or footer.)
+
+The body subexpression is converted as a statement; if control flow
+continues through it, an edge is added from the end of [[inner]] to
+[[next]]. If the iterator is absent, this completes the loop with a back
+edge.
+
+Otherwise, if control flow both enters and leaves the iterator (as
+flagged by [[open]],) the back edge is built from the end of [[footer]]
+to the start of [[header]].
+
+==convert loop*/
+ir_open(&inner, &prehead);
+inner.loop = &(loopenv_t) { .brk = after.head, .cont = next };
+if(convert_stmt(&inner, body))
+    link_blocks(next, inner.tail); // body tail -> around again
+else
+    open = false; // control flow does not enter iter
+if(!ast_is_omitted(iter) && open)
+    link_blocks(header.head, footer.tail);
+/*@
+
+Control-flow edges may now be added for the conditional which ends
+[[header]] -- the [[true]] branch enters the [[inner]] body; the
+[[false]] branch skips to [[after]]. The [[ir]] builder extends to this
+last.
+
+==convert loop*/
+link_blocks(inner.head, header.tail);
+link_blocks(after.head, header.tail);
+ir_extend(ir, &after);
+/*@
+
+
+\subsection{Break \& Continue}
+
+``[[break]]'' and ``[[continue]]'' create control-flow edges to the
+corresponding blocks in the enclosing loop (assuming one is present.)
+
+==convert_loop_exit*/
+static bool convert_loop_exit(ir_builder_t *ir, ast_t *ast)
+{
+    bool is_break = (ast->token == BREAK);
+
+    if(!ir->loop)
+        ir_error(ir, "%s outside loop.",
+                 is_break ? "break" : "continue");
+    else
+        link_blocks(is_break ? ir->loop->brk : ir->loop->cont,
+                    ir->tail);
+    return false;
+}
+/*@
+
+
+\subsection{Type}
+
+A ``[[type]]'' expression becomes a [[CONST]] node with the value of the
+specified type object. [[rtype_from_spec]] returns [[NULL]] if the
+specifier is not valid; here, this is an error.
+
+==convert_literal_type*/
+static bool convert_literal_type(ir_builder_t *ir, ast_t *ast)
+{
+    rtype_t *type = rtype_from_spec(ast);
+
+    if(!type)
+    {
+        ir_error(ir, "unknown type in `type` expression.");
+        return false;
+    }
+    build_constant(ir, (robject_t *)type);
+    return true;
+}
+/*@
+
+
+\subsection{Include}
+
+After opening an [[inner]] builder, continuing from [[ir]], the file
+named by the argument is read and parsed by [[p_source]]. If it fails,
+an error is signalled, but a message is only emitted if the file couldn't
+be found (since in case of syntax error, the parser has already done
+so.) The resulting [[ast]] is converted by [[convert_file]].
+
+==convert_include*/
+static bool convert_include(ir_builder_t *ir, ast_t *arg)
+{
+    assert(arg->type == AST_STRING);
+    char *filename = arg->string;
+    ast_t ast;
+    ir_builder_t inner;
+    bool open;
+    int r;
+
+    assert(filename);
+    ir_open(&inner, ir);
+    link_blocks(inner.head, ir->tail);
+    inner.file = r_intern(filename);
+    r = p_source(filename, &ast);
+    if(r != 0)
+    {
+        *ir->pfailed = true;
+        if(r < 0)
+            ir_error(ir, "including %s - %s", filename,
+                     strerror(errno));
+        return false;
+    }
+    open = convert_file(&inner, &ast);
+    ast_fini(&ast);
+    ir_extend(ir, &inner);
+    return open;
+}
+/*@
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+#include "ir.h"
+#include "ast.h"
+#include "grammar.h"
+#include <errno.h>
+/*@
+
+==prototypes*/
+static bool convert_expr(ir_builder_t *ir, ast_t *ast);
+static bool convert_stmt(ir_builder_t *ir, ast_t *ast);
+/*@
+
+%% XXX temp scratch
+
+%The scope of a function's formal arguments is its body. The scope of
+%variables defined by ``[[let]]'' or ``[[var]]'' is the remainder of the
+%brace-delimited block in which they occur.
+
+%Each free variable [[var]] names a global. If it was introduced with a
+%``[[global]]'' or ``[[const]]'' declaration in the input, its [[.type]]
+%will be [[GLOBAL_INT]], otherwise it's [[GLOBAL_EXT]] (\autoref{rt:global}).
+
+%*/

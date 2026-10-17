@@ -1,0 +1,310 @@
+/*@
+\chapter{Compiler}
+\label{compiler}
+
+The compiler subsystem supplies the [[compile]] entry point, which
+translates an abstract syntax tree into a callable object containing
+bytecode, ready for execution. A relatively straightforward direct-style
+compiler operating on an intermediate representation in static single
+assignment form, it has the peculiarity that it \textit{recovers} types
+during optimisation, as opposed to \textit{inferring} them or
+\textit{checking} them beforehand.
+
+==compiler.c*/
+//includes//
+//globals//
+//c_intern//
+//c_messages//
+//c_message_va//
+//c_begin//
+//c_end//
+//pass prototypes//
+//compile//
+/*@
+
+
+\section{Entry Point}
+
+Compilation proceeds as a sequence of \textit{passes}, each of which
+examines and perhaps transforms some or all of the program being
+compiled. The input is an abstract syntax tree from the parser
+(\autoref{parser}); a closure (\autoref{callable}) is returned that can
+be executed by the virtual machine (\autoref{vm}).
+
+==compile*/
+rclosure_t *compile(ast_t *ast, char *name)
+{
+    cfunction_t *fn = NULL;
+    rfunction_t *rfn = NULL;
+    rclosure_t *cl = NULL;
+
+    //passes//
+fail:
+    if(fn)
+        cfunc_free(fn);
+    return cl;
+}
+/*@
+
+The ``front-end'' of the compiler, [[ir_convert]], converts the input
+[[ast]] into \textit{intermediate representation}, which describes the
+control and data flow in the input program with a graph of pointers
+between compile-time objects (\autoref{ir}, \autoref{ir_convert}). The
+resulting [[fn]] encapsulates the program for the remainder of the
+compilation process.
+
+==passes*/
+fn = ir_convert(ast, name);
+ast_fini(ast);
+if(!fn)
+    goto fail;
+/*@
+
+The program is cleaned, sorted and annotated by [[ir_prepare]]
+(\autoref{ir_pre}).
+
+==passes*/
+if(failed(ir_prepare(fn)))
+    goto fail;
+/*@
+
+Most local variables are erased the during \textit{static single
+  assignment conversion} performed by [[ir_ssa_convert]], becoming edges
+in the value flow graph (\autoref{ir_ssa}).
+
+==passes*/
+ir_ssa_convert(fn);
+/*@
+
+The compiler's ``mid-end'' is a mixture of necessary transformations and
+optional optimisations. The [[ir_optimise]] pass analyses the program
+using \textit{sparse conditional constant propagation}, then uses the
+results to rewrite parts so that they are semantically equivalent but
+more efficient (\autoref{opt}, \autoref{opt_inline}).
+
+Lexically captured variables undergo \textit{cell introduction} in
+[[ir_cell_intro]] (\autoref{opt_closure}). Declared types are checked
+and any necessary conversions inserted by [[ir_postpass]], which can
+also interpret certain complex argument lists ahead of time
+(\autoref{opt_post}).
+
+A simple but effective \textit{dominator value numbering} pass,
+implemented by [[ir_dvn]], is capable of removing redundant computations
+(\autoref{opt_dvn}).
+
+==passes*/
+if(failed(ir_optimise(fn)))
+    goto fail;
+ir_cell_intro(fn);
+if(failed(ir_postpass(fn)))
+    goto fail;
+ir_dvn(fn);
+if(opt.dbg_dump_ir)
+    ir_dump(fn);
+/*@
+
+Finally, the ``back end'' pass [[gen_function]] generates bytecode from
+the optimised intermediate representation, producing an [[rfunction_t]]
+object which is wrapped in a callable closure by
+[[rcall_closure_create]] (\autoref{gen_code}).
+
+==passes*/
+rfn = gen_function(fn);
+cl = rcall_closure_create(rfn->cl_type, rfn);
+/*@
+
+
+\section{Interface}
+\label{compiler:int}
+
+If a pass encounters an error, [[compile]] must be informed so it can
+abandon the compilation. Some passes are run until convergence --
+they're iterated until no further changes are made. Some can avoid
+performing unnecessary operations if they know that a function had no
+effect.
+
+To these ends, passes and their associated functions return [[cresult]]
+bitflags: to signal that they [[CHANGED]] something, or that they
+[[FAILED]]. [[SUCCESS]] is the neutral value.
+
+==cresult*/
+typedef unsigned char cresult;
+enum { SUCCESS = 0, FAILED = 1<<0, CHANGED = 1<<1 };
+/*@
+
+[[cresult]]s are bitwise-ORed together to accumulate flags across
+multiple callees, and tested by callers with the [[failed]] and
+[[changed]] predicates.
+
+==cresult predicates*/
+static inline bool failed(cresult res) { return (res & FAILED) != 0; }
+static inline bool changed(cresult res) { return (res & CHANGED) != 0; }
+/*@
+
+A small amount of state is kept over the lifetime of a compiler
+invocation -- the list of diagnostic messages [[c_msgs]], and the
+constant table [[c_consttab]]. Globals are bad form, but this subsystem
+is not intended to be re-entrant.
+
+==globals*/
+static const char *lvlnames[] = { "Error", "Warning" };
+static SLIST(cmessage_t) c_msgs;
+static hashset_t *c_consttab;
+/*@
+
+They must be initialised before calling into the compiler.
+
+==c_begin*/
+void c_begin()
+{
+    c_msgs = NULL;
+    c_consttab = hashset_create(r_hash, r_equal);
+}
+/*@
+
+After compilation, any messages that were queued are printed, then state
+is deallocated.
+
+==c_end*/
+void c_end()
+{
+    hashset_free(c_consttab);
+    c_messages(C_WARNING);
+    assert(c_msgs == NULL);
+}
+/*@
+
+Constant objects are built from literals in the input program, or
+generated by invocation of certain builtin functions with constant
+arguments.
+
+They're internalised by the compiler in the same way that symbols and
+types are by the runtime.
+
+==c_intern*/
+void *c_intern(void *ptr)
+{
+    void *obj = hashset_insert(c_consttab, ptr);
+    if(obj != ptr)
+        gc_release(ptr);
+    return obj;
+}
+/*@
+
+When an invocation of [[compile]] fails, an [[ERROR]] provides further
+information about the reason. A [[WARNING]] details an unexpected,
+probably undesired condition encountered during compilation.
+
+==cmsglevel*/
+typedef enum { C_ERROR, C_WARNING } cmsglevel;
+/*@
+
+A message is represented by an instance of the [[cmessage_t]] structure.
+The [[c_messages]] list is linked through the [[.next]] field.
+
+==cmessage_t*/
+typedef struct cmessage
+{
+    SLIST(struct cmessage) next;
+    cmsglevel level;
+    rsymbol_t *file;
+    char *string;
+} cmessage_t;
+/*@
+
+Other modules will call [[c_message_va]] to append a message to the
+global list\ldots
+
+==c_message_va*/
+void c_message_va(cmsglevel lvl, rsymbol_t *file, char *fmt, ...)
+{
+    va_list va;
+    cmessage_t *msg = xcalloc(1, sizeof(*msg));
+
+    va_start(va, fmt);
+    msg->level = lvl;
+    msg->file = file;
+    if(vasprintf(&msg->string, fmt, va) == -1)
+        fatal("vasprintf failed.");
+    slist_push(c_msgs, msg, next);
+    va_end(va);
+}
+/*@
+
+\ldots or use a shorthand macro.
+
+==message macros*/
+#define c_warning(fmt, args...) c_message_va(C_WARNING, NULL, fmt, ##args)
+#define c_error(fmt, args...) c_message_va(C_ERROR, NULL, fmt, ##args)
+/*@
+
+The [[c_messages]] function prints and clears the message list. A
+[[level]] argument of [[C_ERROR]] will muffle any warnings.
+
+==c_messages*/
+void c_messages(int level)
+{
+    if(c_msgs)
+    {
+        cmessage_t *msg, *tmp;
+
+        slist_nreverse(c_msgs, next);
+        slist_foreach_safe(c_msgs, msg, tmp, next)
+        {
+            if(msg->level <= level)
+                fprintf(stderr, "%s: %s\n", lvlnames[msg->level], msg->string);
+            xfree(msg->string);
+            xfree(msg);
+        }
+        c_msgs = NULL;
+    }
+}
+/*@
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+#include "ir.h"
+#include "ast.h"
+/*@
+
+Pass entry point prototypes are included inline, not from header files,
+as no other module needs to call them.
+
+==pass prototypes*/
+cfunction_t *ir_convert(ast_t *ast, char *filename); // ir_convert.c
+cresult ir_prepare(cfunction_t *fn); // ir_pre.c
+cresult ir_postpass(cfunction_t *fn); // opt_post.c
+void ir_init_closure(cfunction_t *fn); // ir_closure.c
+void ir_ssa_convert(cfunction_t *fn); // ir_ssa.c
+cresult ir_optimise(cfunction_t *fn); // opt_sccp.c
+cresult ir_cell_intro(cfunction_t *fn); // opt_closure.c
+void ir_dvn(cfunction_t *fn); // opt_dvn.c
+rfunction_t *gen_function(cfunction_t *fn); // gen_code.c
+/*@
+
+% .h
+==compiler.h*/
+//cmsglevel//
+//cmessage_t//
+//cresult//
+//cresult predicates//
+//message macros//
+//prototypes//
+/*@
+
+==prototypes*/
+typedef struct cfunction cfunction_t;
+cfunction_t *convert(ast_t *ast, char *name);
+rclosure_t *source(char *name);
+rclosure_t *compile(ast_t *ast, char *name);
+void *c_intern(void *ptr);
+void c_begin();
+void c_end();
+void c_messages(int level);
+void c_message_va(cmsglevel lvl, rsymbol_t *file, char *fmt, ...);
+/*@
+
+%*/

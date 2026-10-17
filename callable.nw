@@ -1,0 +1,975 @@
+/*@
+\chapter{Functions, Closures, Builtins}
+\label{callable}
+
+A \textit{callable} object can be invoked by a function call expression.
+They participate in the calling convention established by the VM
+(\autoref{call}).
+
+
+==rt/callable.c*/
+//includes//
+//callables//
+//signatures//
+//type construction//
+//closures//
+//functions//
+//builtins//
+//rt_install_call_types//
+/*@
+
+To the user, callable objects have types which are instances of
+[[function]]. This type constructor is known as [[r_type_callable]] to
+the runtime.
+
+
+\section{Callables}
+
+A callable is either a \textit{closure} or a \textit{builtin}. Function
+expressions create closures, while builtins allow C functions to be
+invoked by the VM.
+
+==call_dispatch*/
+typedef enum { CALL_CLOSURE, CALL_BUILTIN } call_dispatch;
+/*@ %
+
+Both begin with a common [[rcallable_t]] structure.
+
+==rcallable_t*/
+typedef struct rcallable
+{
+    robject_t base;
+    call_dispatch disp;
+} rcallable_t;
+/*@
+
+They can be distinguished by [[rcall_is_builtin]].
+
+==rcall_is_builtin*/
+static inline bool rcall_is_builtin(const rcallable_t *cl)
+    { return cl->disp != CALL_CLOSURE; }
+/*@
+
+
+\subsection{Operations}
+
+==callables*/
+//rcall_gc//
+//rcall_free//
+//rcall_print//
+//call_ops//
+/*@ %
+
+A closure may allocate an array containing references to managed
+objects, so must be handled appropriately by the [[ops.gc]]\ldots
+
+==rcall_gc*/
+static void closure_gc(rclosure_t *cl);
+static void rcall_gc(void *ptr)
+{
+    if(!rcall_is_builtin(ptr))
+        closure_gc(ptr);
+}
+/*@ %
+
+\ldots and [[ops.free]] callbacks.
+
+==rcall_free*/
+static void closure_free(rclosure_t *cl);
+static void rcall_free(void *ptr)
+{
+    if(!rcall_is_builtin(ptr))
+        closure_free(ptr);
+}
+/*@ %
+
+A callable has the printed representation ``[[<type pointer>]]''. Some
+builtins have more information available; their [[.name]] may be printed
+instead.
+
+==rcall_print*/
+static void rcall_print(FILE *fp, const void *ptr)
+{
+    const rcallable_t *cl = ptr;
+
+    fprintf(fp, "<");
+    r_print(fp, r_typeof(ptr));
+    if(rcall_is_builtin(cl))
+    {
+        const cbuiltin_t *cbi = ((rbuiltin_t *)ptr)->cbi;
+
+        if(cbi)
+        {
+            fprintf(fp, " `%s`>", cbi->name);
+            return;
+        }
+    }
+    fprintf(fp, " %p>", ptr);
+}
+/*@ %
+
+Two callables are equal only when they are the same object, so the
+[[ops.equal]] callback is omitted.
+
+==call_ops*/
+static const typeops_t call_ops = {
+    .free = rcall_free,
+    .gc = rcall_gc,
+    .print = rcall_print
+};
+/*@ %
+
+
+\section{Signatures}
+\label{callable:sig}
+
+An [[rtype_t]] with [[.kind]] [[CALLABLE]] is called a
+\textit{signature}.
+
+==signatures*/
+//sig_equal//
+//sig_types_equal//
+//sig_print//
+//argdesc_mark//
+//sig_gc//
+//sig_free//
+/*@ %
+
+The type's [[.sig]] field points to an auxiliary [[funsig_t]] structure
+that it owns.
+
+[[.args]] is an array of length [[.nargs]], each element describing the
+corresponding argument. [[.ret_type]] is the type of the return value.
+[[.has_rest]] is set if [[...]] is present as an argument. [[reqbits]]
+has one bit per argument, the inverse of [[.is_optional]].
+
+During a call, argument values are placed on the stack in a ``call
+frame'' (\autoref{vm:frame}). [[.argsz]] is its total size, in bytes.
+
+==funsig_t*/
+typedef struct funsig
+{
+    argdesc_t *args;
+    unsigned nargs;
+    rtype_t *ret_type;
+    bool has_rest;
+    unsigned reqbits;
+    uint32_t hash;
+    op_offset_t argsz;
+} funsig_t;
+/*@
+
+When a function with this signature is called, each argument must be a
+subtypes of its corresponding [[.type]]. Its value is stored [[.offset]]
+bytes from the start of the call frame. [[.name]] may be [[NULL]]; if
+not, it can be named in a call expression. [[.is_optional]] is true when
+the argument has a default expression, and so is not required to be
+present in a call.
+
+==argdesc_t*/
+typedef struct
+{
+    rtype_t *type;
+    op_offset_t offset;
+    rsymbol_t *name;
+    bool is_optional;
+} argdesc_t;
+/*@ %
+
+Two [[CALLABLE]] types with the same arguments and return types are
+equal (since the other values are derived.) Types are tested with
+pointer equality, as they've been interned by construction.
+
+==sig_equal*/
+bool sig_equal(funsig_t *a, funsig_t *b)
+{
+    if(a->nargs != b->nargs || a->ret_type != b->ret_type)
+        return false;
+    for(int i=0; i<a->nargs; i++)
+    {
+        argdesc_t *m = &a->args[i], *n = &b->args[i];
+
+        if(m->name != n->name ||
+           m->is_optional != n->is_optional ||
+           m->type != n->type ||
+           m->offset != n->offset)
+            return false;
+    }
+    return true;
+}
+/*@ %
+
+For subtyping and compatibility, only argument and return types need to
+be checked, as type declarations don't include argument names or
+optional flags.
+
+==sig_types_equal*/
+bool sig_types_equal(funsig_t *a, funsig_t *b)
+{
+    if(a->nargs != b->nargs || a->ret_type != b->ret_type)
+        return false;
+    for(int i=0; i<a->nargs; i++)
+    {
+        argdesc_t *m = &a->args[i], *n = &b->args[i];
+
+        if(m->type != n->type)
+            return false;
+    }
+    return true;
+}
+/*@ %
+
+A signature prints like its type specifier, ``[[function (args) : return]]''.
+[[...]], if present, has a known type and is always optional, so those
+need not be printed. A trailing ``[[=]]'' on an argument denotes its
+optionality. If the return type is [[object]], it is omitted.
+
+==sig_print*/
+void sig_print(FILE *fp, funsig_t *sig)
+{
+    fprintf(fp, "function ");
+    fputc('(', fp);
+    for(int i=0; i<sig->nargs; i++)
+    {
+        argdesc_t *arg = &sig->args[i];
+
+        if(i > 0)
+            fprintf(fp, ", ");
+        if(arg->name == r_sym_rest)
+            r_print(fp, arg->name);
+        else if(arg->name)
+        {
+            if(arg->type != r_type_object)
+            {
+                r_print(fp, arg->type);
+                fputc(' ', fp);
+            }
+            r_print(fp, arg->name);
+            if(arg->is_optional)
+                fputc('=', fp);
+        }
+        else
+            r_print(fp, arg->type);
+    }
+    fputc(')', fp);
+    if(sig->ret_type != r_type_object)
+    {
+        fprintf(fp, " : ");
+        r_print(fp, sig->ret_type);
+    }
+}
+/*@ %
+
+Types and symbols are managed objects, so a signature must participate
+in garbage collection by marking them\ldots
+
+==sig_gc*/
+void sig_gc(funsig_t *sig)
+{
+    gc_mark(sig->ret_type);
+    for(int i=0; i<sig->nargs; i++)
+        argdesc_mark(&sig->args[i]);
+}
+/*@ %
+
+\ldots in each argument descriptor.
+
+==argdesc_mark*/
+static inline void argdesc_mark(argdesc_t *arg)
+{
+    gc_mark(arg->name);
+    gc_mark(arg->type);
+}
+/*@ %
+
+The type will free its [[funsig_t]] during deallocation.
+
+==sig_free*/
+void sig_free(funsig_t *sig)
+{
+    if(sig->args)
+        xfree(sig->args);
+    xfree(sig);
+}
+/*@ %
+
+And given the former, the latter may be extracted with [[rcall_sig]].
+
+==rcall_sig*/
+static inline funsig_t *rcall_sig(const rcallable_t *cl)
+    { return cl->base.type->sig; }
+/*@ %
+
+
+\section{Type Construction}
+\label{callable:type}
+
+[[CALLABLE]] types can be created by type expressions in user code, or
+by the compiler and runtime as needed (for example, when installing new
+builtins.)
+
+==type construction*/
+//copy_args//
+//rcall_type_create//
+//call_type_from_spec//
+//callable_cons//
+/*@ %
+
+The latter case is handled by [[rcall_type_create]], which must be
+provided a return type, an argument count, and an array of
+[[argdesc_t]]s with their [[.name]], [[.type]] and [[.is_optional]]
+fields initialised as desired.
+
+(Note that [[.argsz]] always includes at least an [[argbits_t]]. This
+could be omitted for functions without optional arguments, at the cost
+of complicating function invocation.)
+
+[[.hash]] is computed from the hashes of the return type and the
+argument list -- [[.reqbits]], [[.nargs]], [[.argsz]] and [[.has_rest]]
+are derived from the latter and so need not be included.
+
+==rcall_type_create*/
+rtype_t *rcall_type_create(rtype_t *ret_type, unsigned nargs,
+                           argdesc_t *args)
+{
+    funsig_t *sig = xmalloc(sizeof(funsig_t));
+
+    *sig = (funsig_t) {
+        .args = nargs > 0 ? xcalloc(nargs, sizeof(argdesc_t)) : NULL,
+        .nargs = nargs,
+        .reqbits = 0,
+        .argsz = sizeof(argbits_t),
+        .ret_type = ret_type,
+        .has_rest = false
+    };
+    sig->hash = hash_roll(r_hash(ret_type), copy_args(sig, nargs, args));
+    return rtype_create(RT_CALLABLE, sig, &call_ops, NULL);
+}
+/*@ %
+
+The [[argdesc_t]] array is copied, computing each argument's
+[[.offset]], updating the signature's [[.argsz]], [[.reqbits]] and
+[[.has_rest]] fields accordingly.
+
+The hash of the argument list is the hash of each argument's fields as
+provided by the caller.
+
+==copy_args*/
+static uint32_t copy_args(funsig_t *sig, unsigned nargs, argdesc_t *args)
+{
+    uint32_t hash = 0;
+
+    for(int i=0; i<nargs; i++)
+    {
+        argdesc_t *arg = &sig->args[i];
+
+        *arg = args[i];
+        arg->offset = sig->argsz;
+        if(arg->name == r_sym_rest)
+            sig->has_rest = true;
+        if(!arg->is_optional)
+            sig->reqbits |= 1<<i;
+        sig->argsz += rtype_eltsz(arg->type);
+        hash = hash_code_seed(&arg->is_optional, sizeof(bool), hash);
+        hash = hash_roll(hash, r_hash(arg->name));
+        hash = hash_roll(hash, r_hash(arg->type));
+    }
+    return hash;
+}
+/*@ %
+
+A trivial convenience function exists to initialise them.
+
+==argdesc_init*/
+static inline argdesc_t argdesc_init(rsymbol_t *name, rtype_t *type, bool is_opt)
+{
+    return (argdesc_t) {
+        .name = name,
+        .type = type,
+        .is_optional = is_opt
+    };
+}
+/*@ %
+
+When a [[function]] type constructor is encountered in a type specifier,
+[[call_type_from_spec]] is invoked, with an array containing specifiers
+for the argument and return types.
+
+==callable_cons*/
+static consdesc_t callable_cons = {
+    .from_spec = call_type_from_spec,
+    .kind = RT_CALLABLE
+};
+/*@ %
+
+If none were supplied, the [[function]] type itself is returned -- since
+this is a supertype of all [[CALLABLE]]s, it lets the user specify any
+type of callable object.
+
+Otherwise, the grammar has arranged that the return type is the first
+specifier in the array. If it was omitted, [[object]] is assumed.
+
+Each [[argdesc_t]] takes its [[.type]] from the corresponding type
+specifier. The [[...]] argument, if present, is a named vector of
+[[object]]s, optional, and must be the last element in the array.
+
+==call_type_from_spec*/
+static rtype_t *
+call_type_from_spec(const consdesc_t *cons, unsigned nargs, ast_t *args)
+{
+    if(nargs < 1)
+        return r_type_callable;
+
+    argdesc_t *descs = alloca(sizeof(argdesc_t) * (nargs-1));
+    rtype_t *ret_type = (args[0].type == AST_INVALID)
+        ? r_type_object
+        : rtype_from_spec(&args[0]);
+
+    if(!ret_type)
+        return NULL;
+    for(int i=1; i<nargs; i++)
+    {
+        argdesc_t *desc = &descs[i-1];
+        ast_t *arg = &args[i];
+
+        if(arg->type == AST_NAME && arg->symbol == r_sym_rest)
+        {
+            if(i != nargs-1)
+            {
+                c_warning("`...` not last argument in list.");
+                return NULL;
+            }
+            *desc = argdesc_init(r_sym_rest, (rtype_t *)r_type_vec_object, true);
+        }
+        else
+        {
+            rtype_t *type = rtype_from_spec(arg);
+
+            if(!type)
+                return NULL;
+            *desc = argdesc_init(NULL, type, false);
+        }
+    }
+    return rcall_type_create(ret_type, nargs-1, descs);
+}
+/*@ %
+
+
+\section{Closures}
+\label{callable:closure}
+
+Function expressions in user code cause closures to be created. The
+closure provides access to the values of variables bound by lexically
+enclosing functions.
+
+==closures*/
+//closure_free//
+//closure_gc//
+//rcall_closure_create//
+/*@ %
+
+This object of [[CALLABLE]] type is a pair of pointers. [[.fn]] is the
+function compiled from its corresponding expression; [[.env]] a buffer
+containing values saved from its lexical environment. This corresponds
+to the ``flat closure'' arrangement described in \citet{serrano95}.
+
+==rclosure_t*/
+typedef struct rclosure
+{
+    rcallable_t base;
+    rfunction_t *fn;
+    void *env;
+} rclosure_t;
+/*@
+
+The [[.disp]] of a closure is always [[CALL_CLOSURE]]. If the function
+needs no environment, [[.env]] is left [[NULL]] (it would be possible to
+avoid creating a closure entirely for functions which don't capture
+lexical variables, at the cost of further complicating function
+invocation).
+
+==rcall_closure_create*/
+rclosure_t *rcall_closure_create(rtype_t *type, rfunction_t *fn)
+{
+    rclosure_t *cl = gc_alloc(type, sizeof(rclosure_t));
+    op_offset_t env_sz = fn->env_sz;
+
+    cl->base.disp = CALL_CLOSURE;
+    cl->fn = fn;
+    cl->env = (env_sz > 0) ? xcalloc(1, env_sz) : NULL;
+    return cl;
+}
+/*@ %
+
+The compiled function is a managed object -- it's shared by all closures
+over a given function expression -- and so must be marked during garbage
+collection.
+
+The environment is split into two areas - scalars are stored from bytes
+0 to [[.env_scalsz - 1]], and references from [[.env_scalsz]] to
+[[.env_sz - 1]]. Each pointer in the latter must be marked.
+
+==closure_gc*/
+#define env_ptr(c, f) (robject_t **)((uint8_t *)c->env + c->fn->f)
+static void closure_gc(rclosure_t *cl)
+{
+    gc_mark(cl->fn);
+    if(cl->env)
+    {
+        robject_t **ptr;
+
+        for(ptr = env_ptr(cl, env_scalsz);
+            ptr < env_ptr(cl, env_sz); ptr++)
+            gc_mark(*ptr);
+    }
+}
+/*@ %
+
+As [[.env]] was allocated, it must be freed.
+
+==closure_free*/
+static void closure_free(rclosure_t *cl)
+{
+    if(cl->env)
+        xfree(cl->env);
+}
+/*@ %
+
+
+
+\section{Functions}
+\label{callable:func}
+
+Internal to the runtime subsystem, a \textit{function} is the compiled
+representation of a single function expression in user code. It is not,
+in itself, callable.
+
+==functions*/
+//rfunc_create//
+//rfunc_free//
+//rfunc_gc//
+//func_ops//
+/*@ %
+
+The VM interprets a stream of [[op_code_t]] opcodes as instructions.
+Each instruction is typically followed by a number of [[op_stack_t]] or
+[[op_offset_t]] operands.
+
+(The former is usually a byte displacement from the stack frame base
+pointer -- negative values to address function arguments, positive for
+local variables. The latter, a zero-based byte offset or element index
+into some other structure.)
+
+The [[argbits_t]] typedef is merely informative. Argument bitflags are
+manipulated as [[rint_t]]s by the VM, so these types must be the same
+size.
+
+==bytecode types*/
+typedef uint8_t op_code_t;
+typedef uint16_t op_offset_t;
+typedef int16_t op_stack_t; /* "32k of stack frame is enough for anyone" */
+typedef unsigned argbits_t;
+static_assert(sizeof(argbits_t) == sizeof(rint_t),
+              "argbits not the same size as int.");
+/*@
+
+When the argument at position [[b]] was omitted from a call with
+argument bitflags [[a]], [[argbits_missing]] returns [[true]].
+
+==argbits_missing*/
+static inline bool argbits_missing(argbits_t a, unsigned b)
+    { return (a & (1<<b)) == 0; }
+/*@ %
+
+Each user function generates at most one [[rfunction_t]] (some may be
+removed by dead code elimination.)
+
+The function can be referred to by many closures, so is a managed
+object. The body of the function is compiled into the array stored in
+the [[.code]] field. The [[.cl_type]] field is the signature of the
+function (and so the [[.type]] of its closures.)
+
+Local variable storage ([[.loc_scalsz]], [[.loc_sz]]) and the closure
+environment ([[.env_scalsz]], [[.env_sz]]) are both split into areas
+where values of scalar and reference types are stored. Neither are
+mapped in any more detail, as the exact layouts are only needed during
+code generation.
+
+[[.consts]] holds an array of [[nconsts]] references which serve as the
+function's ``constant pool''. [[CONST]] opcodes refer to objects from
+here.
+
+==rfunction_t*/
+typedef struct
+{
+    robject_t base;
+    op_code_t *code;
+    rtype_t *cl_type;
+    op_offset_t loc_scalsz, loc_sz;
+    op_offset_t env_scalsz, env_sz;
+    robject_t **consts;
+    unsigned nconsts;
+} rfunction_t;
+/*@
+
+[[rfunc_create]] gives the newly-created function ownership of its
+[[code]] and the contents of the [[consts]] array.
+
+==rfunc_create*/
+rfunction_t *rfunc_create(rtype_t *cl_type, op_code_t *code, size_t loc_scalsz,
+                          size_t loc_sz, size_t env_scalsz, size_t env_sz,
+                          robject_array_t *consts)
+{
+    rfunction_t *rfn = gc_alloc(r_type_function, sizeof(rfunction_t));
+    unsigned nconsts = alen(consts);
+
+    *rfn = (rfunction_t) {
+        .base = rfn->base,
+        .code = code,
+        .cl_type = cl_type,
+        .loc_scalsz = loc_scalsz,
+        .loc_sz = loc_sz,
+        .env_scalsz = env_scalsz,
+        .env_sz = env_sz,
+        .consts = array_cede(consts),
+        .nconsts = nconsts
+    };
+    return rfn;
+}
+/*@
+
+Constants in the pool (and the function signature) are managed objects,
+and must be marked during garbage collection.
+
+==rfunc_gc*/
+static void rfunc_gc(void *ptr)
+{
+    rfunction_t *fn = ptr;
+    gc_mark(fn->cl_type);
+    for(int i=0; i<fn->nconsts; i++)
+        gc_mark(fn->consts[i]);
+}
+/*@ %
+
+The constant pool and code array are owned by the function, so must be
+freed when it's collected as garbage.
+
+==rfunc_free*/
+static void rfunc_free(void *ptr)
+{
+    rfunction_t *fn = ptr;
+    if(fn->consts)
+        xfree(fn->consts);
+    xfree(fn->code);
+}
+/*@ %
+
+Compiled function objects are not user-visible, so don't need the other
+[[.ops]] callbacks.
+
+==func_ops*/
+static const typeops_t func_ops = {
+    .free = rfunc_free,
+    .gc = rfunc_gc,
+};
+/*@ %
+
+
+\section{Builtins}
+\label{callable:builtin}
+
+The VM can call C functions through the \textit{builtin} mechanism. The
+compiler can also be informed of their behaviour, and generate bytecode
+in place of a regular call; optional callbacks specify when and how.
+
+==builtins*/
+//rcall_builtin_create//
+//count_args//
+//argdesc_from_init//
+//rbuiltin_define//
+//rbuiltin_install//
+/*@ %
+
+An [[rbuiltin_t]] is an object of [[CALLABLE]] type. The [[.fn]] field
+points to the C function to invoke. When the compiler comes upon one of
+these objects, it looks to the [[.cbi]] field, where present, to
+determine its behaviour.
+
+==rbuiltin_t*/
+typedef struct rbuiltin rbuiltin_t;
+typedef struct vm_ctx vm_ctx_t;
+typedef void (*builtin_fn)(vm_ctx_t *, rbuiltin_t *, uint8_t *, void *);
+typedef struct rbuiltin
+{
+    rcallable_t base;
+    builtin_fn fn;
+    const cbuiltin_t *cbi;
+} rbuiltin_t;
+/*@
+
+The [[.ops]] callbacks in the [[cbuiltin_t]] structure specify the
+builtin's semantics, implement any custom code generation it requires,
+and are described in \autoref{opt:builtin}. Any extra information can be
+referenced via the [[.data]] field. The printed representation of the
+associated [[rbuiltin_t]] will include the [[.name]] if it's present.
+
+==cbuiltin_t*/
+typedef struct builtin_ops builtin_ops_t;
+typedef struct cbuiltin
+{
+    const builtin_ops_t *ops;
+    void *data;
+    const char *name;
+} cbuiltin_t;
+/*@
+
+Builtins are similar to closures, except with [[.disp]] equal to
+[[CALL_BUILTIN]], a pointer to a C function instead of VM code, and an
+optional compiler descriptor instead of an environment.
+
+==rcall_builtin_create*/
+rcallable_t *
+rcall_builtin_create(rtype_t *type, builtin_fn fn, const cbuiltin_t *cbi)
+{
+    rbuiltin_t *cl = gc_alloc(type, sizeof(rbuiltin_t));
+
+    cl->base.disp = CALL_BUILTIN;
+    cl->fn = fn;
+    cl->cbi = cbi;
+    return (rcallable_t *)cl;
+}
+/*@ %
+
+A module which implements builtins will [[#include "rt/builtin.h"]].
+
+==rt/builtin.h*/
+//builtin_init_arg_t//
+//builtin_init_t//
+//init macros//
+//defbuiltin//
+//function macros//
+//builtin_return//
+//builtin externs//
+//missingp//
+/*@ %
+
+Each builtin is initialised by a static [[builtin_init_t]] structure.
+[[.fn]] and [[.cbi]] will be copied to their counterparts in
+[[rbuiltin_t]]; [[.prtype]] holds the address of the global containing
+the return type of the builtin (it can't simply take a value; types are
+not constant, they're created during runtime initialisation.)
+
+==builtin_init_t*/
+typedef struct
+{
+    char *name;
+    builtin_fn fn;
+    rtype_t **prtype;
+    const cbuiltin_t *cbi;
+    const builtin_init_arg_t *args;
+} builtin_init_t;
+/*@ %
+
+[[.args]] points to the start of a static array of
+[[builtin_init_arg_t]] structures.
+
+==builtin_init_arg_t*/
+typedef struct
+{
+    char *name;
+    rtype_t **ptype;
+    bool is_optional;
+} builtin_init_arg_t;
+/*@ %
+
+These fields are interned (when present), dereferenced and copied,
+respectively, to initialise an [[argdesc_t]].
+
+==argdesc_from_init*/
+static inline argdesc_t argdesc_from_init(const builtin_init_arg_t *arg)
+{
+    return argdesc_init(arg->name ? r_intern(arg->name) : NULL,
+                        *arg->ptype,
+                        arg->is_optional);
+}
+/*@ %
+
+The [[.args]] array is terminated with a sentinel [[{ 0 }]], so counting
+its elements is a matter of finding the first one with no [[.ptype]].
+
+==count_args*/
+static inline unsigned count_init_args(const builtin_init_t *init)
+{
+    unsigned i = 0;
+    for(; init->args[i].ptype; i++);
+    return i;
+}
+/*@ %
+
+[[rbuiltin_define]] creates and installs a builtin, given a static
+initialiser. Counting and converting the arguments (and, since this is
+late enough in the runtime initialisation, dereferencing the pointer to
+the return type) lets us create the [[CALLABLE]] type; this, along with
+the other fields from the structure, is enough to create the builtin
+object. It's installed in the global environment with the given
+[[.name]].
+
+==rbuiltin_define*/
+rcallable_t *rbuiltin_define(const builtin_init_t *init)
+{
+    unsigned nargs = count_init_args(init);
+    argdesc_t *args = alloca(sizeof(argdesc_t) * nargs);
+
+    for(int i=0; i<nargs; i++)
+        args[i] = argdesc_from_init(&init->args[i]);
+
+    rtype_t *cl_type = rcall_type_create(*init->prtype, nargs, args);
+    rcallable_t *cl = rcall_builtin_create(cl_type, init->fn, init->cbi);
+
+    r_defbuiltin(init->name, cl);
+    return cl;
+}
+/*@ %
+
+The convenience function [[rbuiltin_install]] defines every builtin in
+an array of initialisers (which is also terminated with [[{ 0 }]].)
+
+==rbuiltin_install*/
+void rbuiltin_install(const builtin_init_t *init)
+{
+    for(; init->name; init++)
+        rbuiltin_define(init);
+}
+/*@ %
+
+The [[.args]] field of the builtin initialiser is a pointer, and
+initialising it with a static array requires an explicit cast. The
+convenience macro [[defbuiltin]] helps reduce the clutter (or, when a
+[[cbuiltin_t]] is needed, [[defcbuiltin]].)
+
+==defbuiltin*/
+#define defbuiltin(n, f, prt, a...) \
+    { init_builtin(n, f, prt, init_args(a)) }
+#define defcbuiltin(n, f, prt, o, d, a...) \
+    { init_builtin(n, f, prt, init_args(a)), .cbi = init_cbi(o, n, d) }
+/*@ %
+
+This provides the fields\ldots
+
+==init macros*/
+#define init_builtin(n, f, prt, a...) \
+    .name = n, .fn = f, .prtype = prt, .args = a
+/*@ %
+
+\ldots and the argument list, cast to the correct type (with sentinel
+value appended.)
+
+==init macros*/
+#define init_args(a...) (builtin_init_arg_t []) { a, { } }
+/*@ %
+
+Instead of taking a pointer to a named static structure, the [[.cbi]]
+field can be initialised inline.
+
+==init macros*/
+#define init_cbi(o, n, d) \
+    &(cbuiltin_t) { .ops = o, .name = n, .data = d }
+/*@ %
+
+%% FIXME these are going away??
+==function macros*/
+#define def_args struct __attribute__ ((__packed__))
+#define end_args(args, n) *n = (void *)(args - sizeof(*n))
+/*@ %
+
+A builtin is given a pointer to a location where it is to place its
+return value, and it could be of a pointer or a scalar type. A macro
+hides some of the verbiage.
+%% FIXME the form [[bi_return(type, r) = val]] is better
+
+==builtin_return*/
+#define builtin_return(ret, typ, val) (*((typ *)(ret))) = val
+/*@ %
+
+Optional arguments to a builtin don't have defaults. Instead, the
+[[argbits_t]] from the call frame is made available. This can be passed
+to [[argbits_missing]], along with the zero-based index of the argument
+in question, to test for its absence.
+
+==missingp*/
+#define missingp(a,b) argbits_missing(a,b)
+/*@ %
+
+
+\section{Initialisation}
+
+The type of compiled functions is stored in [[r_type_function]]. It's
+named ``[[compiled]]'' but, as no objects of this type are accessible to
+the user, should never be seen.
+
+The constructor of [[CALLABLE]] types is named ``[[function]]'', as this
+lends itself to type specifiers which look similar to the function
+expressions with which they are compatible.
+
+==rt_install_call_types*/
+rtype_t *r_type_function, *r_type_callable;
+void rt_install_call_types()
+{
+    r_type_function = rtype_create(RT_OBJECT, NULL, &func_ops, "compiled");
+    r_type_callable = rtype_cons_init(&callable_cons, "function");
+}
+/*@ %
+
+
+\section*{Miscellanea}
+
+%% .c misc
+==includes*/
+#include "global.h"
+// required for rbuiltin_define
+#include "rt/builtin.h"
+// required for from_spec
+#include "ast.h"
+/*@ %
+
+%% builtin.h misc
+==builtin externs*/
+rcallable_t *rbuiltin_define(const builtin_init_t *init);
+void rbuiltin_install(const builtin_init_t *init);
+/*@
+
+%% .h
+==rt/callable.h*/
+//bytecode types//
+//argbits_missing//
+//argdesc_t//
+//funsig_t//
+//rfunction_t//
+//call_dispatch//
+//rcallable_t//
+//rcall_is_builtin//
+//rclosure_t//
+//cbuiltin_t//
+//rbuiltin_t//
+//prototypes//
+//externs//
+//argdesc_init//
+//rcall_sig//
+/*@
+
+==externs*/
+extern rtype_t *r_type_function, *r_type_callable;
+/*@ %
+
+==prototypes*/
+rtype_t *rcall_type_create(rtype_t *ret_type, unsigned nargs, argdesc_t *args);
+rfunction_t *rfunc_create(rtype_t *cl_type, op_code_t *code, size_t loc_scalsz,
+                          size_t loc_sz, size_t env_scalsz, size_t env_sz,
+                          robject_array_t *consts);
+rclosure_t *rcall_closure_create(rtype_t *type, rfunction_t *fn);
+rcallable_t *rcall_builtin_create(rtype_t *type, builtin_fn fn,
+                                  const cbuiltin_t *builtin);
+void rt_install_call_types();
+/*@ %
+
+%*/

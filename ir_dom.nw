@@ -1,0 +1,230 @@
+/*@
+\chapter{Dominator Tree}
+\label{ir_dom}
+
+Several properties of the control flow graph of a function, and the
+basic blocks (\autoref{ir:block}) that it contains, are informed by the
+concept of dominance.
+
+If the block [[x]] appears on every control-flow path from the function
+entry to the block [[y]], then [[x]] \textit{dominates} [[y]]. If, in
+addition, [[x != y]], then [[x]] \textit{strictly dominates} [[y]].
+[[x]] is the \textit{immediate dominator} of [[y]] if [[x]] strictly
+dominates [[y]], and every other dominator of [[y]] dominates [[x]]
+\citep{tarjan79,cytron91}.
+
+The \textit{dominator tree} of a function is rooted at the [[.entry]]
+block, and every other block [[y]] has its immediate dominator as its
+parent in the tree \citep{cytron91}.
+
+The \textit{dominance frontier} of a block [[x]] is the set of all
+blocks [[y]] such that [[x]] dominates some predecessor of [[y]] but
+doesn't strictly dominate [[y]] \citep{cytron91}.
+
+==ir_dom.c*/
+//includes//
+//intersect//
+//dom_idoms//
+//add_df//
+//dom_collect//
+//dom_free//
+//cfunc_dom//
+/*@
+
+The SSA conversion (\autoref{ir_ssa}) and value numbering
+(\autoref{opt_dvn}) passes rely on the dominator tree to efficiently
+determine the definition that reaches a use. The SSA conversion pass
+uses the dominance frontier to place $\phi$-functions where the values
+from different assignments of a variable merge together.
+
+The [[doms_t]] structure stores these sets. The element in [[.dfs]]
+indexed by a block's [[.id]] holds an array containing references to the
+blocks in its dominance frontier. The element at the same index in
+[[.children]] holds an array of references to its children in the
+dominator tree.
+
+==doms_t*/
+typedef struct
+{
+    cblock_array_t *dfs;
+    cblock_array_t *children;
+} doms_t;
+/*@
+
+[[cfunc_dom]] populates the immediate dominator array [[idom]], then
+derives from that the dominator tree and dominance frontier sets.
+
+==cfunc_dom*/
+doms_t *cfunc_dom(cfunction_t *fn)
+{
+    doms_t *dom;
+    cblock_t **idom = dom_idoms(fn);
+
+    dom = dom_collect(fn, idom);
+    xfree(idom);
+    return dom;
+}
+/*@
+
+The [[doms_t]] returned can be deallocated with [[dom_free]].
+
+==dom_free*/
+void dom_free(doms_t *dom, int nblocks)
+{
+    for(int i=0; i<nblocks; i++)
+    {
+        array_fini(&dom->children[i]);
+        array_fini(&dom->dfs[i]);
+    }
+    xfree(dom->children);
+    xfree(dom->dfs);
+    xfree(dom);
+}
+/*@
+
+
+\section{Immediate Dominators}
+
+A straightforward implementation of the algorithm described in
+\citet*[Figure 3]{cooper11}, [[dom_idoms]] requires that blocks in the
+input function [[fn]] have been numbered in postorder (a task performed
+by [[cfunc_rdfo]].)
+
+The immediate dominator of a [[block]] is its predecessor, if it has
+just the one; or the nearest block which dominates all of its
+predecessors. It's stored in the [[doms]] array, indexed by block
+[[.id]]. The [[.entry]] block is its own immediate dominator, to ground
+the [[intersect]] calls. The algorithm iterates to convergence.
+
+==dom_idoms*/
+static cblock_t **dom_idoms(cfunction_t *fn)
+{
+    cblock_t **doms = xcalloc(fn->nblocks, sizeof(*doms));
+    bool changed = (fn->nblocks > 1);
+
+    doms[0] = fn->entry;
+    while(changed)
+    {
+        cblock_t *block;
+
+        changed = false;
+        list_foreach_entry(&fn->cblock_head, block, cblock_list)
+        {
+            cblock_t *pred, *new_idom = NULL;
+
+            if(block == fn->entry)
+                continue;
+            array_foreach_entry(&block->pred, pred)
+            {
+                if(doms[pred->id])
+                {
+                    if(!new_idom)
+                        new_idom = pred;
+                    else
+                        new_idom = intersect(doms, pred, new_idom);
+                }
+            }
+            if(doms[block->id] != new_idom)
+            {
+                doms[block->id] = new_idom;
+                changed = true;
+            }
+        }
+    }
+    return doms;
+}
+/*@
+
+The sequence [[doms[x]]], [[doms[doms[x]]]], \textellipsis\ corresponds to the
+path up the dominator tree from block [[x]] to the entry.
+[[intersect]] advances [[b1]] and [[b2]] until a
+common ancestor is found.
+
+==intersect*/
+static cblock_t *intersect(cblock_t *doms[], cblock_t *b1, cblock_t *b2)
+{
+    while(b1 != b2)
+    {
+        while(b1->id > b2->id)
+            b1 = doms[b1->id];
+        while(b2->id > b1->id)
+            b2 = doms[b2->id];
+    }
+    return b1;
+}
+/*@
+
+\section{Dominator Tree \& Dominance Frontier}
+
+Other passes actually use the inverse of [[doms]] -- for each block in
+the dominator tree, they require a list of the children, not the parent.
+These are initialised by [[dom_collect]], which additionally computes the
+dominance frontier sets in the manner described by \citet[Figure 5]{cooper11}.
+
+==dom_collect*/
+static doms_t *dom_collect(cfunction_t *fn, cblock_t *doms[])
+{
+    cblock_array_t *dfs = xcalloc(fn->nblocks, sizeof(*dfs));
+    cblock_array_t *children = xcalloc(fn->nblocks, sizeof(*children));
+    doms_t *dom = xmalloc(sizeof(*dom));
+    cblock_t *block;
+
+    list_foreach_entry(&fn->cblock_head, block, cblock_list)
+    {
+        if(block == fn->entry)
+            continue;
+        array_push(&children[doms[block->id]->id], block);
+        if(alen(&block->pred) > 1)
+        {
+            cblock_t *pred;
+
+            array_foreach_entry(&block->pred, pred)
+            {
+                cblock_t *runner = pred;
+                while(runner != doms[block->id])
+                {
+                    add_df(block, &dfs[runner->id]);
+                    runner = doms[runner->id];
+                }
+            }
+        }
+    }
+    *dom = (doms_t) {
+        .dfs = dfs,
+        .children = children,
+    };
+    return dom;
+}
+/*@
+
+[[add_df]] will not insert [[block]] into [[set]] more than once. It
+could be improved with e.g. a presence bitvector if quadratic running
+time is to be avoided; it hasn't been a problem in practice.
+
+==add_df*/
+static void add_df(cblock_t *block, cblock_array_t *set)
+{
+    cblock_t *tmp;
+
+    array_foreach_entry(set, tmp)
+        if(tmp == block)
+            return;
+    array_push(set, block);
+}
+/*@
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+#include "ir.h"
+/*@
+
+==ir_dom.h*/
+//doms_t//
+doms_t *cfunc_dom(cfunction_t *fn);
+void dom_free(doms_t *dom, int nblocks);
+/*@
+
+% */

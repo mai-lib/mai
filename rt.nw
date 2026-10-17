@@ -1,0 +1,932 @@
+/*@
+\chapter{Runtime Library}
+\label{rt/rt}
+
+This appendix contains miscellaneous builtin functions, including random
+number generators from \citet[Mathlib]{rproject} and \cite{mersenne}.
+
+
+\section*{rt/math.c}
+\label{math}
+
+==rt/math.c*/
+/*
+ *  Mathlib : A C Library of Special Functions
+ *  Copyright (C) 1998   Ross Ihaka
+ *  Copyright (C) 2000-9 The R Core Team
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, a copy is available at
+ *  https://www.R-project.org/Licenses/
+ *
+*/
+
+#include "global.h"
+
+// mersenne twister
+
+void init_genrand64(unsigned long long seed);
+unsigned long long genrand64_int64(void);
+double genrand64_real3(void);
+
+void init_rand(unsigned long long seed)
+{
+    init_genrand64(seed);
+}
+
+double unif_rand()
+{
+    return genrand64_real3();
+}
+
+unsigned unif_rand_u32()
+{
+    return (unsigned)genrand64_int64();
+}
+
+// box-muller rng from MathLib
+
+static double BM_norm_keep = 0.0;
+
+double norm_rand()
+{
+    if(BM_norm_keep != 0.0)
+    { /* An exact test is intentional */
+        double s = BM_norm_keep;
+        BM_norm_keep = 0.0;
+        return s;
+    }
+
+    double theta = 2 * M_PI * unif_rand();
+    double R = sqrt(-2 * log(unif_rand())) + 10*DBL_MIN; /* ensure non-zero */
+    BM_norm_keep = R * sin(theta);
+    return R * cos(theta);
+}
+
+double rnorm(double mu, double sigma)
+{
+    if(isnan(mu) || !isfinite(sigma) || sigma < 0)
+        return NAN;
+    if(sigma == 0 || !isfinite(mu))
+        return mu;
+    return mu + sigma * norm_rand();
+}
+/*@
+
+
+\section*{rt/mt19937-64.c}
+
+==rt/mt19937-64.c*/
+/*
+   A C-program for MT19937-64 (2004/9/29 version).
+   Coded by Takuji Nishimura and Makoto Matsumoto.
+
+   This is a 64-bit version of Mersenne Twister pseudorandom number
+   generator.
+
+   Before using, initialize the state by using init_genrand64(seed)
+   or init_by_array64(init_key, key_length).
+
+   Copyright (C) 2004, Makoto Matsumoto and Takuji Nishimura,
+   All rights reserved.
+
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions
+   are met:
+
+     1. Redistributions of source code must retain the above copyright
+        notice, this list of conditions and the following disclaimer.
+
+     2. Redistributions in binary form must reproduce the above copyright
+        notice, this list of conditions and the following disclaimer in the
+        documentation and/or other materials provided with the distribution.
+
+     3. The names of its contributors may not be used to endorse or promote
+        products derived from this software without specific prior written
+        permission.
+
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+   A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+   References:
+   T. Nishimura, ``Tables of 64-bit Mersenne Twisters''
+     ACM Transactions on Modeling and
+     Computer Simulation 10. (2000) 348--357.
+   M. Matsumoto and T. Nishimura,
+     ``Mersenne Twister: a 623-dimensionally equidistributed
+       uniform pseudorandom number generator''
+     ACM Transactions on Modeling and
+     Computer Simulation 8. (Jan. 1998) 3--30.
+
+   Any feedback is very welcome.
+   http://www.math.hiroshima-u.ac.jp/~m-mat/MT/emt.html
+   email: m-mat @ math.sci.hiroshima-u.ac.jp (remove spaces)
+*/
+
+
+#include <stdio.h>
+
+#define NN 312
+#define MM 156
+#define MATRIX_A 0xB5026F5AA96619E9ULL
+#define UM 0xFFFFFFFF80000000ULL /* Most significant 33 bits */
+#define LM 0x7FFFFFFFULL /* Least significant 31 bits */
+
+
+/* The array for the state vector */
+static unsigned long long mt[NN];
+/* mti==NN+1 means mt[NN] is not initialized */
+static int mti=NN+1;
+
+/* initializes mt[NN] with a seed */
+void init_genrand64(unsigned long long seed)
+{
+    mt[0] = seed;
+    for (mti=1; mti<NN; mti++)
+        mt[mti] =  (6364136223846793005ULL * (mt[mti-1] ^ (mt[mti-1] >> 62)) + mti);
+}
+
+/* initialize by an array with array-length */
+/* init_key is the array for initializing keys */
+/* key_length is its length */
+void init_by_array64(unsigned long long init_key[],
+		     unsigned long long key_length)
+{
+    unsigned long long i, j, k;
+    init_genrand64(19650218ULL);
+    i=1; j=0;
+    k = (NN>key_length ? NN : key_length);
+    for (; k; k--) {
+        mt[i] = (mt[i] ^ ((mt[i-1] ^ (mt[i-1] >> 62)) * 3935559000370003845ULL))
+          + init_key[j] + j; /* non linear */
+        i++; j++;
+        if (i>=NN) { mt[0] = mt[NN-1]; i=1; }
+        if (j>=key_length) j=0;
+    }
+    for (k=NN-1; k; k--) {
+        mt[i] = (mt[i] ^ ((mt[i-1] ^ (mt[i-1] >> 62)) * 2862933555777941757ULL))
+          - i; /* non linear */
+        i++;
+        if (i>=NN) { mt[0] = mt[NN-1]; i=1; }
+    }
+
+    mt[0] = 1ULL << 63; /* MSB is 1; assuring non-zero initial array */
+}
+
+/* generates a random number on [0, 2^64-1]-interval */
+unsigned long long genrand64_int64(void)
+{
+    int i;
+    unsigned long long x;
+    static unsigned long long mag01[2]={0ULL, MATRIX_A};
+
+    if (mti >= NN) { /* generate NN words at one time */
+
+        /* if init_genrand64() has not been called, */
+        /* a default initial seed is used     */
+        if (mti == NN+1)
+            init_genrand64(5489ULL);
+
+        for (i=0;i<NN-MM;i++) {
+            x = (mt[i]&UM)|(mt[i+1]&LM);
+            mt[i] = mt[i+MM] ^ (x>>1) ^ mag01[(int)(x&1ULL)];
+        }
+        for (;i<NN-1;i++) {
+            x = (mt[i]&UM)|(mt[i+1]&LM);
+            mt[i] = mt[i+(MM-NN)] ^ (x>>1) ^ mag01[(int)(x&1ULL)];
+        }
+        x = (mt[NN-1]&UM)|(mt[0]&LM);
+        mt[NN-1] = mt[MM-1] ^ (x>>1) ^ mag01[(int)(x&1ULL)];
+
+        mti = 0;
+    }
+
+    x = mt[mti++];
+
+    x ^= (x >> 29) & 0x5555555555555555ULL;
+    x ^= (x << 17) & 0x71D67FFFEDA60000ULL;
+    x ^= (x << 37) & 0xFFF7EEE000000000ULL;
+    x ^= (x >> 43);
+
+    return x;
+}
+
+/* generates a random number on [0, 2^63-1]-interval */
+long long genrand64_int63(void)
+{
+    return (long long)(genrand64_int64() >> 1);
+}
+
+/* generates a random number on [0,1]-real-interval */
+double genrand64_real1(void)
+{
+    return (genrand64_int64() >> 11) * (1.0/9007199254740991.0);
+}
+
+/* generates a random number on [0,1)-real-interval */
+double genrand64_real2(void)
+{
+    return (genrand64_int64() >> 11) * (1.0/9007199254740992.0);
+}
+
+/* generates a random number on (0,1)-real-interval */
+double genrand64_real3(void)
+{
+    return ((genrand64_int64() >> 12) + 0.5) * (1.0/4503599627370496.0);
+}
+
+#if 0
+int main(void)
+{
+    int i;
+    unsigned long long init[4]={0x12345ULL, 0x23456ULL,
+                                0x34567ULL, 0x45678ULL}, length=4;
+    init_by_array64(init, length);
+    printf("1000 outputs of genrand64_int64()\n");
+    for (i=0; i<1000; i++) {
+      printf("%20llu ", genrand64_int64());
+      if (i%5==4) printf("\n");
+    }
+    printf("\n1000 outputs of genrand64_real2()\n");
+    for (i=0; i<1000; i++) {
+      printf("%10.8f ", genrand64_real2());
+      if (i%5==4) printf("\n");
+    }
+    return 0;
+}
+#endif
+/*@
+
+\section*{rt/math.h}
+
+==rt/math.h*/
+void init_rand(unsigned long long seed);
+double unif_rand();
+unsigned unif_rand_u32();
+double norm_rand();
+double rnorm(double mu, double sigma);
+/*@
+
+
+\section*{rt/opt_builtins.h}
+
+==rt/opt_builtins.h*/
+const extern builtin_ops_t pure_ops, type_ops, typeof_ops;
+
+typedef struct
+{
+    int arity;
+    union
+    {
+        rtype_t *(*unfn)(const void *);
+        rtype_t *(*binfn)(rtype_t *, rtype_t *);
+    };
+} type_op_fn_t;
+
+#define type_unop(fn) (&(type_op_fn_t){ .arity = 1, .unfn = fn })
+#define type_binop(fn) (&(type_op_fn_t){ .arity = 2, .binfn = fn })
+/*@
+
+\section*{rt/builtins.c}
+
+==rt/builtins.c*/
+#include "global.h"
+#include "rt/builtin.h"
+#include "rt/opt_builtins.h"
+#include <time.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+
+static void builtin_rm(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rsymbol_t *name;
+    } end_args(args, a);
+    bool ret = r_unset(a->name);
+    //if(!ret)
+    //    vm_error(vm, "rm", "can't remove global `%s`.", r_symstr(a->name));
+    //builtin_return(r, robject_t *, NULL);
+    builtin_return(r, rboolean_t, ret);
+}
+
+static void builtin_print(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        argbits_t argbits;
+        robject_t *x;
+    } end_args(args, a);
+    argbits_t ab = a->argbits; // TEMP
+
+    if(!missingp(ab, 0))
+        r_print(stdout, a->x);
+    fprintf(stdout, "\n");
+
+    builtin_return(r, robject_t *, NULL);
+}
+
+static void builtin_eq(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *x, *y;
+    } end_args(args, a);
+    builtin_return(r, rboolean_t, (a->x == a->y));
+}
+
+static void builtin_equal(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *x, *y;
+    } end_args(args, a);
+    builtin_return(r, rboolean_t, r_equal(a->x, a->y));
+}
+
+// ---
+
+static void builtin_typeof(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *obj;
+    } end_args(args, a);
+    builtin_return(r, rtype_t *, r_typeof(a->obj));
+}
+
+static rtype_t *common_type(rtype_t *self, rtype_t *other)
+{
+    if(self && other)
+        return r_common_type(self, other);
+    return NULL;
+}
+
+static void builtin_common_type(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rtype_t *self, *other;
+    } end_args(args, a);
+    builtin_return(r, rtype_t *, common_type(a->self, a->other));
+}
+
+static rtype_t *r_ret_type(const void  *arg)
+{
+    const rtype_t *typ = arg;
+    if(rtype_is_callable(typ))
+        return typ->sig->ret_type;
+    else if(typ == r_type_callable)
+        return r_type_object;
+    return NULL;
+}
+
+static void builtin_ret_type(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rtype_t *typ;
+    } end_args(args, a);
+    rtype_t *ret = r_ret_type(a->typ);
+    if(!ret)
+        vm_error(vm, "ret_type", "invalid argument.");
+    builtin_return(r, rtype_t *, ret);
+}
+
+static rtype_t *r_elt_type(const void *arg)
+{
+    const rtype_t *typ = arg;
+    if(rtype_is_container(typ))
+        return typ->elt;
+    else if(typ == r_type_vector || typ == r_type_array)
+        return r_type_object;
+    return NULL;
+}
+
+static void builtin_elt_type(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rtype_t *typ;
+    } end_args(args, a);
+    rtype_t *ret = r_elt_type(a->typ);
+    if(!ret)
+        vm_error(vm, "elt_type", "invalid argument.");
+    builtin_return(r, rtype_t *, ret);
+}
+
+// ---
+
+static void builtin_subtype(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rtype_t *self, *other;
+    } end_args(args, a);
+    if(!a->self || !a->other)
+        vm_error(vm, "subtype", "invalid argument.");
+    builtin_return(r, rboolean_t, r_subtypep(a->self, a->other));
+}
+
+static void builtin_compat(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rtype_t *self, *other;
+    } end_args(args, a);
+    if(!a->self || !a->other)
+        vm_error(vm, "compat", "invalid argument.");
+    builtin_return(r, rint_t, r_type_compat(a->self, a->other, true));
+}
+
+static void builtin_hash(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *x;
+    } end_args(args, a);
+    builtin_return(r, rint_t, r_hash(a->x));
+}
+
+static inline double tv_to_sec(struct timeval *tv)
+{
+    return tv->tv_sec + tv->tv_usec/(double)1000000;
+}
+
+// { real, user, sys } times in seconds
+static void builtin_time(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    rvector_t *res = vm_retain(vm, rvec_create(r_type_vec_double, 3));
+    rdouble_t *times = rvec_elts(res);
+    rsymbol_t **names = rvec_elts(rvec_add_names(res));
+    struct rusage ru;
+    struct timeval tv;
+
+    getrusage(RUSAGE_SELF, &ru);
+    gettimeofday(&tv, NULL);
+    times[0] = tv_to_sec(&tv);
+    times[1] = tv_to_sec(&ru.ru_utime);
+    times[2] = tv_to_sec(&ru.ru_stime);
+    names[0] = r_intern("real");
+    names[1] = r_intern("user");
+    names[2] = r_intern("system");
+    builtin_return(r, rvector_t *, res);
+    vm_release(vm, 1);
+}
+
+#define clamp_int(v) ((v) > INT_MAX ? rint_na : (rint_t)(v))
+
+static void builtin_gc(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    rvector_t *res = vm_retain(vm, rvec_create(r_type_vec_int, 4));
+    rint_t *counts = rvec_elts(res);
+    rsymbol_t **names = rvec_elts(rvec_add_names(res));
+    gc_stats_t stats;
+
+    gc_collect();
+    gc_collect_stats(&stats);
+    counts[0] = clamp_int(stats.ncollect);
+    counts[1] = clamp_int(stats.nchunks);
+    counts[2] = clamp_int(stats.obj_bytes/1024.0);
+    counts[3] = clamp_int(stats.vec_bytes/1024.0);
+    names[0] = r_intern("collections");
+    names[1] = r_intern("chunks");
+    names[2] = r_intern("object KB");
+    names[3] = r_intern("vector KB");
+    builtin_return(r, rvector_t *, res);
+    vm_release(vm, 1);
+}
+
+static void builtin_rand(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rint_t min, max;
+    } end_args(args, a);
+
+    if(a->max == rint_na || a->min == rint_na || a->max <= a->min)
+        vm_error(vm, "rand", "invalid argument.");
+    unsigned range = (unsigned)((int64_t)a->max - a->min) + 1;
+    builtin_return(r, rint_t, (rint_t)(unif_rand_u32() % range + a->min));
+}
+
+static void builtin_srand(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        argbits_t argbits;
+        rint_t seed; // optional
+    } end_args(args, a);
+    argbits_t ab = a->argbits; // TEMP
+    unsigned long long seed;
+
+    if(!missingp(ab, 0))
+    {
+        if(a->seed == rint_na)
+            vm_error(vm, "srand", "invalid argument.");
+        seed = (unsigned)a->seed;
+    }
+    else
+    {
+        time_t tval = time(NULL);
+        if(tval == (time_t)-1)
+            vm_error(vm, "srand", "time(2) error."); // wat.
+        seed = tval;
+    }
+    init_rand(seed);
+    builtin_return(r, robject_t *, NULL);
+}
+
+static void builtin_source(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rstring_t *name;
+    } end_args(args, a);
+    rclosure_t *cl;
+
+    // the compiler is somewhat cavalier about managed pointers
+    gc_set_enabled(false);
+    // read and compile file
+    cl = source(a->name->string);
+    // closure is rooted on return
+    gc_set_enabled(true);
+    builtin_return(r, rclosure_t *, cl);
+}
+
+static void builtin_stop(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rstring_t *msg;
+    } end_args(args, a);
+    vm_error(vm, "stop", "%s", a->msg ? a->msg->string : "");
+    // does not return
+}
+
+static void builtin_assert(vm_ctx_t *vm, rbuiltin_t *fn,
+                           uint8_t *args, void *r)
+{
+    def_args {
+        rboolean_t test;
+    } end_args(args, a);
+    if(a->test != true)
+        vm_error(vm, "assert", "assertion failed.");
+    builtin_return(r, robject_t *, NULL);
+}
+
+const builtin_init_t runtime_builtins[] = {
+    defbuiltin("rm", builtin_rm, &r_type_boolean,
+               { "name", &r_type_symbol }),
+    defcbuiltin("eq", builtin_eq, &r_type_boolean,
+               &pure_ops, NULL, // pointers are immutable
+               { "x", &r_type_object },
+               { "y", &r_type_object }),
+    defbuiltin("equal", builtin_equal, &r_type_boolean,
+               { "x", &r_type_object },
+               { "y", &r_type_object }),
+    defbuiltin("print", builtin_print, &r_type_object,
+               { "x", &r_type_object, true }),
+    defbuiltin("rt_time", builtin_time, &r_type_object,
+               { }),
+    defbuiltin("rand", builtin_rand, &r_type_int,
+               { "min", &r_type_int },
+               { "max", &r_type_int }),
+    defbuiltin("srand", builtin_srand, &r_type_object,
+               { "seed", &r_type_int, true }),
+    defcbuiltin("typeof", builtin_typeof, &r_type_type,
+               &typeof_ops, NULL,
+               { "obj", &r_type_object }),
+    defcbuiltin("common_type", builtin_common_type, &r_type_type,
+               &type_ops, type_binop(common_type),
+               { "self", &r_type_type },
+               { "other", &r_type_type }),
+    defcbuiltin("ret_type", builtin_ret_type, &r_type_type,
+               &type_ops, type_unop(r_ret_type),
+               { "type", &r_type_type }),
+    defcbuiltin("elt_type", builtin_elt_type, &r_type_type,
+               &type_ops, type_unop(r_elt_type),
+               { "type", &r_type_type }),
+    defcbuiltin("subtype", builtin_subtype, &r_type_boolean,
+               &pure_ops, NULL, // types are immutable
+               { "self", &r_type_type },
+               { "other", &r_type_type }),
+    defcbuiltin("compat", builtin_compat, &r_type_int,
+               &pure_ops, NULL, // types are immutable
+               { "self", &r_type_type },
+               { "other", &r_type_type }),
+    defbuiltin("hash", builtin_hash, &r_type_int,
+               { "x", &r_type_object }),
+    defbuiltin("gc_collect", builtin_gc, &r_type_object,
+               { }),
+    defbuiltin("source", builtin_source, &r_type_callable,
+               { "file", &r_type_string }),
+    defbuiltin("stop", builtin_stop, &r_type_object,
+               { "message", &r_type_string }),
+    defbuiltin("assert", builtin_assert, &r_type_object,
+               { "expr", &r_type_boolean }),
+    { }
+};
+/*@ %
+
+
+\section*{rt/opt\_builtins.c}
+
+==rt/opt_builtins.c*/
+#include "global.h"
+#include "rt/builtin.h"
+#include "rt/opt_builtins.h"
+#include "ir.h"
+#include "opt.h"
+#include "vm/vm_ops.h"
+#include "gen_code.h"
+
+static cresult trans_typeof(opt_phase phase, cnode_t *node, cell_t *cell,
+                            const cbuiltin_t *bi, cnode_array_t *args)
+{
+    assert(node->type == CN_CALL || node->type == CN_CALL_FAST);
+    if(alen(args) != 1)
+        return SUCCESS;
+    // the condition for typeof could be weakened slightly, to something like
+    // "if the static type is the most precise possible dynamic type",
+    // but that isn't expressible here.
+    if(phase == TRANSFER && opt.opt_constfold)
+    {
+        cell_t *ac = cell_for(aref(args,0));
+        if(!cell_const_obj(ac) && !cell_const_lambda(ac))
+                return SUCCESS;
+
+        cell_set_const(cell, (robject_t *)cell_type(ac));
+        // DBG("%s folds to ", bi->name);
+        // r_print(stderr, cell_type(ac));
+        // DBG("\n");
+    }
+    return SUCCESS;
+}
+
+static cresult trans_type(opt_phase phase, cnode_t *node, cell_t *cell,
+                          const cbuiltin_t *bi, cnode_array_t *args)
+{
+    type_op_fn_t *tofn = bi->data;
+    assert(node->type == CN_CALL || node->type == CN_CALL_FAST);
+    assert(tofn);
+
+    if(alen(args) != tofn->arity)
+        return SUCCESS;
+    if(phase == TRANSFER && opt.opt_constfold)
+    {
+        cnode_t *arg;
+        array_foreach_entry(args, arg)
+        {
+            cell_t *ac = cell_for(arg);
+            if(!cell_const_obj(ac) || cell_type(ac) != r_type_type)
+                return SUCCESS;
+        }
+
+        rtype_t *ret = (tofn->arity == 1)
+            ? tofn->unfn(cell_const(cell_for(aref(args,0))))
+            : tofn->binfn(cell_const(cell_for(aref(args,0))),
+                          cell_const(cell_for(aref(args,1))));
+        if(ret)
+        {
+            cell_set_const(cell, (robject_t *)ret);
+            // DBG("%s folds to ", bi->name);
+            // r_print(stderr, ret);
+            // DBG("\n");
+        }
+    }
+    return SUCCESS;
+}
+
+// XXX need a user-facing `missing` special form: arg parsed as
+// identifier; symbol must name an arg bound by the current function
+// convert emits a CN_BUILTIN directly -- like the prologue does in
+// ir_convert
+static inline cresult fold_missing(cell_t *cell, cell_t *bits, argbits_t idx)
+{
+    if(opt.opt_constfold && cell_const_obj(bits))
+    {
+        bool val = argbits_missing(UNBOX(argbits_t, cell_const(bits)), idx);
+        cell_set_const(cell, c_intern(r_box(r_type_boolean, &val)));
+        return CHANGED;
+    }
+    return SUCCESS;
+}
+
+static cresult trans_missing(opt_phase phase, cnode_t *node, cell_t *cell,
+                             const cbuiltin_t *bi, cnode_array_t *args)
+{
+    assert(node->type == CN_BUILTIN);
+    assert(node->builtin.optype && r_typeof(node->builtin.optype) == r_type_int);
+    assert(alen(args) == 1);
+
+    cell_t *bits = cell_for(aref(args, 0));
+    robject_t *idx = (robject_t *)node->builtin.optype; // this is a hack
+
+    assert(cell_type(bits) == r_type_int);
+    if(phase == TRANSFER)
+    {
+        cell_set_type(cell, r_type_boolean);
+        return fold_missing(cell, bits, UNBOX(argbits_t, idx));
+    }
+    // transform; already a builtin, so don't care
+    return SUCCESS;
+}
+
+static void gen_missing(cnode_t *node)
+{
+    // MISSING dest, bits, idx
+    asm_op(OP_missing);
+    asm_stack(loc_for(node));
+    asm_stack(loc_for(aref(&node->builtin.args, 0)));
+    // we stashed a box in .optype. retrieve it and emit the value as a literal operand
+    assert(node->builtin.optype && r_typeof(node->builtin.optype) == r_type_int);
+    asm_offset(UNBOX(argbits_t, node->builtin.optype));
+}
+
+static bool always(cnode_t *node, bool may_alias)
+    { return true; }
+
+const cbuiltin_t missing = {
+    &(builtin_ops_t) { trans_missing, NULL, gen_missing,
+                       .is_pure = always },
+    NULL, "missing"
+};
+
+const builtin_ops_t pure_ops = { .is_pure = always };
+const builtin_ops_t typeof_ops = { trans_typeof, NULL, NULL, .is_pure = always };
+const builtin_ops_t type_ops = { trans_type, NULL, NULL, .is_pure = always };
+/*@ %
+
+
+\section*{rt/options.h}
+
+==rt/options.h*/
+typedef struct __attribute__ ((__packed__))
+{
+    // optimisation
+    bool opt_builtin;
+    bool opt_inline;
+    bool opt_dce;
+    bool opt_constfold;
+    bool opt_dvn;
+    // debugging
+    bool dbg_dump_ir;
+    // printing
+    int print_digits;
+    int print_line;
+    int print_max;
+    int print_name_max;
+} options_t;
+extern options_t opt;
+void rt_init_options();
+/*@
+
+\section*{rt/options.c}
+
+==rt/options.c*/
+#include "global.h"
+#include <ctype.h>
+#include "rt/builtin.h"
+#include "arith/scalar.h"
+#include "arith/vec.h"
+
+options_t opt;
+
+static inline void *opt_ofs(argdesc_t *arg)
+{
+    return (uint8_t *)&opt + arg->offset - sizeof(argbits_t);
+}
+
+// return a named vector containing the compiler options
+static rvector_t *get_options(vm_ctx_t *vm, funsig_t *sig)
+{
+    int nargs = sig->nargs, i;
+    rvector_t *res = vm_retain(vm, rvec_create(r_type_vec_object, nargs));
+    robject_t **elts = rvec_elts(res);
+
+    for(i=0; i<nargs; i++)
+    {
+        argdesc_t *arg = &sig->args[i];
+        void *src = opt_ofs(arg);
+
+        if(rtype_is_scalar(arg->type))
+            elts[i] = vm_retain(vm, r_box(arg->type, src));
+        else
+            elts[i] = *(robject_t **)src;
+    }
+    // ensure the vector is fully initialised before calling rvec_add_names...
+    rsymbol_t **names = rvec_elts(rvec_add_names(res));
+    for(i=0; i<nargs; i++)
+        names[i] = sig->args[i].name;
+    vm_release(vm, 1+nargs);
+    return res;
+}
+
+// set the given compiler options, returning the previous state
+// so it can be reset with something like `apply(options, state)`
+static void builtin_options(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    funsig_t *sig = rcall_sig(&fn->base);
+    robject_t *res = vm_retain(vm, get_options(vm, sig));
+    args -= sig->argsz; // XXX builtin call convention is silly, fix this imo
+    argbits_t argbits = *(argbits_t *)args;
+    assert(sizeof(opt) == sig->argsz - sizeof(argbits_t));
+
+    for(int i=0; i<sig->nargs; i++)
+    {
+        if(argbits & (1<<i))
+        {
+            argdesc_t *arg = &sig->args[i];
+            void *src = args + arg->offset;
+            void *dest = opt_ofs(arg);
+
+            if(rtype_is_scalar(arg->type)
+               && scalar_is_na(arg->type, src) == true)
+            {   // XXX vm_warning?
+                fprintf(stderr, "warning: argument `%s` not valid.\n",
+                        r_symstr(arg->name));
+                continue;
+            }
+            memcpy(dest, src, rtype_eltsz(arg->type));
+        }
+    }
+    vm_release(vm, 1);
+    builtin_return(r, robject_t *, res);
+}
+
+// XXX multiexpand to avoid these getting out of sync
+// (typedef in rt/options.h also)
+const builtin_init_t options_builtin =
+    defbuiltin("options", builtin_options, &r_type_vec_object,
+               { "opt_builtin", &r_type_boolean, true },
+               { "opt_inline", &r_type_boolean, true },
+               { "opt_dce", &r_type_boolean, true },
+               { "opt_constfold", &r_type_boolean, true },
+               { "opt_dvn", &r_type_boolean, true },
+               { "dbg_dump_ir", &r_type_boolean, true },
+               { "print_digits", &r_type_int, true },
+               { "print_line", &r_type_int, true },
+               { "print_max", &r_type_int, true },
+               { "print_name_max", &r_type_int, true });
+
+/*
+static char *upcase(char *str)
+{
+    static char buf[32];
+    int sz = sizeof(buf)-1;
+    char *ptr = buf;
+
+    while(*str != '\0' && sz-- > 0)
+        *ptr++ = toupper(*str++);
+    *ptr = '\0'; // terminate
+    return buf;
+}
+*/
+
+static int init_option(char *name, int def)
+{
+    char *val = getenv(name);
+    if(val)
+        return atoi(val);
+    return def;
+}
+
+void rt_init_options()
+{
+    opt = (options_t) {
+        .opt_builtin = init_option("OPT_BUILTIN", true),
+        .opt_inline = init_option("OPT_INLINE", true),
+        .opt_dce = init_option("OPT_DCE", true),
+        .opt_constfold = init_option("OPT_CONSTFOLD", true),
+        .opt_dvn = init_option("OPT_DVN", true),
+        .dbg_dump_ir = init_option("DBG_DUMP_IR", false),
+        .print_digits = 6,
+        .print_line = 76,
+        .print_max = 200,
+        .print_name_max = 15,
+    };
+
+    rbuiltin_define(&options_builtin);
+/*
+    rbuiltin_t *fn = (rbuiltin_t *)rbuiltin_define(&options_builtin);
+    funsig_t *sig = fn->base.base.type->sig;
+    for(int i=0; i<sig->nargs; i++)
+    {
+        argdesc_t *arg = &sig->args[i];
+        char *str = getenv(upcase(r_symstr(arg->name)));
+        if(str)
+        {
+            void *dest = opt_ofs(arg);
+            // ... atoi ...
+        }
+    }
+*/
+}
+/*@
+
+% */

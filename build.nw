@@ -1,0 +1,212 @@
+/*@
+\chapter{Build System}
+
+%% FIXME this has been invalidated. repopulate when necessary.
+
+==files.mk*/
+# directories
+srcdir := src
+builddir := build
+depdir := deps
+
+# root noweb
+root := writeup.nw
+# bootstrap noweb
+boot := build.nw
+# all (other) nowebs
+allwebs := $(wildcard *.nw)
+srcwebs := $(filter-out $(root) $(boot),$(wildcard *.nw))
+
+# outputs
+outbin := $(builddir)/main
+outdoc := $(root:%.nw=%.pdf)
+
+# $(srcfilt .from,.to)
+#srcfilt = $(patsubst %$0,%$1,$(filter %$0,$(sources)))
+
+# all tex files
+texs := $(allwebs:%.nw=%.tex)
+# all .c source files
+srcs = $(filter %.c,$(sources))
+srcs += $(patsubst %.c.in,%.c,$(filter %.c.in,$(sources)))
+srcs += $(patsubst %.y,%.tab.c,$(filter %.y,$(sources)))
+# all .h files
+hdrs = $(filter %.h,$(sources))
+hdrs += $(patsubst %.h.in,%.h,$(filter %.h.in,$(sources)))
+hdrs += $(patsubst %.y,%.h,$(filter %.y,$(sources)))
+# all object files
+objs = $(srcs:$(srcdir)/%.c=$(builddir)/%.o)
+/*@ %
+
+==nwchunks.sh*/
+#!/bin/bash
+exec noroots "$1" | sed "s,@<<,$2,g; s,>>,,g;" | tr '\n' ' '
+/*@ %
+
+==mknwdep.sh*/
+#!/bin/bash
+# mknwdep <input file> <srcdir>
+files=$(./nwchunks.sh $1 $2)
+echo "${files} : $1"
+echo "sources += ${files}"
+/*@ %
+
+==mkcdep.sh*/
+#!/bin/bash
+# mkcdep <input file> <output target name>
+exec cc -MM -MG -MT $2 ${CFLAGS} $1
+/*@ %
+
+==esc-und.sh*/
+#!/bin/sh
+# escape unescaped underscores in chunk names (@use/@defn)
+# otherwise they will be interpreted by TeX, with unpleasant results
+cmd='s/\([^\\]\)_/\1\\_/g'
+sed -e '/^@use /'$cmd \
+    -e '/^@defn /'$cmd
+/*@ %
+
+==Makefile*/
+include files.mk
+#include config.mk
+export sources
+
+# problem: .e must be made before .d
+# problem: if .d is made before srcs are extracted, headers won't be resolved
+# correctly (ie "global.h" instead of "src/global.h src/util.h src/array.h
+# ...") in prereqs
+# solution: split makefile in two. first makes .e, re-executes,
+# extracts sources; then calls the second, which makes .d &c.
+
+# see also http://make.mad-scientist.net/papers/advanced-auto-dependency-generation/
+
+
+define mkoutdir=
+endef
+
+define unfuck=
+endef
+define mknwdep=
+endef
+define mkcdep=
+endef
+
+
+.PHONY:	all doc build clean
+
+all:	bootstrap doc build
+
+doc:	$(outdoc)
+
+# output doc from texes
+$(outdoc): $(texs)
+
+# pdf from tex
+%.pdf:	%.tex
+	pdflatex -interaction nonstopmode -file-line-error $<
+
+# doc from noweb
+%.tex:	%.nw
+# | cpif $@ if needed
+	noweave -latex -delay -filter ./esc-und.sh $< > $@
+
+# code from noweb
+$(srcdir)/%:
+# make sure some dep rule has given us a prereq; can probably be
+# dispensed with when debugged
+	@[ ! -z $^ ] || { echo "no prereq for this target!"; exit 1; }
+# make the parent dirs if required
+	@-mkdir -p $(@D)
+# tangle the chunk named by the stem (ie without src/) from the
+# prereq to the target file
+	notangle -R$* $< | cpif $@
+
+# sourcedeps from noweb
+$(depdir)/%.e: %.nw
+	@-mkdir -p $(@D)
+	./mknwdep.sh $< $(srcdir)/ > $@
+
+# -L'#line %L "%F"%N'
+
+ifneq ($(MAKECMDGOALS),clean)
+# initialise source list; accumulated by sourcedeps
+sources :=
+# one sourcedep file for each noweb file
+include $(srcwebs:%.nw=$(depdir)/%.e)
+endif
+
+# extract sources and run build
+build:	$(sources)
+	$(MAKE) -f Build.mk
+
+# bootstrap sources from a designated file
+bootsrcs := $(shell ./nwchunks.sh $(boot))
+
+# extract the makefiles and scripts
+bootstrap: $(bootsrcs)
+
+$(bootsrcs): $(boot)
+# preserve tabs, since there are makefiles
+	notangle -R$@ -t8 $< | cpif $@
+
+clean:
+# do not delete the bootstrap outputs, needless to say
+	-rm -rf $(outdoc) $(outdoc:.pdf=.log) $(outdoc:.pdf=.toc) \
+		$(texs) $(texs:.tex=.aux) \
+		$(srcdir) $(builddir) $(depdir)
+/*@ %
+
+==config.mk*/
+# -DDBG_SUPPRESS
+CDEBUG := -Og -g3 -ggdb -UNDEBUG -fstrict-aliasing
+override CFLAGS := -std=c11 -I$(srcdir) -O3 -DNDEBUG $(CDEBUG) -Wall -Wstrict-aliasing -Winline -D_GNU_SOURCE $(CFLAGS)
+
+#  -minline-all-stringops rubs valgrind the wrong way
+override CFLAGS := -fno-common -march=native -mtune=native -mfpmath=sse $(CFLAGS)
+
+override LDFLAGS := -ggdb $(LDFLAGS)
+override LDLIBS := -lm -lreadline $(LDLIBS)
+/*@ %
+
+==Build.mk*/
+include files.mk
+include config.mk
+
+.PHONY: all
+
+# don't delete sources or headers if they happen to be intermediates
+.SECONDARY: $(srcs) $(hdrs)
+
+all: $(outbin)
+
+$(outbin): $(objs)
+
+# objdeps from source
+# all headers as prereqs, so it picks up correct paths
+$(depdir)/%.d: $(srcdir)/%.c $(hdrs)
+	@-mkdir -p $(@D)
+	CFLAGS="${CFLAGS}" ./mkcdep.sh $< $(builddir)/$*.o > $@
+
+# m4 expansion from in
+% :: %.in
+	m4 -P -I$(srcdir)/ $^ > $@
+
+# c and h from yacc
+%.tab.c %.h: %.y
+# bison puts outputs in cwd by default, even if inputs have paths.
+# needless to say, we do not want this.
+	bison --defines=$*.h --file-prefix=$* --report=states,itemset,lookahead,solved -Wno-other $^
+#	bison -o $@ --report=states,itemset,lookahead,solved -Wno-other $^
+
+# o from c
+$(builddir)/%.o: $(srcdir)/%.c
+	@-mkdir -p $(@D)
+	$(COMPILE.c) $(OUTPUT_OPTION) $<
+
+ifneq ($(MAKECMDGOALS),clean)
+# one objdep file for each source file
+include $(srcs:$(srcdir)/%.c=$(depdir)/%.d)
+endif
+*/
+/*@ %
+*/

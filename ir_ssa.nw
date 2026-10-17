@@ -1,0 +1,521 @@
+/*@
+\chapter{SSA Form Construction}
+\label{ir_ssa}
+
+A program in \textit{static single assignment} form has exactly one
+assignment to each variable, and that assignment dominates all uses of
+the variable.
+
+SSA form allows the representation of a program's data flow information
+in a more compact form, rendering analyses and optimisations simpler and
+more efficient \citep{kelsey95,briggs98,cytron91}.
+
+==ir_ssa.c*/
+//includes//
+//phi_t//
+//defsrc_t//
+//def_t//
+//globals//
+//place_phi//
+//insert_phis//
+//lookup_def//
+//has_var//
+//push_def//
+//ssa_convert//
+//finalize_phis//
+//collect_vars//
+//cfunc_ssa_convert//
+//ir_ssa_convert//
+/*@
+
+Where different control-flow paths join, a pseudo-function called a
+\textit{$\phi$-function} introduces a definition representing the merging
+of values from multiple assignments \citep{briggs98}.
+
+During conversion to SSA form, $\phi$-functions may be inserted at the
+start of blocks reached by more than one assignment to a variable. Their
+provisional presence is recorded in a list of [[phi_t]] structures, one
+for each [[.var]] being converted, singly linked through the [[.next]]
+field. The [[PHI]] [[.node]] itself will only be added to the block if
+it's [[LIVE]].
+
+==phi_t*/
+typedef struct phi
+{
+    cnode_t *node;
+    cvar_t *var;
+    enum { PENDING, DEAD, LIVE } state;
+    struct phi *next;
+} phi_t;
+/*@
+
+The source of a definition is either some [[NODE]] in the input or a
+provisional [[PHI]], recorded by a [[defsrc_t]] structure.
+
+==defsrc_t*/
+typedef struct
+{
+    enum { PHI, NODE } type;
+    union
+    {
+        phi_t *phi;
+        cnode_t *node;
+    };
+} defsrc_t;
+/*@
+
+As conversion proceeds, and a variable's definitions encountered,
+[[def_t]] structures are pushed onto a stack. [[.src]] records the
+variable's value at its assignment in [[.block]];
+[[.next_stack]] points to the stack upon which another definition in the
+same block was pushed.
+
+==def_t*/
+typedef struct def def_t;
+typedef def_t *def_stack_t;
+typedef struct def
+{
+    defsrc_t src;
+    cblock_t *block;
+    def_stack_t *next_stack;
+    def_t *next;
+} def_t;
+/*@
+
+Each element of the [[defs]] array is a pointer to the top definition on
+the stack for the variable with corresponding [[.id]]. In a similar
+manner, each element of [[phis]], indexed by block [[.id]], points to
+the head of the list of [[phi_t]] records provisionally inserted in that
+block. [[vars]] contains the variables being considered for conversion.
+
+==globals*/
+static def_stack_t *defs;
+static phi_t **phis;
+static cvar_array_t vars;
+/*@
+
+To recursively convert [[fn]] and its child functions into SSA form, the
+compiler will invoke [[ir_ssa_convert]].
+
+==ir_ssa_convert*/
+void ir_ssa_convert(cfunction_t *fn)
+{
+    cfunc_ssa_convert(fn);
+    cfunc_mapc_children(fn, ir_ssa_convert);
+}
+/*@
+
+[[cfunc_ssa_convert]] operates on the single function [[fn]], using the
+dominator tree and dominance frontier sets returned by [[cfunc_dom]]
+(\autoref{ir_dom}). Variables eligible for conversion are recorded and
+numbered by [[collect_vars]]. [[defs]] and [[phis]] are allocated; one
+stack per variable, one list per block.
+
+[[insert_phis]] adds provisional $\phi$-functions as [[phi_t]] records
+to the latter lists, then [[ssa_convert]] ``renames'' variables via the
+former, with unique [[cnode_t]]s taking the place of shared
+[[rsymbol_t]]s.
+
+The $\phi$-functions discovered to be [[LIVE]] are linked into the IR by
+[[finalize_phis]]. The graph has likely been modified, so after
+deallocating intermediate structures, calls to [[cfunc_cleanup]] and
+[[cfunc_rdfo]] prune redundant objects and number any newly added
+[[PHI]]s.
+
+==cfunc_ssa_convert*/
+void cfunc_ssa_convert(cfunction_t *fn)
+{
+    doms_t *dom = cfunc_dom(fn);
+
+    collect_vars(fn, &vars);
+    defs = xcalloc(vars.length, sizeof(*defs));
+    phis = xcalloc(fn->nblocks, sizeof(*phis));
+    insert_phis(dom, fn);
+    ssa_convert(dom, fn->entry);
+    finalize_phis(fn);
+    xfree(phis);
+    xfree(defs);
+    array_fini(&vars);
+    dom_free(dom, fn->nblocks);
+    cfunc_cleanup(fn);
+    assert(!cfunc_crit_edges(fn));
+    cfunc_rdfo(fn);
+}
+/*@
+
+Since the values flowing between [[cnode_t]]s never leave the body of a
+single [[cfunction_t]], only the lexical variables bound by the given
+[[fn]] undergo SSA conversion. Another call to [[cfunc_ssa_convert]]
+will be made by a later pass to convert variables which require cells,
+after they've been introduced; they're ignored for now.
+
+==collect_vars*/
+static void collect_vars(cfunction_t *fn, cvar_array_t *vars)
+{
+    int nvars = 0;
+    cvar_t *var;
+
+    array_init(vars, 0);
+    list_foreach_entry(&fn->cvar_head, var, cvar_list)
+    {
+        if(cvar_is_global(var) || cvar_is_celled(var))
+            continue;
+        var->id = nvars++;
+        array_push(vars, var);
+    }
+}
+/*@
+
+For all and only the variables undergoing conversion, [[has_vars]]
+returns [[true]].
+
+==has_var*/
+static inline bool has_var(cvar_t *var)
+{
+    cvar_t *v;
+
+    array_foreach_entry(&vars, v)
+        if(v == var)
+            return true;
+    return false;
+}
+/*@
+
+
+\section{$\phi$-function Placement}
+
+[[insert_phis]] implements the algorithm given in \citet[Figure 11]{cytron91}.
+Each variable [[var]] requires $\phi$-functions placed in the iterated
+dominance frontier of the blocks in which its assignments are found. To
+avoid clearing the [[added]] and [[processed]] flag arrays between
+variables, a clock [[tick]] is used, as in \autoref{ir_pre:cleanup}.
+
+==insert_phis*/
+static void insert_phis(doms_t *dom, cfunction_t *fn)
+{
+    ARRAY(cblock_t *) work = ARRAY_INIT;
+    unsigned *added = xcalloc(fn->nblocks, sizeof(unsigned));
+    unsigned *processed = xcalloc(fn->nblocks, sizeof(unsigned));
+    unsigned tick = 0;
+    cblock_t *block, *wkblk;
+    cnode_t *node;
+    cvar_t *var;
+
+    array_foreach_entry(&vars, var)
+    {
+        tick++;
+        //place phis//
+    }
+    xfree(added);
+    xfree(processed);
+    array_fini(&work);
+}
+/*@
+
+The worklist [[work]] is initialised with each [[block]] containing at
+least one [[SET]] or [[BIND]] node assigning to [[var]]. The
+[[processed]] flag is set on each such block.
+
+==place phis*/
+list_foreach_entry(&fn->cblock_head, block, cblock_list)
+{
+    unsigned id = block->id;
+
+    list_foreach_entry(&block->cnode_head, node, cnode_list)
+    {
+        if((node->type == CN_SET || node->type == CN_BIND)
+           && node->set.var == var)
+        {
+            processed[id] = tick;
+            array_push(&work, block);
+            break;
+        }
+    }
+}
+/*@
+
+Until the workqueue is empty, a block [[wkblk]] is taken. For every
+[[block]] in its dominance frontier, a [[phi]] is created and [[added]] to
+the [[phis]] array, if one hasn't been already.
+
+The value resulting from this merge is interpreted as being assigned to
+the variable, so may itself require the placement of further
+$\phi$-functions -- if the block hasn't been [[processed]] yet, it's
+added to the worklist.
+
+==place phis*/
+while(array_take(&work, &wkblk))
+{
+    array_foreach_entry(&dom->dfs[wkblk->id], block)
+    {
+        unsigned id = block->id;
+
+        if(added[id] < tick)
+        {
+            place_phi(block, var);
+            added[id] = tick;
+            if(processed[id] < tick)
+            {
+                processed[id] = tick;
+                array_push(&work, block);
+            }
+        }
+    }
+}
+/*@
+
+A [[phi_t]] record for [[var]] is placed in a [[block]] by adding it to
+the corresponding element of the [[phis]] array. A [[PHI]] node is
+created and stored in the [[.node]] field, with one argument per
+control-flow inedge, but it's not added to the block's [[.cnode_head]]
+list -- some of these $\phi$-functions may be unnecessary in the
+resulting code, but we don't yet know which; its [[.state]] is
+[[PENDING]].
+
+==place_phi*/
+static void place_phi(cblock_t *block, cvar_t *var)
+{
+    unsigned len = alen(&block->pred);
+    phi_t *phi = xmalloc(sizeof(*phi));
+    cnode_t *node = cnode_create(block, CN_PHI);
+
+    *phi = (phi_t) {
+        .node = node,
+        .var = var,
+        .state = PENDING
+    };
+    array_init(&node->phi.args, len);
+    array_resize(&node->phi.args, len);
+    slist_push(phis[block->id], phi, next);
+}
+/*@
+
+
+\section{Variable Renaming}
+\label{ir_ssa:var}
+
+[[ssa_convert]] implements the algorithm of \citet[Figure 12]{cytron91}
+and \citet[Figure 3, step 2]{briggs98}. Instead of using an array
+\textit{C} of counters to rename the variable at each assignment, the
+[[cnode_t]] yielding the value assigned becomes the unique ``name'',
+and is substituted in place of the corresponding [[REF]]s.
+
+==ssa_convert*/
+static void ssa_convert(doms_t *dom, cblock_t *block)
+{
+    phi_t *phi;
+    cnode_t *node, *tmp;
+    cblock_t *nextblk;
+    def_stack_t *unwind = NULL;
+
+    //convert block//
+}
+/*@
+
+$\phi$-functions come before the other nodes in the block. Each
+[[phi_t]] added earlier counts as an assignment, so a [[defsrc_t]]
+recording the [[phi]] is pushed onto its variable's stack.
+
+==convert block*/
+slist_foreach(phis[block->id], phi, next)
+{
+    defsrc_t src = { .type = PHI, .phi = phi };
+
+    unwind = push_def(phi->var, src, block, unwind);
+}
+/*@
+
+The nodes in the block are visited in control-flow order. A [[SET]] or
+[[BIND]] of a variable being converted is an assignment, so a
+[[defsrc_t]] for the assigned value is prepared (recall that a [[BIND]]
+with [[NULL]] [[.set.value]] introduces a function argument, and its
+value is taken directly.)
+
+The first optimisation of \citet[Section 4]{briggs98} applies here: if
+there's a definition of [[var]] earlier in the block, the record on the
+stack can just be replaced instead of pushing a new one.
+
+A [[SET]] or local [[BIND]] can be safely removed at this point as, by
+construction, no other nodes use their values.
+
+A [[REF]] node of such a variable is reached by the definition returned
+by [[lookup_def]] -- which replaces the [[node]] in its users. Its
+purpose fulfilled, the [[REF]] may now be freed.
+
+==convert block*/
+list_foreach_entry_safe(&block->cnode_head, node, tmp, cnode_list)
+{
+    if((node->type == CN_SET || node->type == CN_BIND)
+            && has_var(node->set.var))
+    {
+        cvar_t *var = node->set.var;
+        def_t *tos = defs[var->id];
+        defsrc_t src = {
+            .type = NODE,
+            .node = node->set.value ? node->set.value : node
+        };
+
+        if(tos && tos->block == node->block)
+            tos->src = src;
+        else
+            unwind = push_def(var, src, block, unwind);
+        if(node->set.value)
+            cnode_remove(node);
+    }
+    else if(node->type == CN_REF && has_var(node->ref.var))
+    {
+        cnode_t *value = lookup_def(node->ref.var);
+        assert(value);
+        cnode_replace_in_users(node, value);
+        cnode_free(node);
+    }
+}
+/*@
+
+A different definition reaches a $\phi$-function along each control-flow
+inedge. In each successor [[nextblk]], each [[phi_t]] is given, as its
+argument at corresponding index [[i]], the definition of its variable
+that reaches the end of the current [[block]].
+
+Minimal (unpruned) SSA form inserts more $\phi$-functions than necessary
+-- in particular, outside the scope of some variables, such as those
+declared in a loop body. The control-flow edge bypassing the loop
+carries no meaningful value, and no references can occur beyond it. Any
+[[phi_t]] using such a value is redundant, its [[.state]] set to
+[[DEAD]].
+
+==convert block*/
+array_foreach_entry(&block->succ, nextblk)
+{
+    int i = index_of_block(&nextblk->pred, block);
+
+    slist_foreach(phis[nextblk->id], phi, next)
+    {
+        cnode_t *value = lookup_def(phi->var);
+
+        if(value)
+            aset(&phi->node->phi.args, i, value);
+        else
+            phi->state = DEAD;
+    }
+}
+/*@
+
+The block's processing completed, we recursively proceed to its children
+in the dominator tree.
+
+==convert block*/
+array_foreach_entry(&dom->children[block->id], nextblk)
+    ssa_convert(dom, nextblk);
+/*@
+
+After those are processed, the definition stacks are unwound, as per the
+second optimisation of \citet[Section 4]{briggs98}. Popping the stacks
+on the [[unwind]] list removes just those definitions that were pushed
+by this block.
+
+==convert block*/
+while(unwind)
+{
+    def_t *def = *unwind;
+
+    slist_remove_head(*unwind, next);
+    unwind = def->next_stack;
+    xfree(def);
+}
+/*@
+
+When the value of [[src]] is assigned to a variable [[var]] in a
+[[block]], a new definition [[def]] is allocated, initialised, and
+pushed onto the corresponding [[stack]] by [[push_def]].
+
+[[unwind]] heads a linked list of stacks, onto which [[block]] has
+pushed definitions. [[.next_stack]] takes the old value, and the new
+value is returned.
+
+==push_def*/
+static def_stack_t *push_def(cvar_t *var, defsrc_t src,
+                             cblock_t *block, def_stack_t *unwind)
+{
+    def_stack_t *stack = &defs[var->id];
+    def_t *def = xmalloc(sizeof(*def));
+
+    *def = (def_t) {
+        .src = src,
+        .block = block,
+        .next_stack = unwind
+    };
+    slist_push(*stack, def, next);
+    return stack;
+}
+/*@
+
+[[lookup_def]] returns the definition at the top of the stack for
+variable [[var]]. If it's a provisional [[PHI]], it's confirmed to be
+[[LIVE]] unless we know otherwise.
+
+==lookup_def*/
+static cnode_t *lookup_def(cvar_t *var)
+{
+    def_t *def = defs[var->id];
+
+    if(!def)
+        return NULL;
+    if(def->src.type == PHI)
+    {
+        phi_t *phi = def->src.phi;
+
+        if(phi->state != DEAD)
+        {
+            phi->state = LIVE;
+            return phi->node;
+        }
+        return NULL;
+    }
+    return def->src.node;
+}
+/*@
+
+
+\section{$\phi$-function Realization}
+
+Conversion complete, a [[phi_t]]'s record now correctly indicates its
+[[.state]]. Those that are [[LIVE]] have their [[.node]]s linked into
+the IR (at the head of their [[block]]s) and record themselves as using
+their arguments.
+
+==finalize_phis*/
+static void finalize_phis(cfunction_t *fn)
+{
+    cblock_t *block;
+    phi_t *phi, *tmp;
+
+    list_foreach_entry(&fn->cblock_head, block, cblock_list)
+    {
+        slist_foreach_safe(phis[block->id], phi, tmp, next)
+        {
+            if(phi->state == LIVE)
+            {
+                cnode_t *arg;
+
+                array_foreach_entry(&phi->node->phi.args, arg)
+                    cnode_add_user(phi->node, arg);
+                list_add(&block->cnode_head, &phi->node->cnode_list);
+            }
+            else
+                cnode_free(phi->node);
+            xfree(phi);
+        }
+    }
+}
+/*@
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+#include "ir.h"
+/*@
+
+% */

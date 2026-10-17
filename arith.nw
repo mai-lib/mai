@@ -1,0 +1,3387 @@
+/*@
+\chapter{Arithmetic Library}
+\label{arith}
+
+This appendix contains an arithmetic and support library for scalars,
+vectors and arrays; together with the builtin functions that make them
+available to users of the system. They contain minimal significant
+innovation, and an unpleasant amount of M4 \citep{m4}.
+
+\section*{arith/arith.m4}
+
+==arith/arith.m4*/
+m4_changecom(`M4', `')
+m4_changequote(`{{', `}}')
+
+M4 bind the first argument (name) as an element of the second (quoted list)
+M4 and expand the third argument (quotation) for each one in order
+
+m4_define({{shift3}}, {{m4_shift(m4_shift(m4_shift($1)))}})
+m4_define({{_foreach}}, {{
+  m4_ifelse({{$#}},{{3}},,{{
+    m4_define({{$1}}, {{$3}})
+    $2
+    $0({{$1}},{{$2}},shift3({{$@}}))
+  }})
+}})
+m4_define({{foreach}}, {{m4_pushdef({{$1}})_foreach({{$1}},{{$3}},$2,)m4_popdef({{$1}})}})
+
+M4 usual list routines
+m4_define({{car}}, {{$1}})
+m4_define({{cdr}}, {{m4_shift($@)}})
+m4_define({{cadr}}, {{car(cdr($@))}})
+
+M4 token-pasting
+m4_define({{paste}}, {{m4_ifelse({{$#}},1,{{$1}},{{$1_{{}}$0(m4_shift($@))}})}})
+
+M4 diversion wrapper
+m4_define({{stash}},{{m4_divert($1){{}}$2{{}}m4_divert}})
+
+M4 names of things
+m4_define({{make_type}}, {{r$1_t}})
+m4_define({{make_type_obj}}, {{r_type_$1}})
+m4_define({{check_na}}, {{$2_na($1)}})
+m4_define({{make_na}}, {{r$1_na}})
+m4_define({{make_min}}, {{r$1_min}})
+m4_define({{make_max}}, {{r$1_max}})
+
+M4 static arithmetic promotion: expand to the argument found first in `types`
+M4 FIXME should be ifelse(car($3), `$1', match one, car($3), `$2', match two, no match)
+m4_define({{_make_rtype}}, {{m4_ifelse({{$1}}, car($3), {{$1}},
+{{m4_ifelse({{$2}}, car($3), {{$2}},
+  {{$0({{$1}}, {{$2}}, {{cdr($3)}})}})}})}})
+m4_define({{make_rtype}}, {{_make_rtype($1, $2, {{scalar_types}})}})
+
+M4 convenient synonyms
+m4_define({{xtype_t}}, {{make_type(xtype)}})
+m4_define({{ytype_t}}, {{make_type(ytype)}})
+m4_define({{rtype}}, {{make_rtype(xtype, ytype)}})
+m4_define({{rtype_t}}, {{make_type(rtype)}})
+m4_define({{op_name}}, {{car(op_spec)}})
+m4_define({{op_sym}}, {{cadr(op_spec)}})
+
+M4 m4_define({{op_binary}}, {{$1 cadr(op_spec) $2}})
+m4_define({{op_binary}}, {{m4_ifelse(op_sym,{{}},
+  {{op_name{{}}($1, $2)}},
+  {{$1 op_sym $2}})}})
+
+M4 m4_define({{op_unary}}, {{cadr(op_spec) $1}})
+m4_define({{op_unary}}, {{m4_ifelse(op_sym,{{}},
+  {{op_name{{}}($1)}},
+  {{op_sym $1}})}})
+
+m4_define({{op_conv}}, {{$2_conv($1)}})
+M4 double ops have no overflow
+m4_define({{op_xflow}}, {{m4_ifelse(rtype,{{double}},0,
+  {{op_name{{}}_xflow($1, $2)}})}})
+m4_define({{conv_func}}, {{paste({{arith}}, {{conv}}, xtype, {{to}}, ytype)}})
+m4_define({{binary_func}}, {{paste({{arith}}, op_name, xtype, ytype)}})
+m4_define({{unary_func}}, {{paste({{arith}}, op_name, xtype)}})
+
+M4 loops
+m4_define({{for_ops}}, {{foreach(op_spec, {{$1}}, {{$2}})}})
+m4_define({{for_type}}, {{foreach(xtype, {{$1}}, {{$2}})}})
+m4_define({{for_types}}, {{
+  foreach(xtype, {{$1}}, {{
+  foreach(ytype, {{$1}}, {{
+  $2
+  }})
+  }})
+}})
+
+M4 configuration
+m4_define({{element_types}}, {{double, int, boolean, ptr}})
+m4_define({{scalar_types}}, {{double, int, boolean}})
+m4_define({{numeric_types}}, {{double, int}})
+
+M4 on numeric types, return promoted
+m4_define({{arith_ops}}, {{{{add, +}}, {{sub, -}},
+  {{mul, *}}, {{div, /}}, {{pow}}}})
+M4 on numeric types, return same
+m4_define({{arith_unary_ops}}, {{{{neg, -}}}})
+M4 on numeric types, return same, no analogous symbol
+M4 use cadr(op_spec) for identity instead
+m4_define({{arith_reduce_ops}}, {{{{add, 0}}, {{mul, 1}}}})
+
+M4 on numeric types, return boolean
+m4_define({{rela_ops}}, {{{{lth, <}}, {{lte, <=}}, {{gth, >}}, {{gte, >=}}}})
+
+M4 on scalar types, return boolean
+m4_define({{eql_ops}}, {{{{eql, ==}}, {{neq, !=}}}})
+M4 on scalar types, return boolean
+M4 none for now
+M4 m4_define({{eql_unary_ops}}, {{{{something}}}})
+
+M4 on booleans only
+m4_define({{bool_ops}}, {{{{and, &}}, {{or, |}}}})
+M4 on booleans only
+m4_define({{bool_unary_ops}}, {{{{not, !}}}})
+M4 on booleans only, etc, etc
+m4_define({{bool_reduce_ops}}, {{{{and, true}}, {{or, false}}}})
+
+M4 on doubles only
+m4_define({{math_ops}}, {{{{atan2}}}})
+m4_define({{math_unary_ops}}, {{{{sqrt}}, {{sin}}, {{cos}}, {{tan}},
+                                {{asin}}, {{acos}}, {{atan}},
+                                {{log}}, {{exp}}, {{round}}}})
+/*@
+
+
+\section*{arith/scalar.h.in}
+\label{arith/scalar}
+
+==arith/scalar.h.in*/
+/*
+  m4_include(`arith/arith.m4')
+*/
+
+// return true if the value is NA
+#define boolean_na(v) ((v) == rboolean_na)
+#define int_na(v) ((v) == rint_na)
+#define double_na(v) (isnan(v))
+// convert the value to the type
+#define boolean_conv(v) ((v) != 0)
+#define double_conv(v) (rdouble_t)(v)
+#define int_conv(v) ((((v) > INT_MAX) | ((v) <= INT_MIN)) ? rint_na : (rint_t)(v))
+
+// do not take `r`: compute it explicitly and hope that common
+// subexpression elimination does its thing.
+// return true if the operation over- or underflowed
+#define add_xflow(x, y) ((x > 0) ^ (y < (x + y)))
+#define signs(a, b) ((a < 0) ^ (b < 0))
+#define sub_xflow(x, y) (signs(x, y) & signs(x, (x - y)))
+#define mul_xflow(x, y) (((int64_t)x * (int64_t)y) != (x * y))
+#define div_xflow(x, y) (y==0)
+// XXX inefficient
+#define pow_xflow(x, y) (fabs(pow(x,y)) > (INT_MAX-1))
+
+// m4_define({{expand_binary}}, {{
+static inline rtype_t paste(arith, op_name, xtype, ytype)(xtype_t x, ytype_t y)
+{
+    return (check_na(x, xtype) | check_na(y, ytype) | op_xflow(x, y))
+        ? make_na(rtype)
+        : op_binary(x, y);
+}
+// }})
+// m4_define({{expand_unary}}, {{
+static inline rtype_t paste(arith, op_name, xtype)(xtype_t x)
+{
+    rtype_t r = op_unary(x);
+    return check_na(x, xtype) ? make_na(rtype) : r;
+}
+// }})
+/*@
+
+\subsection*{Arithmetic}
+
+==arith/scalar.h.in*/
+// M4 prefer native double NA handling, thanks to C arithmetic conversion
+// m4_pushdef({{double_na}}, {{0}})
+
+// for_types({{numeric_types}}, {{
+// for_ops({{arith_ops}}, {{
+expand_binary()
+// }})
+// }})
+
+// for_type({{numeric_types}}, {{
+// for_ops({{arith_unary_ops}}, {{
+expand_unary()
+// }})
+// }})
+
+// M4 for other ops, we must explicitly check
+// m4_popdef({{double_na}})
+// M4 overflow doesn't occur outside arithmetic
+// m4_pushdef({{op_xflow}}, {{0}})
+/*@
+
+\subsection*{Relational}
+
+==arith/scalar.h.in*/
+// M4 ops from now on return boolean
+// m4_pushdef({{rtype}}, {{boolean}})
+
+// for_types({{numeric_types}}, {{
+// for_ops({{rela_ops}}, {{
+expand_binary()
+// }})
+// }})
+/*@
+
+\subsection*{Equality}
+
+==arith/scalar.h.in*/
+// for_types({{scalar_types}}, {{
+// for_ops({{eql_ops}}, {{
+expand_binary()
+// }})
+// }})
+
+/*@
+
+\subsection*{Booleans}
+
+==arith/scalar.h.in*/
+// m4_pushdef({{xtype}}, {{boolean}}) m4_pushdef({{ytype}}, {{boolean}})
+// for_ops({{bool_ops}}, {{
+expand_binary()
+// }})
+// for_ops({{bool_unary_ops}}, {{
+expand_unary()
+// }})
+// m4_popdef({{xtype}}) m4_popdef({{ytype}})
+/*@
+
+\subsection*{NA}
+
+==arith/scalar.h.in*/
+// for_type({{scalar_types}}, {{
+static inline rboolean_t paste(arith, is_na, xtype)(xtype_t x)
+{
+    return check_na(x, xtype);
+}
+// }})
+
+// M4 reset defs to default
+// m4_popdef({{rtype}})
+// m4_popdef({{op_xflow}})
+/*@
+
+\subsection*{Conversion}
+
+==arith/scalar.h.in*/
+// for_types({{scalar_types}}, {{
+// m4_ifelse(xtype, ytype, {{}}, {{
+static inline ytype_t paste(arith, conv, xtype, to, ytype)(xtype_t x)
+{
+    return (check_na(x, xtype)) ? make_na(ytype) : op_conv(x, ytype);
+}
+// }})
+// }})
+/*@
+
+\subsection*{Box \& Unbox}
+
+==arith/scalar.h.in*/
+// for_type({{scalar_types}}, {{
+static inline xtype_t paste(arith, conv, ptr, to, xtype)(robject_t *x)
+{
+    if(r_typeof(x) != make_type_obj(xtype))
+        return make_na(xtype);
+    return UNBOX(xtype_t, x);
+}
+
+static inline robject_t *paste(arith, conv, xtype, to, ptr)(xtype_t x)
+{
+    robject_t *box = r_box_create(make_type_obj(xtype));
+    UNBOX(xtype_t, box) = x;
+    return box;
+}
+// }})
+/*@
+
+\subsection*{Dispatch Index Codes}
+
+%% Reusing the scalar codes from [[runtime.h]]. FIXME reverse
+%% [[scalar_types]], and assign here.
+
+==arith/scalar.h.in*/
+enum {
+    CODE_boolean = SC_BOOLEAN,
+    CODE_int = SC_INT,
+    CODE_double = SC_DOUBLE,
+    CODE_MAX_SCALAR,
+    CODE_ptr = CODE_MAX_SCALAR,
+    CODE_MAX
+};
+enum {
+    CODE_sca, CODE_vec
+};
+/*@
+
+
+\section*{arith/vec.h.in}
+
+==arith/vec.h.in*/
+/*
+  m4_include(`arith/arith.m4')
+*/
+// {{
+typedef void (*binop_fn)(void *, void *, void *, int);
+typedef void (*unop_fn)(void *, void *, int);
+typedef void (*conv_fn)(void *, void *, int);
+typedef void (*fill_na_fn)(void *, size_t );
+typedef void (*idx_fn)(void *, void *, void *, int, int, int);
+// }}
+
+// m4_define({{expand_bintab}}, {{
+extern const binop_fn paste(op_name, funcs)[2][2][CODE_MAX_SCALAR][CODE_MAX_SCALAR];
+// }})
+// m4_define({{expand_untab}}, {{
+extern const unop_fn paste(op_name, funcs)[2][CODE_MAX_SCALAR];
+// }})
+// m4_define({{expand_redtab}}, {{
+extern const unop_fn paste(reduce, op_name, funcs)[CODE_MAX_SCALAR];
+// }})
+// m4_define({{expand_convtab}}, {{
+extern const conv_fn paste(conv, funcs)[2][CODE_MAX_SCALAR][CODE_MAX_SCALAR];
+// }})
+/*@
+
+\subsection*{Externs}
+
+==arith/vec.h.in*/
+// for_ops({{arith_ops, rela_ops, eql_ops, bool_ops, math_ops}}, {{
+expand_bintab()
+// }})
+// for_ops({{arith_unary_ops, bool_unary_ops, math_unary_ops, {{is_na}}}}, {{
+expand_untab()
+// }})
+// for_ops({{arith_reduce_ops, bool_reduce_ops}}, {{
+expand_redtab()
+// }})
+expand_convtab()
+/*@
+
+\subsection*{Typedefs}
+
+FIXME should be a [[binop_subtab [CODE_MAX_SCALAR][CODE_MAX_SCALAR]]],
+because if one is [[NULL]], they all are.
+
+==arith/vec.h.in*/
+// {{
+typedef const binop_fn binop_fntab[2][2][CODE_MAX_SCALAR][CODE_MAX_SCALAR];
+typedef const unop_fn unop_fntab[2][CODE_MAX_SCALAR];
+typedef const unop_fn reduce_fntab[CODE_MAX_SCALAR];
+/*@
+
+\subsection*{Inlines}
+
+==arith/vec.h.in*/
+// return the element type for an operand, given an aggregate or scalar type.
+// returns NULL if typ isn't a scalar or an aggregate containing scalars.
+static inline rtype_t *arith_elt_type(rtype_t *typ)
+{
+    if(rtype_is_container(typ))
+        typ = typ->elt;
+    return rtype_is_scalar(typ) ? typ : NULL;
+}
+
+// recycle src along dest
+// slen/dlen lengths in elements, sz element size in bytes
+static inline
+void copy_recycle(void *dest, void *src, int dlen, int slen, size_t sz)
+{
+    if(slen == 0)
+    {
+        memset(dest, 0, sz * dlen);
+        return;
+    }
+    if(slen >= dlen)
+    {
+        memcpy(dest, src, sz * dlen);
+        return;
+    }
+
+    ptrdiff_t adv = slen * sz;
+    uint8_t *end = (uint8_t *)dest + dlen * sz;
+    for(uint8_t *ptr = dest; ptr < end; ptr += adv)
+        memcpy(ptr, src, min(adv, end - ptr));
+}
+
+static inline rboolean_t scalar_is_na(rtype_t *type, void *src)
+{
+    assert(rtype_is_scalar(type));
+    rboolean_t res;
+    unop_fn is_na = is_na_funcs[CODE_sca][rscal_code(type)];
+    is_na(&res, src, 1);
+    return res;
+}
+/*@
+
+\subsection*{Prototypes}
+
+==arith/vec.h.in*/
+robject_t *arith_binary(vm_ctx_t *vm, binop_fntab fntab, bool pred,
+                        robject_t *xobj, robject_t *yobj);
+robject_t *arith_unary(vm_ctx_t *vm, unop_fntab fntab, bool pred,
+                       robject_t *xobj);
+robject_t *arith_convert(vm_ctx_t *vm, robject_t *obj, rtype_t *to);
+robject_t *arith_reduce(vm_ctx_t *vm, reduce_fntab fntab, robject_t *xobj);
+bool scalar_convert(void *dest, robject_t *obj, rtype_t *to, rtype_t *from);
+
+robject_t *vec_fetch(vm_ctx_t *vm, robject_t *obj, robject_t *idx);
+robject_t *vec_store(vm_ctx_t *vm, robject_t *obj, robject_t *val,
+                     robject_t *idx);
+robject_t *arr_fetch(vm_ctx_t *vm, robject_t *obj, robject_t *idx,
+                     robject_t **idxs, int nidxs);
+robject_t *arr_store(vm_ctx_t *vm, robject_t *obj, robject_t *val,
+                     robject_t *idx, robject_t **idxs, int nidxs);
+void copy_names(robject_t *dest, robject_t *src);
+void rt_install_vectors();
+// }}
+/*@
+
+
+\section*{arith/dispatch.h}
+
+==arith/dispatch.h*/
+// builtin data
+typedef struct
+{
+    const void *fntab; // table of function pointers
+    bool is_pred; // whether this builtin a predicate
+    op_code_t op; // vm instruction opcode
+} arith_builtin_t;
+
+// binary operation dispatch
+typedef struct
+{
+    rtype_t *typ, *optyp;
+    size_t xsz, ysz, rsz;
+    scalar_code xcode, ycode;
+    bool xvec, yvec; // 'is array or vector', really
+    bool xarr, yarr; // 'is array and not vector'
+} binop_chk_t;
+
+bool check_binary(binop_chk_t *chk, rtype_t *xt, rtype_t *yt, bool pred);
+
+static inline binop_fn dispatch_binary(binop_chk_t *chk, binop_fntab fntab)
+{
+    return fntab[chk->xvec][chk->yvec][chk->xcode][chk->ycode];
+}
+
+// unary operation dispatch
+typedef struct
+{
+    rtype_t *typ;
+    scalar_code code;
+    bool vec, arr; // same as for binop
+} unop_chk_t;
+
+bool check_unary(unop_chk_t *chk, rtype_t *xt, bool pred);
+
+static inline unop_fn dispatch_unary(unop_chk_t *chk, unop_fntab fntab)
+{
+    return fntab[chk->vec][chk->code];
+}
+
+// reduction dispatch
+typedef struct
+{
+    rtype_t *typ; // always a scalar
+    scalar_code code;
+    bool vec;
+} reduce_chk_t;
+
+bool check_reduce(reduce_chk_t *chk, rtype_t *xt);
+
+static inline unop_fn dispatch_reduce(reduce_chk_t *chk, reduce_fntab fntab)
+{
+    return fntab[chk->code];
+}
+
+// conversion dispatch
+typedef struct
+{
+    rtype_t *rt;
+    bool vec, arr, generic;
+    scalar_code fromcode, tocode;
+} conv_chk_t;
+
+// from could be anything; to is always a scalar
+bool check_conv(conv_chk_t *chk, rtype_t *from, rtype_t *to);
+
+static inline conv_fn dispatch_conv(conv_chk_t *chk)
+{
+    return conv_funcs[chk->vec][chk->fromcode][chk->tocode];
+}
+
+// collection fetch and store
+
+// scalar, vector, boolean, or omitted index
+typedef enum { SINGLE, INDEX, MASK, MISSING } idx_kind;
+
+// vector
+typedef struct
+{
+    idx_kind kind;
+    bool takeptr; // use replacement/result value directly, do not indirect
+    bool names; // fetch element names
+    rtype_t *typ; // result type/replacement element type
+} idx_chk_t;
+
+bool check_fetch(idx_chk_t *chk, rtype_t *typ, rtype_t *ityp);
+bool check_store(idx_chk_t *chk, rtype_t *typ, rtype_t *ityp, rtype_t *rtyp);
+
+// array
+typedef struct
+{
+    idx_kind *kinds; // one per index, _including_ the first
+    bool takeptr;
+    int rank; // rank of indexed value - 0: scalar, 1: vector, >1: array
+    rtype_t *typ;  // element type of result/replacement
+} arr_chk_t;
+
+bool check_arr_fetch(arr_chk_t *achk, rtype_t *typ, rtype_t **ityps,
+                     int ntyps);
+bool check_arr_store(arr_chk_t *achk, rtype_t *typ, rtype_t **ityps,
+                     int ntyps, rtype_t *rtyp);
+/*@
+
+
+\section*{arith/vec.c.in}
+\label{arith/vec}
+
+==arith/vec.c.in*/
+/*
+  m4_include(`arith/arith.m4')
+*/
+#include "global.h"
+#include "arith/scalar.h"
+#include "arith/vec.h"
+#include "arith/dispatch.h"
+/*
+  m4_define({{vec_binary_func}}, {{paste({{vec}}, op_name, xtype, $1, ytype, $2)}})
+  m4_define({{vec_unary_func}}, {{paste({{vec}}, op_name, xtype, $1)}})
+  m4_define({{vec_conv_func}}, {{paste({{vec_conv}}, $1, xtype, to, ytype)}})
+  m4_define({{code}},{{paste(CODE,$1)}})
+*/
+// m4_define({{expand_bintab}}, {{
+const binop_fn paste(op_name, funcs)[2][2][CODE_MAX_SCALAR][CODE_MAX_SCALAR] = {
+    m4_undivert(1)
+};
+// }})
+// m4_define({{expand_untab}}, {{
+const unop_fn paste(op_name, funcs)[2][CODE_MAX_SCALAR] = {
+    m4_undivert(1)
+};
+// }})
+// m4_define({{expand_redtab}}, {{
+const unop_fn paste(reduce, op_name, funcs)[CODE_MAX_SCALAR] = {
+    m4_undivert(1)
+};
+// }})
+// m4_define({{expand_convtab}}, {{
+const conv_fn paste(conv, funcs)[2][CODE_MAX_SCALAR][CODE_MAX_SCALAR] = {
+    m4_undivert(1)
+};
+// }})
+
+// m4_define({{expand_vec}}, {{
+static void vec_binary_func(v, v)(void *r, void *x, void *y, int len)
+{
+    xtype_t *vx = x;
+    ytype_t *vy = y;
+    rtype_t *vr = r;
+    for(int i=0; i < len; i++)
+        vr[i] = binary_func()(vx[i], vy[i]);
+}
+
+static void vec_binary_func(v, s)(void *r, void *x, void *y, int len)
+{
+    xtype_t *vx = x;
+    ytype_t vy = *(ytype_t *)y;
+    rtype_t *vr = r;
+    for(int i=0; i < len; i++)
+        vr[i] = binary_func()(vx[i], vy);
+}
+
+static void vec_binary_func(s, v)(void *r, void *x, void *y, int len)
+{
+    xtype_t vx = *(xtype_t *)x;
+    ytype_t *vy = y;
+    rtype_t *vr = r;
+    for(int i=0; i < len; i++)
+        vr[i] = binary_func()(vx, vy[i]);
+}
+
+static void vec_binary_func(s, s)(void *r, void *x, void *y, int len)
+{
+    xtype_t *vx = x;
+    ytype_t *vy = y;
+    rtype_t *vr = r;
+    *vr = binary_func()(*vx, *vy);
+}
+
+/*
+  stash(1,{{
+  [CODE_sca][CODE_sca][code(xtype)][code(ytype)] = vec_binary_func(s,s),
+  [CODE_sca][CODE_vec][code(xtype)][code(ytype)] = vec_binary_func(s,v),
+  [CODE_vec][CODE_sca][code(xtype)][code(ytype)] = vec_binary_func(v,s),
+  [CODE_vec][CODE_vec][code(xtype)][code(ytype)] = vec_binary_func(v,v),
+  }})
+*/
+// }})
+
+// m4_define({{expand_vec_unary}}, {{
+static void vec_unary_func(v)(void *r, void *x, int len)
+{
+    xtype_t *vx = x;
+    rtype_t *vr = r;
+    for(int i=0; i < len; i++)
+        vr[i] = unary_func()(vx[i]);
+}
+
+static void vec_unary_func(s)(void *r, void *x, int len)
+{
+    xtype_t *vx = x;
+    rtype_t *vr = r;
+    *vr = unary_func()(*vx);
+}
+
+/*
+  stash(1,{{
+  [CODE_sca][code(xtype)] = vec_unary_func(s),
+  [CODE_vec][code(xtype)] = vec_unary_func(v),
+  }})
+*/
+// }})
+
+// m4_define({{expand_vec_reduce}}, {{
+static void paste(vec, reduce, op_name, xtype)(void *r, void *x, int len)
+{
+    xtype_t vr = op_sym;
+    xtype_t *vx = x;
+    for(int i=0; i < len; i++)
+        vr = paste(arith, op_name, xtype, xtype)(vr, vx[i]);
+    *(xtype_t *)r = vr;
+}
+
+/*
+  stash(1,{{
+  [code(xtype)] = paste(vec, reduce, op_name, xtype),
+  }})
+*/
+// }})
+/*@
+
+\subsection*{Arithmetic}
+
+==arith/vec.c.in*/
+// for_ops({{arith_ops}}, {{
+// for_types({{numeric_types}}, {{
+expand_vec()
+// }})
+expand_bintab()
+// }})
+
+// for_ops({{arith_unary_ops}}, {{
+// for_type({{numeric_types}}, {{
+expand_vec_unary()
+// }})
+expand_untab()
+// }})
+
+// for_ops({{arith_reduce_ops}}, {{
+// for_type({{numeric_types}}, {{
+expand_vec_reduce()
+// }})
+expand_redtab()
+// }})
+/*@
+
+\subsection*{Relational}
+
+==arith/vec.c.in*/
+// m4_pushdef({{rtype}}, {{boolean}})
+
+// for_ops({{rela_ops}}, {{
+// for_types({{numeric_types}}, {{
+expand_vec()
+// }})
+expand_bintab()
+// }})
+/*@
+
+\subsection*{Equality}
+
+==arith/vec.c.in*/
+// for_ops({{eql_ops}}, {{
+// for_types({{scalar_types}}, {{
+expand_vec()
+// }})
+expand_bintab()
+// }})
+/*@
+
+\subsection*{NA}
+
+==arith/vec.c.in*/
+// for_ops({{{{is_na}}}}, {{
+// for_type({{scalar_types}}, {{
+expand_vec_unary()
+// }})
+expand_untab()
+// }})
+/*@
+
+\subsection*{Booleans}
+
+==arith/vec.c.in*/
+// m4_pushdef({{xtype}}, {{boolean}})
+// m4_pushdef({{ytype}}, {{boolean}})
+// for_ops({{bool_ops}}, {{
+expand_vec()
+expand_bintab()
+// }})
+// for_ops({{bool_unary_ops}}, {{
+expand_vec_unary()
+expand_untab()
+// }})
+// for_ops({{bool_reduce_ops}}, {{
+expand_vec_reduce()
+expand_redtab()
+// }})
+// m4_popdef({{xtype}}) m4_popdef({{ytype}}) m4_popdef({{rtype}})
+/*@
+
+\subsection*{Special Functions}
+
+==arith/vec.c.in*/
+// m4_pushdef({{xtype}}, {{double}})
+// m4_pushdef({{ytype}}, {{double}})
+// m4_pushdef({{rtype}}, {{double}})
+// m4_pushdef({{binary_func}}, {{op_name{{}}}})
+// m4_pushdef({{unary_func}}, {{op_name{{}}}})
+// for_ops({{math_ops}}, {{
+expand_vec()
+expand_bintab()
+// }})
+// for_ops({{math_unary_ops}}, {{
+expand_vec_unary()
+expand_untab()
+// }})
+// m4_popdef({{binary_func}}) m4_popdef({{unary_func}})
+// m4_popdef({{xtype}}) m4_popdef({{ytype}}) m4_popdef({{rtype}})
+/*@
+
+\subsection*{Conversion}
+
+==arith/vec.c.in*/
+// for_types({{scalar_types}}, {{
+// m4_ifelse(xtype, ytype, {{}}, {{
+static void vec_conv_func(v)(void *dest, void *src, int len)
+{
+    xtype_t *vs = src;
+    ytype_t *vd = dest;
+    for(int i=0; i < len; i++)
+        vd[i] = conv_func()(vs[i]);
+}
+static void vec_conv_func(s)(void *dest, void *src, int len)
+{
+    *(ytype_t *)dest = conv_func()(*(xtype_t *)src);
+}
+/*
+  stash(1,{{
+  [CODE_sca][code(xtype)][code(ytype)] = vec_conv_func(s),
+  [CODE_vec][code(xtype)][code(ytype)] = vec_conv_func(v),
+  }})
+*/
+// }})
+// }})
+expand_convtab()
+/*@
+
+\subsection*{Store}
+
+==arith/vec.c.in*/
+/*
+  m4_define({{maybe_conv}},
+    {{m4_ifelse(xtype,ytype,$1,
+      {{paste(arith,conv,ytype,to,xtype)}}{{($1)}})}})
+*/
+#define NEXT1(p, start, end) ((p+1 >= end) ? start : p+1)
+// for_types({{element_types}}, {{
+
+// v[ints] = r
+// recycle r along idx
+// idxs which are out of range are ignored
+static void
+paste(int, set, xtype, from, ytype)(void *r, void *v, void *idx,
+                                    int rlen, int vlen, int ilen)
+{
+    rint_t *vi = idx;
+    xtype_t *vv = v;
+    ytype_t *vr = r;
+    ytype_t *rstart = vr, *rend = vr + rlen;
+
+    for(int i=0; i<ilen; i++)
+    {
+        rint_t j = vi[i];
+        if(!(int_na(j) || j > vlen || j <= 0))
+        {
+            vv[j-1] = maybe_conv(*vr);
+            vr = NEXT1(vr, rstart, rend);
+        }
+    }
+}
+
+// v[bools] = r
+// recycles r along idx, and idx along v
+static void
+paste(bool, set, xtype, from, ytype)(void *r, void *v, void *idx,
+                                     int rlen, int vlen, int ilen)
+{
+    rboolean_t *vi = idx;
+    rboolean_t *istart = vi, *iend = vi + ilen;
+    xtype_t *vv = v;
+    ytype_t *vr = r;
+    ytype_t *rstart = vr, *rend = vr + rlen;
+
+    for(int i=0; i<vlen; i++)
+    {
+        rboolean_t b = *vi;
+        vi = NEXT1(vi, istart, iend);
+        if(b == true)
+        {
+            vv[i] = maybe_conv(*vr);
+            vr = NEXT1(vr, rstart, rend);
+        }
+    }
+}
+
+// v[] = r
+static void
+paste(missing, set, xtype, from, ytype)(void *r, void *v, void *idx,
+                                        int rlen, int vlen, int ilen)
+{
+    xtype_t *vv = v;
+    ytype_t *vr = r;
+    ytype_t *rstart = vr, *rend = vr + rlen;
+
+    for(int i=0; i<vlen; i++)
+    {
+        vv[i] = maybe_conv(*vr);
+        vr = NEXT1(vr, rstart, rend);
+    }
+}
+
+/*
+  stash(1,{{
+  [code(xtype)][code(ytype)] = paste(int, set, xtype, from, ytype),
+  }})
+  stash(2,{{
+  [code(xtype)][code(ytype)] = paste(bool, set, xtype, from, ytype),
+  }})
+  stash(3,{{
+  [code(xtype)][code(ytype)] = paste(missing, set, xtype, from, ytype),
+  }})
+*/
+// }})
+
+const idx_fn int_set_funcs[CODE_MAX][CODE_MAX] = {
+    //m4_undivert(1)
+};
+const idx_fn bool_set_funcs[CODE_MAX][CODE_MAX] = {
+    //m4_undivert(2)
+};
+const idx_fn missing_set_funcs[CODE_MAX][CODE_MAX] = {
+    //m4_undivert(3)
+};
+/*@
+
+\subsection*{Fetch}
+
+==arith/vec.c.in*/
+// for_type({{element_types}}, {{
+static void paste(fill_na, xtype)(void *r, size_t sz)
+{
+    xtype_t *vr = r;
+    int len = sz / sizeof(*vr);
+    for(int i=0; i < len; i++)
+        vr[i] = make_na(xtype);
+}
+
+// ... = v[ints]
+// r is sized correctly
+static void paste(int, get, xtype)(void *r, void *v, void *idx,
+                                   int rlen, int vlen, int ilen)
+{
+    rint_t *vi = idx;
+    xtype_t *vv = v;
+    xtype_t *vr = r;
+
+    // for each element in the index
+    for(int i=0; i < ilen; i++)
+    {
+        rint_t j = vi[i];
+        // if the index element is out of range or NA, the result is NA,
+        // else it's the indexed element from the vector
+        if(int_na(j) || j > vlen || j <= 0)
+            vr[i] = make_na(xtype);
+        else
+            vr[i] = vv[j-1];
+    }
+}
+
+// ... = v[bools]
+// recycle idx along v
+// r is sized correctly, but may need padding with NAs if v is shorter than idx
+static void paste(bool, get, xtype)(void *r, void *v, void *idx,
+                                    int rlen, int vlen, int ilen)
+{
+    rboolean_t *vi = idx;
+    rboolean_t *istart = vi, *iend = vi + ilen;
+    xtype_t *vv = v;
+    xtype_t *vr = r;
+
+    for(int i=0; i<vlen; i++)
+    {
+        rboolean_t b = *vi;
+        vi = NEXT1(vi, istart, iend);
+        // if it's not false
+        if(b != false)
+        {
+            // set the current result element - to NA, if the index elt is;
+            // or to the corresponding vector element
+            *vr++ = boolean_na(b) ? make_na(xtype) : vv[i];
+        }
+    }
+
+    // if the index is longer than the vector, fill the rest of the result with NAs
+    if(vlen < ilen)
+    {
+        uint8_t *end = (uint8_t *)((xtype_t *)r + rlen);
+        paste(fill_na, xtype)(vr, end - (uint8_t *)vr);
+    }
+}
+
+// ... = v[]
+static void paste(missing, get, xtype)(void *r, void *v, void *idx,
+                                       int rlen, int vlen, int ilen)
+{
+    xtype_t *vv = v;
+    xtype_t *vr = r;
+
+    for(int i=0; i<vlen; i++)
+        vr[i] = vv[i];
+}
+
+/*
+  stash(1,{{
+  [code(xtype)] = paste(int, get, xtype),
+  }})
+  stash(2,{{
+  [code(xtype)] = paste(bool, get, xtype),
+  }})
+  stash(3,{{
+  [code(xtype)] = paste(missing, get, xtype),
+  }})
+  stash(4,{{
+  [code(xtype)] = paste(fill_na, xtype),
+  }})
+*/
+// }})
+
+const idx_fn int_get_funcs[CODE_MAX] = {
+    //m4_undivert(1)
+};
+const idx_fn bool_get_funcs[CODE_MAX] = {
+    //m4_undivert(2)
+};
+const idx_fn missing_get_funcs[CODE_MAX] = {
+    //m4_undivert(3)
+};
+const fill_na_fn fill_na_funcs[CODE_MAX] = {
+    //m4_undivert(4)
+};
+/*@
+
+\subsection*{Operations}
+
+==arith/vec.c.in*/
+//{{
+
+// helpers
+// FIXME use rvec_len/rvec_elts now they exist
+static inline int arith_length(robject_t *obj)
+{
+    if(!obj)
+        return 0;
+    if(!rtype_is_container(r_typeof(obj)))
+        return 1;
+    return ((rbuf_t *)obj)->length;
+}
+
+static inline void *arith_storage(robject_t *obj)
+{
+    if(!obj)
+        return NULL;
+    if(rtype_is_scalar(r_typeof(obj)))
+        return BOXPTR(obj);
+    assert(rtype_is_container(r_typeof(obj)));
+    return ((rbuf_t *)obj)->elts;
+}
+
+// FIXME some generalised new() kind of thing, plx
+static inline robject_t *arith_create(rtype_t *typ, int len)
+{
+    if(rtype_is_scalar(typ))
+        return r_box_create(typ);
+    else if(rtype_is_vector(typ))
+        return (robject_t *)rvec_create(typ, len);
+    else if(rtype_is_array(typ))
+        return (robject_t *)rarr_create_buf(typ, len);
+    assert(!"can't arith_create that type");
+    return NULL;
+}
+
+// dest and src are the same (container) type
+// may allocate; retain unrooted inputs.
+// do not invoke before initialising freshly allocated vectors of reference type
+// despite the name, will share .names/.dimnames pointer if at all possible
+void copy_names(robject_t *dest, robject_t *src)
+{
+    rtype_t *dtype = r_typeof(dest);
+    if(rtype_is_vector(dtype))
+    {
+        rvector_t *dvec = (rvector_t *)dest, *svec = (rvector_t *)src;
+
+        if(rvec_len(dvec) == rvec_len(svec))
+        {
+            // copy the reference if they're the same length
+            dvec->names = svec->names;
+        }
+        else
+        {
+            rvec_add_names(dvec);
+            copy_recycle(rvec_elts(dvec->names), rvec_elts(svec->names),
+                         rvec_len(dvec), rvec_len(svec),
+                         sizeof(rsymbol_t *));
+        }
+    }
+    else if(rtype_is_array(dtype))
+    {
+        rarray_t *darr = (rarray_t *)dest, *sarr = (rarray_t *)src;
+        assert(rarr_conform(darr, sarr));
+        // arrays always conform, so just copy the reference
+        darr->dimnames = sarr->dimnames;
+    }
+}
+
+static inline void copy_shape(robject_t *robj, robject_t *obj)
+{
+    rarray_t *arr = (rarray_t *)obj;
+    rarr_set_shape((rarray_t *)robj, arr->rank, arr->shape);
+}
+
+bool check_binary(binop_chk_t *chk, rtype_t *xt, rtype_t *yt, bool pred)
+{
+    *chk = (binop_chk_t) {
+        .xvec = rtype_is_container(xt), .yvec = rtype_is_container(yt),
+        .xarr = rtype_is_array(xt), .yarr = rtype_is_array(yt)
+    };
+
+    // take the element type if arg is a container
+    rtype_t *xet = chk->xvec ? xt->elt : xt,
+            *yet = chk->yvec ? yt->elt : yt;
+
+    // only work on scalars
+    if(!rtype_is_scalar(xet) || !rtype_is_scalar(yet))
+        return false;
+
+    // dispatch at the higher of the arguments
+    chk->optyp = rscal_promote(xet, yet);
+
+    // result element type is dispatch type, or boolean if op is a predicate
+    rtype_t *etyp = pred ? r_type_boolean : chk->optyp;
+
+    // result is an array if either arg is, else a vector if either arg is, else a scalar
+    if(chk->xarr || chk->yarr)
+        chk->typ = rarr_type_create(etyp);
+    else if(chk->xvec || chk->yvec)
+        chk->typ = rvec_type_create(etyp);
+    else
+        chk->typ = etyp;
+
+    // scalar attributes cached for later use
+    chk->xsz = rscal_size(xet);
+    chk->ysz = rscal_size(yet);
+    chk->rsz = rscal_size(etyp);
+    chk->xcode = rscal_code(xet);
+    chk->ycode = rscal_code(yet);
+    return true;
+}
+
+// XXX ancillae, surely?
+static void copy_ancilla_binary(binop_chk_t *chk, robject_t *robj, robject_t *xobj,
+                                robject_t *yobj, bool y_long)
+{
+    bool xn = is_named(xobj), yn = is_named(yobj);
+
+    // if an array is involved
+    if(chk->xarr || chk->yarr)
+    {
+        // take its shape
+        if(chk->xarr)
+            copy_shape(robj, xobj);
+        else if(chk->yarr)
+            copy_shape(robj, yobj);
+        // take dimnames if present
+        if(chk->xarr && xn)
+            copy_names(robj, xobj);
+        else if(chk->yarr && yn)
+            copy_names(robj, yobj);
+    }
+    // neither x nor y are arrays
+    else if(chk->xvec && xn)
+    {
+        // x is a named vector
+        // if y is a named vector longer than x, use its names
+        if(chk->yvec && yn && y_long)
+            copy_names(robj, yobj);
+        else // else use x's
+            copy_names(robj, xobj);
+    }
+    // x is not a named vector, and y is
+    else if(chk->yvec && yn)
+        copy_names(robj, yobj);
+}
+
+robject_t *arith_binary(vm_ctx_t *vm, binop_fntab fntab, bool pred,
+                        robject_t *xobj, robject_t *yobj)
+{
+    rtype_t *xt = r_typeof(xobj), *yt = r_typeof(yobj);
+    binop_chk_t chk = { 0 };
+
+    if(!check_binary(&chk, xt, yt, pred))
+        vm_error(vm, "arith_binary", "incompatible argument types.");
+
+    rtype_t *rt = vm_retain(vm, chk.typ);
+    binop_fn fn = dispatch_binary(&chk, fntab);
+
+    if(!fn)
+        vm_error(vm, "arith_binary", "operation not supported.");
+    if(chk.xarr & chk.yarr && !rarr_conform((rarray_t *)xobj, (rarray_t *)yobj))
+        vm_error(vm, "arith_binary", "non-conforming arrays.");
+
+    int xlen = arith_length(xobj), ylen = arith_length(yobj);
+    int rlen = (xlen == 0 || ylen == 0) ? 0 : max(xlen, ylen);
+    robject_t *robj = vm_retain(vm, arith_create(rt, rlen));
+    void *x = arith_storage(xobj), *y = arith_storage(yobj),
+         *r = arith_storage(robj);
+
+    // copy shape and dim/names
+    copy_ancilla_binary(&chk, robj, xobj, yobj, ylen > xlen);
+    // if either are length 0, the result is length 0, an R-ism
+    if(chk.xvec && chk.yvec && rlen > 0)
+    {
+        bool xlong = xlen >= ylen;
+        int roundlen = xlong ? ylen : xlen;
+        int rounds = rlen / roundlen;
+        int extra = rlen - rounds * roundlen;
+
+        ptrdiff_t xadv = xlong ? (chk.xsz * ylen) : 0;
+        ptrdiff_t yadv = xlong ? 0 : (chk.ysz * xlen);
+        ptrdiff_t radv = xlong ? (chk.rsz * ylen) : (chk.rsz * xlen);
+
+        for(int n=0; n < rounds; n++)
+        {
+            fn(r, x, y, roundlen);
+            r = (uint8_t *)r + radv;
+            x = (uint8_t *)x + xadv;
+            y = (uint8_t *)y + yadv;
+        }
+        if(extra > 0)
+        {
+            fn(r, x, y, extra);
+            // vm_warning(vm, "non-integral recycling");
+        }
+    }
+    else // since rlen is correct, and arith_storage does the right thing
+        fn(r, x, y, rlen);
+    vm_release(vm, 2);
+    return robj;
+}
+
+bool check_unary(unop_chk_t *chk, rtype_t *xt, bool pred)
+{
+    *chk = (unop_chk_t) {
+        .vec = rtype_is_container(xt),
+        .arr = rtype_is_array(xt),
+    };
+    rtype_t *xet = chk->vec ? xt->elt : xt;
+
+    if(!rtype_is_scalar(xet))
+        return false;
+
+    rtype_t *etyp = pred ? r_type_boolean : xet;
+
+    if(chk->arr)
+        chk->typ = rarr_type_create(etyp);
+    else if(chk->vec)
+        chk->typ = rvec_type_create(etyp);
+    else
+        chk->typ = etyp;
+    chk->code = rscal_code(xet);
+    return true;
+}
+
+static void copy_ancilla_unary(bool arr, robject_t *robj, robject_t *xobj)
+{
+    if(arr)
+        copy_shape(robj, xobj);
+    if(is_named(xobj))
+        copy_names(robj, xobj);
+}
+
+robject_t *arith_unary(vm_ctx_t *vm, unop_fntab fntab, bool pred,
+                       robject_t *xobj)
+{
+    rtype_t *xt = r_typeof(xobj);
+    unop_chk_t chk = { 0 };
+
+    if(!check_unary(&chk, xt, pred))
+        vm_error(vm, "arith_unary", "incompatible argument type.");
+
+    rtype_t *rt = vm_retain(vm, chk.typ);
+    unop_fn fn = dispatch_unary(&chk, fntab);
+
+    if(!fn)
+        vm_error(vm, "arith_unary", "operation not supported.");
+
+    int len = arith_length(xobj);
+    robject_t *robj = vm_retain(vm, arith_create(rt, len));
+    void *x = arith_storage(xobj), *r = arith_storage(robj);
+
+    copy_ancilla_unary(chk.arr, robj, xobj);
+    fn(r, x, len);
+    vm_release(vm, 2);
+    return robj;
+}
+
+
+bool check_reduce(reduce_chk_t *chk, rtype_t *xt)
+{
+    *chk = (reduce_chk_t) {
+        .vec = rtype_is_container(xt),
+    };
+    rtype_t *xet = chk->vec ? xt->elt : xt;
+
+    if(!rtype_is_scalar(xet))
+        return false;
+    chk->typ = xet;
+    chk->code = rscal_code(xet);
+    return true;
+}
+
+robject_t *arith_reduce(vm_ctx_t *vm, reduce_fntab fntab, robject_t *xobj)
+{
+    rtype_t *xt = r_typeof(xobj);
+    reduce_chk_t chk = { 0 };
+
+    if(!check_reduce(&chk, xt))
+        vm_error(vm, "arith_reduce", "incompatible argument type.");
+    if(!chk.vec)
+        return xobj;
+
+    int len = arith_length(xobj);
+    rtype_t *rt = vm_retain(vm, chk.typ);
+    unop_fn fn = dispatch_reduce(&chk, fntab);
+
+    if(!fn)
+        vm_error(vm, "arith_reduce", "operation not supported.");
+
+    robject_t *robj = vm_retain(vm, r_box_create(rt));
+    void *x = arith_storage(xobj), *r = arith_storage(robj);
+
+    fn(r, x, len);
+    vm_release(vm, 2);
+    return robj;
+}
+
+// convert a vector of objects to a single scalar type
+static inline void vec_conv_generic(rtype_t *to, void *dest, void *src, int len)
+{
+    assert(rtype_is_scalar(to));
+    size_t sz = rtype_eltsz(to);
+    uint8_t *ptr = dest;
+    robject_t **vs = src;
+    fill_na_fn na_fn = fill_na_funcs[rscal_code(to)];
+
+    for(int i=0; i < len; i++, ptr+=sz)
+    {
+        robject_t *elt = vs[i];
+        rtype_t *from = r_typeof(elt);
+
+        // if the element is of the correct type already, unbox it
+        if(from == to)
+            r_unbox(ptr, elt);
+        // if it's another scalar, convert it
+        else if(rtype_is_scalar(from))
+        {
+            conv_fn fn = conv_funcs[0][rscal_code(from)][rscal_code(to)];
+            fn(ptr, BOXPTR(elt), 1);
+        }
+        // it's not a value, so NA
+        else
+            na_fn(ptr, sz);
+    }
+}
+
+bool check_conv(conv_chk_t *chk, rtype_t *from, rtype_t *to)
+{
+    *chk = (conv_chk_t) {
+        .vec = rtype_is_container(from),
+        .arr = rtype_is_array(from),
+    };
+    assert(rtype_is_scalar(to));
+    if(chk->vec)
+    {
+        chk->rt = chk->arr
+            ? rarr_type_create(to)
+            : rvec_type_create(to);
+
+        if(rtype_is_scalar(from->elt))
+            chk->fromcode = rscal_code(from->elt);
+        else
+            chk->generic = true;
+    }
+    else
+    {
+        chk->rt = to;
+        if(!rtype_is_scalar(from))
+            return false;
+        chk->fromcode = rscal_code(from);
+    }
+    chk->tocode = rscal_code(to);
+    return true;
+}
+
+// convert a vector or scalar to have a given scalar (element) type
+robject_t *arith_convert(vm_ctx_t *vm, robject_t *obj, rtype_t *to)
+{
+    rtype_t *typ = r_typeof(obj);
+    rtype_t *from = arith_elt_type(typ);
+    conv_chk_t chk = { 0 };
+
+    if(!check_conv(&chk, typ, to))
+        vm_error(vm, "arith_convert", "invalid argument type.");
+    // XXX we might want to copy instead, because:
+    // y = as_double(x); y[...] = crap; shouldn't sometimes fill x with crap?
+    if(to == from)
+        return obj;
+
+    rtype_t *rt = vm_retain(vm, chk.rt);
+
+    if(!rt)
+        vm_error(vm, "arith_convert", "invalid argument type.");
+
+    int len = arith_length(obj);
+    robject_t *robj = vm_retain(vm, arith_create(rt, len));
+    void *x = arith_storage(obj), *r = arith_storage(robj);
+
+    copy_ancilla_unary(chk.arr, robj, obj);
+
+    if(chk.generic)
+    {
+        vec_conv_generic(to, r, x, len);
+    }
+    else
+    {
+        conv_fn fn = dispatch_conv(&chk);
+
+        if(!fn)
+            vm_error(vm, "arith_convert", "invalid argument type.");
+        fn(r, x, len);
+    }
+    vm_release(vm, 2);
+    return robj;
+}
+
+// now used in both compiler and vm
+bool scalar_convert(void *dest, robject_t *obj, rtype_t *to, rtype_t *from)
+{
+    assert(rtype_is_scalar(from));
+    assert(rtype_is_scalar(to));
+    assert(to != from);
+
+    conv_fn fn = conv_funcs[0][rscal_code(from)][rscal_code(to)];
+
+    if(!fn)
+        return false;
+    fn(dest, arith_storage(obj), 1);
+    return true;
+}
+
+
+static inline int idx_func_code(rtype_t *typ)
+{
+    return rtype_is_scalar(typ) ? rscal_code(typ) : CODE_ptr;
+}
+
+static inline idx_fn idx_access_func(idx_kind kind, int rcode, int vcode)
+{
+    switch(kind)
+    {
+    case SINGLE:
+    case INDEX:
+        return (rcode == -1) ?
+            int_get_funcs[vcode] : int_set_funcs[vcode][rcode];
+    case MASK:
+        return (rcode == -1) ?
+            bool_get_funcs[vcode] : bool_set_funcs[vcode][rcode];
+    case MISSING:
+        return (rcode == -1) ?
+            missing_get_funcs[vcode] : missing_set_funcs[vcode][rcode];
+    }
+    return NULL; /* NOTREACHED */
+}
+
+static inline void
+idx_copy_names(rsymbol_t **rnames, rsymbol_t **vnames, void *i, idx_kind kind,
+               int rlen, int vlen, int ilen)
+{
+    idx_fn fn = idx_access_func(kind, -1, CODE_ptr);
+    fn(rnames, vnames, i, rlen, vlen, ilen);
+}
+
+static int count_nonfalse(rboolean_t *elts, int n)
+{
+    int c = 0;
+    for(int i=0; i<n; i++)
+        c += (elts[i] != false);
+    return c;
+}
+
+// given a mask of length ilen, return the length of the vector that
+// will result when it's recycled over a vector of length vlen.
+// (note that this may be > vlen, per semantics)
+static int mask_result_len(int vlen, rboolean_t *mask, int ilen)
+{
+    if(ilen == 0)
+        return 0;
+    if(ilen >= vlen)
+        return count_nonfalse(mask, ilen);
+
+    int sum = 0;
+    for(int i=0; i<vlen; i += ilen)
+        sum += count_nonfalse(mask, min(ilen, vlen - i));
+    return sum;
+}
+
+static inline bool check_index(idx_kind *kind, rtype_t *ityp)
+{
+    if(ityp == r_type_nil)
+        *kind = MISSING;
+    else if(arith_elt_type(ityp) == r_type_int)
+        *kind = rtype_is_scalar(ityp) ? SINGLE : INDEX;
+    else if(arith_elt_type(ityp) == r_type_boolean)
+        *kind = MASK;
+    else
+        return false; // no other valid index types
+    return true;
+}
+
+bool check_fetch(idx_chk_t *chk, rtype_t *typ, rtype_t *ityp)
+{
+    if(!rtype_is_vector(typ) && !rtype_is_array(typ))
+        return false;
+    if(!check_index(&chk->kind, ityp))
+        return false;
+    if(chk->kind == SINGLE)
+    {
+        // return a single element
+        chk->typ = typ->elt;
+        // single element of reference type can be returned directly
+        if(!rtype_is_scalar(typ->elt))
+            chk->takeptr = true;
+    }
+    else if(rtype_is_array(typ))
+    {
+        // indexing into an array with a single vectorised subscript
+        // always returns a vector result (this differs from R)
+        chk->typ = rvec_type_create(typ->elt);
+        // (and never returns element names, since arrays don't have them)
+    }
+    else
+    {
+        chk->typ = typ;
+        chk->names = true;
+    }
+    return true;
+}
+
+robject_t *vec_fetch(vm_ctx_t *vm, robject_t *val, robject_t *idx)
+{
+    rtype_t *typ = r_typeof(val), *ityp = r_typeof(idx);
+    idx_chk_t chk = { 0 };
+
+    if(!check_fetch(&chk, typ, ityp))
+        vm_error(vm, "[", "invalid argument type.");
+
+    rtype_t *rt = vm_retain(vm, chk.typ);
+    int vlen = arith_length(val), ilen = arith_length(idx);
+    bool names = chk.names & is_named(val);
+    int rlen = 0;
+
+    if(chk.kind == MASK)
+        rlen = mask_result_len(vlen, arith_storage(idx), ilen);
+    else if(chk.kind == MISSING)
+        rlen = vlen;
+    else
+        rlen = ilen;
+
+    robject_t *res = NULL;
+    void *r;
+
+    if(chk.takeptr)
+        r = &res;
+    else
+    {
+        res = arith_create(rt, rlen);
+        r = arith_storage(res);
+    }
+    vm_retain(vm, res);
+    if(rlen > 0)
+    {
+        idx_fn fn = idx_access_func(chk.kind, -1, idx_func_code(typ->elt));
+        void *v = arith_storage(val), *i = arith_storage(idx);
+
+        fn(r, v, i, rlen, vlen, ilen);
+        if(names)
+        {
+            rvector_t *vvec = (rvector_t *)val, *rvec = (rvector_t *)res;
+
+            rvec_add_names(rvec);
+            idx_copy_names(rvec_elts(rvec->names), rvec_elts(vvec->names), i,
+                           chk.kind, rlen, vlen, ilen);
+        }
+    }
+    vm_release(vm, 2);
+    return res;
+}
+
+bool check_store(idx_chk_t *chk, rtype_t *typ, rtype_t *ityp, rtype_t *rtyp)
+{
+    rtype_t *ret, *et;
+
+    if(!rtype_is_vector(typ) && !rtype_is_array(typ))
+        return false;
+    if(!check_index(&chk->kind, ityp))
+        return false;
+    // replacement check
+    if(rtype_is_vector(rtyp) && chk->kind != SINGLE) // vector replacement?
+    {
+        // replace with contents: check against element type
+        ret = rtyp->elt;
+    }
+    else // either replacement not a vector, or single value required
+    {
+        // replace with value
+        ret = rtyp;
+        // replace with the reference as a value
+        if(!rtype_is_scalar(rtyp))
+            chk->takeptr = true;
+    }
+    // container is always a vector
+    et = typ->elt;
+    // storing into
+    if(rtype_is_scalar(et))
+    {
+        // a vector of scalars
+        // FIXME set_xxx_from_ptr is a thing now, maybe use that
+        if(!rtype_is_scalar(ret)) // can't accept reference objects
+            return false;
+    }
+    else
+    {
+        // a vector of objects
+        if(!r_subtypep(ret, et)) // can't accept incompatible objects
+            return false;
+    }
+    chk->typ = ret;
+    return true;
+}
+
+robject_t *vec_store(vm_ctx_t *vm, robject_t *val, robject_t *rpl,
+                     robject_t *idx)
+{
+    rtype_t *typ = r_typeof(val), *ityp = r_typeof(idx), *rtyp = r_typeof(rpl);
+    idx_chk_t chk = { 0 };
+    void *r;
+
+    if(!check_store(&chk, typ, ityp, rtyp))
+        vm_error(vm, "[=", "invalid argument type.");
+
+    // vector[...]
+    int vlen = arith_length(val), ilen = arith_length(idx), rlen;
+
+    if(chk.takeptr)
+    {
+        r = &rpl;
+        rlen = 1;
+    }
+    else
+    {
+        r = arith_storage(rpl);
+        rlen = arith_length(rpl);
+    }
+    if(rlen > 0 && (ilen > 0 || chk.kind == MISSING))
+    {
+        idx_fn fn = idx_access_func(chk.kind, idx_func_code(chk.typ),
+                                    idx_func_code(typ->elt));
+        void *v = arith_storage(val), *i = arith_storage(idx);
+
+        fn(r, v, i, rlen, vlen, ilen);
+    }
+    return rpl;
+}
+
+
+typedef struct extent_s extent_t;
+typedef void (*ext_fn)(extent_t *, void *, void *);
+typedef struct extent_s
+{
+    void *idx;
+    int rlen, vlen, ilen;
+
+    ext_fn ext_fn;
+    union {
+        idx_fn idx_fn;
+        fill_na_fn na_fn;
+    };
+    size_t vsz, rsz;
+    extent_t *next;
+} extent_t;
+
+static void extent_access(extent_t *ext, void *r, void *v)
+{
+    ext->idx_fn(r, v, ext->idx, ext->rlen, ext->vlen, ext->ilen);
+}
+
+#define NEXT(p, q, start, end) ((p+q >= end) ? start : p+q)
+
+static void extent_bool_get(extent_t *ext, void *r, void *v)
+{
+    rboolean_t *vi = ext->idx;
+    rboolean_t *istart = vi, *iend = vi + ext->ilen;
+    uint8_t *vv = v, *vr = r;
+    size_t vsz = ext->vsz, rsz = ext->rsz;
+    uint8_t *rstart = vr, *rend = vr + ext->rlen * rsz;
+
+    for(int i=0; i<ext->vlen; i++)
+    {
+        rboolean_t b = *vi;
+
+        vi = NEXT1(vi, istart, iend);
+        if(b != false)
+        {
+            if(boolean_na(b))
+                ext->na_fn(vr, rsz);
+            else
+                ext->next->ext_fn(ext->next, vr, vv);
+            vr = NEXT(vr, rsz, rstart, rend);
+        }
+        vv += vsz;
+    }
+    if(ext->vlen < ext->ilen)
+        ext->na_fn(vr, rend - vr);
+}
+
+static void extent_int_get(extent_t *ext, void *r, void *v)
+{
+    rint_t *vi = ext->idx;
+    uint8_t *vv = v, *vr = r;
+    size_t vsz = ext->vsz, rsz = ext->rsz;
+
+    for(int i=0; i<ext->ilen; i++)
+    {
+        rint_t j = vi[i];
+        if(int_na(j) || j > ext->vlen || j <= 0)
+            ext->na_fn(vr, rsz);
+        else
+            ext->next->ext_fn(ext->next, vr, vv + (j-1) * vsz);
+        vr += rsz;
+    }
+}
+
+static void extent_missing_get_set(extent_t *ext, void *r, void *v)
+{
+    uint8_t *vv = v, *vr = r;
+    size_t vsz = ext->vsz, rsz = ext->rsz;
+
+    for(int i=0; i<ext->vlen; i++)
+    {
+        ext->next->ext_fn(ext->next, vr, vv);
+        vr += rsz;
+        vv += vsz;
+    }
+}
+
+static void extent_bool_set(extent_t *ext, void *r, void *v)
+{
+    rboolean_t *vi = ext->idx;
+    rboolean_t *istart = vi, *iend = vi + ext->ilen;
+    uint8_t *vv = v, *vr = r;
+    size_t vsz = ext->vsz, rsz = ext->rsz;
+
+    for(int i=0; i<ext->vlen; i++)
+    {
+        rboolean_t b = *vi;
+        vi = NEXT1(vi, istart, iend);
+        if(b == true)
+        {
+            ext->next->ext_fn(ext->next, vr, vv);
+            vr += rsz;
+        }
+        vv += vsz;
+    }
+}
+
+static void extent_int_set(extent_t *ext, void *r, void *v)
+{
+    rint_t *vi = ext->idx;
+    uint8_t *vv = v, *vr = r;
+    size_t vsz = ext->vsz, rsz = ext->rsz;
+
+    for(int i=0; i<ext->ilen; i++)
+    {
+        rint_t j = vi[i];
+        if(!(int_na(j) || j > ext->vlen || j <= 0))
+        {
+            ext->next->ext_fn(ext->next, vr, vv + (j-1) * vsz);
+            vr += rsz;
+        }
+    }
+}
+
+static ext_fn idx_ext_func(idx_kind kind, bool isset)
+{
+    switch(kind)
+    {
+    case SINGLE:
+    case INDEX:
+        return isset ? extent_int_set : extent_int_get;
+    case MASK:
+        return isset ? extent_bool_set : extent_bool_get;
+    case MISSING:
+        return extent_missing_get_set;
+    }
+    return NULL; /* NOTREACHED */
+}
+
+static inline int idx_dim(int vlen, robject_t *idx, idx_kind kind)
+{
+    switch(kind)
+    {
+    case SINGLE:
+        return 1;
+    case INDEX:
+        return arith_length(idx);
+    case MASK:
+        return mask_result_len(vlen, arith_storage(idx), arith_length(idx));
+    case MISSING:
+        return vlen;
+    }
+    return 0; /* NOTREACHED */
+}
+
+static rtype_t **idx_types(rtype_t **ityps, robject_t *idx,
+                           robject_t **idxs, int nidxs)
+{
+    ityps[0] = r_typeof(idx);
+    for(int i=1; i < nidxs+1; i++)
+        ityps[i] = r_typeof(idxs[i-1]);
+    return ityps;
+}
+
+static int idx_extents(extent_t *exts, idx_kind *kinds,
+                       robject_t *idx, robject_t **idxs, int nidxs,
+                       size_t rsz, size_t vsz,
+                       int *rshape, int *vshape,
+                       int rcode, int vcode, bool isscal)
+{
+    extent_t *ext = &exts[0];
+    extent_t *next = NULL;
+    robject_t **pidx = &idx;
+    int rlen = 1;
+    int j = 0;
+    int rdim;
+    bool isset = (rcode != -1);
+
+    for(int i=0; i<nidxs+1; ext++, i++)
+    {
+        int kind = kinds[i];
+
+        rdim = idx_dim(vshape[i], *pidx, kind);
+        if(kind != SINGLE)
+            rshape[j++] = rdim;
+        rlen *= rdim;
+
+        *ext = (extent_t) {
+            // scalar replacement: correct length for recycling in *_set_*_from_*
+            .rlen = isscal ? 1 : rdim,
+            .vlen = vshape[i],
+            .ilen = arith_length(*pidx),
+            .idx = arith_storage(*pidx),
+        };
+
+        if(i == 0)
+        {
+            ext->ext_fn = extent_access;
+            ext->idx_fn = idx_access_func(kind, rcode, vcode);
+        }
+        else
+        {
+            ext->ext_fn = idx_ext_func(kind, isset);
+            ext->na_fn = fill_na_funcs[vcode];
+            // scalar replacement: do not advance replacement pointer in extent_set_*
+            ext->rsz = isscal ? 0 : rsz;
+            ext->vsz = vsz;
+            ext->next = next;
+        }
+        rsz *= rdim;
+        vsz *= vshape[i];
+        next = ext;
+        // pidx may get to &idx[nidxs], but the loop ends before it's dereferenced
+        pidx = &idxs[i];
+    }
+    return rlen;
+}
+
+// copy dimnames from val (as indexed by exts) to res, if the latter is
+// a vector or array
+static void idx_extent_names(robject_t *res, robject_t *val, int rank,
+                             extent_t *exts, idx_kind *kinds, int nexts,
+                             int *rshape, int *vshape)
+{
+    rarray_t *arr = (rarray_t *)val;
+
+    if(rank == 1)
+    {
+        // to element names
+        rvector_t *rvec = (rvector_t *)res;
+        rvec_add_names(rvec);
+
+        // FIXME split into function
+        rvector_t **dimnames = rvec_elts(arr->dimnames);
+
+        for(int i=0; i<nexts; i++)
+        {
+            if(kinds[i] != SINGLE && dimnames[i])
+            {
+                // there will be exactly one of these
+                idx_copy_names(rvec_elts(rvec->names), rvec_elts(dimnames[i]),
+                               exts[i].idx, kinds[i], rshape[0], vshape[i],
+                               exts[i].ilen);
+            }
+        }
+    }
+    else if(rank > 1)
+    {
+        // to dimnames
+        rarray_t *rarr = (rarray_t *)res;
+        rarr_add_names(rarr);
+
+        // FIXME split into function
+        rvector_t **srcnames = rvec_elts(arr->dimnames);
+        rvector_t **destnames = rvec_elts(rarr->dimnames);
+        int j = 0;
+
+        for(int i=0; i<nexts; i++)
+        {
+            if(kinds[i] != SINGLE)
+            {
+                if(srcnames[i])
+                {
+                    destnames[j] = rvec_create(r_type_vec_symbol, rshape[j]);
+                    idx_copy_names(rvec_elts(destnames[j]), rvec_elts(srcnames[i]),
+                                   exts[i].idx, kinds[i], rshape[j], vshape[i],
+                                   exts[i].ilen);
+                }
+                j++;
+            }
+        }
+    }
+}
+
+bool check_arr_fetch(arr_chk_t *achk, rtype_t *typ, rtype_t **ityps,
+                     int ntyps)
+{
+    int rank = 0;
+
+    if(!rtype_is_array(typ))
+        return false;
+    for(int i=0; i<ntyps; i++)
+    {
+        if(!check_index(&achk->kinds[i], ityps[i]))
+            return false;
+        if(achk->kinds[i] != SINGLE)
+            rank++;
+    }
+    achk->rank = rank;
+    if(rank == 0) // single element
+    {
+        achk->typ = typ->elt;
+        if(!rtype_is_scalar(typ->elt))
+            achk->takeptr = true;
+    }
+    else if(rank == 1) // vector
+        achk->typ = rvec_type_create(typ->elt);
+    else // array
+        achk->typ = typ;
+    return true;
+}
+
+robject_t *arr_fetch(vm_ctx_t *vm, robject_t *val, robject_t *idx,
+                     robject_t **idxs, int nidxs)
+{
+    rtype_t *typ = r_typeof(val);
+    robject_t *res = NULL;
+    arr_chk_t achk = { .kinds = alloca((nidxs+1) * sizeof(idx_kind)) };
+    rtype_t **ityps = idx_types(alloca((nidxs+1) * sizeof(rtype_t *)),
+                                idx, idxs, nidxs);
+
+    if(!check_arr_fetch(&achk, typ, ityps, nidxs+1))
+        vm_error(vm, "[", "invalid argument type.");
+
+    rarray_t *arr = (rarray_t *)val;
+    int vrank = arr->rank;
+    int *vshape = arr->shape;
+
+    if(vrank > nidxs+1)
+        vm_error(vm, "[", "too few indices.");
+    else if(vrank < nidxs+1)
+        vm_error(vm, "[", "too many indices.");
+
+    rtype_t *rtyp = vm_retain(vm, achk.typ);
+    int rrank = achk.rank;
+    int *rshape = alloca(rrank * sizeof(int));
+
+    extent_t *exts = alloca((nidxs+1) * sizeof(extent_t));
+    int rlen = idx_extents(exts, achk.kinds, idx, idxs, nidxs,
+                           rtype_eltsz(typ->elt), rtype_eltsz(typ->elt),
+                           rshape, vshape,
+                           -1, idx_func_code(typ->elt), false);
+
+    void *r = NULL;
+    void *v = arith_storage(val);
+
+    if(achk.takeptr)
+        r = &res;
+    else
+    {
+        res = arith_create(rtyp, rlen);
+        r = arith_storage(res);
+        if(rrank > 1)
+            rarr_set_shape((rarray_t *)res, rrank, rshape);
+    }
+    vm_retain(vm, res);
+    if(rlen > 0)
+    {
+        extent_t *ext = &exts[nidxs];
+        ext->ext_fn(ext, r, v);
+    }
+    // copy dimnames
+    if(is_named(val))
+        idx_extent_names(res, val, rrank, exts, achk.kinds,
+                         nidxs+1, rshape, vshape);
+    vm_release(vm, 2);
+    return res;
+}
+
+bool check_arr_store(arr_chk_t *achk, rtype_t *typ, rtype_t **ityps,
+                     int ntyps, rtype_t *rtyp)
+{
+    rtype_t *ret, *et;
+    int rank = 0;
+
+    if(!rtype_is_array(typ))
+        return false;
+    for(int i=0; i<ntyps; i++)
+    {
+        if(!check_index(&achk->kinds[i], ityps[i]))
+            return false;
+        if(achk->kinds[i] != SINGLE)
+            rank++;
+    }
+    achk->rank = rank;
+    if(rtype_is_container(rtyp) && rank > 0)
+    {
+        // replace with contents: check against element type
+        ret = rtyp->elt;
+    }
+    else // either replacement not a container, or single value required
+    {
+        // replace with value
+        ret = rtyp;
+        // replace with the reference as a value
+        if(!rtype_is_scalar(rtyp))
+            achk->takeptr = true;
+    }
+    // container is always an array
+    et = typ->elt;
+    // element types
+    if(rtype_is_scalar(et))
+    {
+        // can't accept reference objects
+        if(!rtype_is_scalar(ret))
+            return false;
+    }
+    else
+    {
+        // can't accept incompatible objects
+        if(!r_subtypep(ret, et))
+            return false;
+    }
+    achk->typ = ret;
+    return true;
+}
+
+robject_t *arr_store(vm_ctx_t *vm, robject_t *val, robject_t *rpl,
+                     robject_t *idx, robject_t **idxs, int nidxs)
+{
+    rtype_t *typ = r_typeof(val), *rtyp = r_typeof(rpl);
+    arr_chk_t achk = { .kinds = alloca((nidxs+1) * sizeof(idx_kind)) };
+    rtype_t **ityps = idx_types(alloca((nidxs+1) * sizeof(rtype_t *)),
+                                idx, idxs, nidxs);
+
+    if(!check_arr_store(&achk, typ, ityps, nidxs+1, rtyp))
+        vm_error(vm, "[=", "invalid argument type.");
+
+    rarray_t *arr = (rarray_t *)val;
+    int vrank = arr->rank;
+    int *vshape = arr->shape;
+
+    if(vrank > nidxs+1)
+        vm_error(vm, "[=", "too few indices.");
+    else if(vrank < nidxs+1)
+        vm_error(vm, "[=", "too many indices.");
+
+    // 'requirements' that rpl must conform to
+    int rrank = achk.rank;
+    int *rshape = alloca(rrank * sizeof(int));
+
+    extent_t *exts = alloca((nidxs+1) * sizeof(extent_t));
+    int rlen = idx_extents(exts, achk.kinds, idx, idxs, nidxs,
+                           rtype_eltsz(achk.typ), rtype_eltsz(typ->elt),
+                           rshape, vshape,
+                           idx_func_code(achk.typ), idx_func_code(typ->elt),
+                           rtype_is_scalar(rtyp));
+
+    if(rtype_is_vector(rtyp))
+    {
+        rvector_t *rvec = (rvector_t *)rpl;
+        if(rvec_len(rvec) < rlen)
+            vm_error(vm, "[=", "non-conforming replacement vector.");
+    }
+    else if(rtype_is_array(rtyp))
+    {
+        rarray_t *rarr = (rarray_t *)rpl;
+        if(!rarr_shape_conform(rrank, rarr->rank, rshape, rarr->shape))
+            vm_error(vm, "[=", "non-conforming replacement array.");
+    }
+
+    void *r = NULL;
+    void *v = arith_storage(val);
+
+    if(achk.takeptr)
+        r = &rpl;
+    else
+        r = arith_storage(rpl);
+
+    if(rlen > 0)
+    {
+        extent_t *ext = &exts[nidxs];
+        ext->ext_fn(ext, r, v);
+    }
+    return rpl;
+}
+//}}
+/*@
+
+
+\section*{arith/builtins.c}
+%% FIXME: more vector creation builtins
+%% - `seq` (from, to, by, length) choose 3, or length (others default to 1) (type given as object)
+%%   - note length=0 is not from=1, to=0
+%% - `rep` (x, times) - `times` is either scalar or vector of length length(x).
+
+==arith/builtins.c*/
+#include "global.h"
+#include "ir.h"
+#include "rt/builtin.h"
+#include "vm/vm_ops.h"
+#include "arith/scalar.h"
+#include "arith/vec.h"
+#include "arith/dispatch.h"
+
+static void builtin_binary(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *x, *y;
+    } end_args(args, a);
+    const arith_builtin_t *ab = fn->cbi->data;
+    robject_t *res = arith_binary(vm, ab->fntab, ab->is_pred, a->x, a->y);
+    builtin_return(r, robject_t *, res);
+}
+
+static void builtin_unary(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *x;
+    } end_args(args, a);
+    const arith_builtin_t *ab = fn->cbi->data;
+    robject_t *res = arith_unary(vm, ab->fntab, ab->is_pred, a->x);
+    builtin_return(r, robject_t *, res);
+}
+
+static void builtin_reduce(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *x;
+    } end_args(args, a);
+    const arith_builtin_t *ab = fn->cbi->data;
+    robject_t *res = arith_reduce(vm, ab->fntab, a->x);
+    builtin_return(r, robject_t *, res);
+}
+
+static void builtin_convert(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *x;
+    } end_args(args, a);
+    rtype_t *etyp = *(rtype_t **)fn->cbi->data; // note: not an arith_builtin_t
+    robject_t *res = arith_convert(vm, a->x, etyp);
+    builtin_return(r, robject_t *, res);
+}
+
+static void builtin_coerce(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *x;
+        rtype_t *etyp;
+    } end_args(args, a);
+    if(!rtype_is_scalar(a->etyp))
+        vm_error(vm, "as_type", "invalid argument type.");
+    robject_t *res = arith_convert(vm, a->x, a->etyp);
+    builtin_return(r, robject_t *, res);
+}
+
+static inline bool fill_scal(rbuf_t *dest, robject_t *val, rtype_t *etyp, rtype_t *typ)
+{
+    rvalue_union_t temp;
+    size_t esz = rtype_eltsz(etyp);
+    int len = dest->length;
+    uint8_t *ptr = dest->elts;
+
+    // arithmetic conversion if needed
+    if(typ == etyp)
+        r_unbox(&temp, val);
+    else if(!rtype_is_scalar(typ) || !scalar_convert(&temp, val, etyp, typ))
+        return false;
+    for(int i=0; i<len; i++, ptr+=esz)
+        memcpy(ptr, &temp, esz);
+    return true;
+}
+
+static inline bool fill_ptr(rbuf_t *dest, robject_t *val, rtype_t *etyp, rtype_t *typ)
+{
+    robject_t **ptr = dest->elts;
+    int len = dest->length;
+
+    if(!r_subtypep(typ, etyp))
+        return false;
+    for(int i=0; i<len; i++, ptr++)
+        *ptr = val;
+    return true;
+}
+
+static inline bool fill_buf(rbuf_t *dest, robject_t *val)
+{
+    rtype_t *etyp = elt_type(dest);
+    rtype_t *typ = r_typeof(val);
+
+    if(rtype_is_scalar(etyp))
+        return fill_scal(dest, val, etyp, typ);
+    return fill_ptr(dest, val, etyp, typ);
+}
+
+static inline void fill_buf_from(rbuf_t *dest, rbuf_t *src)
+{
+    copy_recycle(dest->elts, src->elts, dest->length, src->length,
+                 rtype_eltsz(elt_type(dest)));
+}
+
+// create a vector of given element type and length, retaining both
+// (i.e. +2 release)
+static rvector_t *safe_vec_create(vm_ctx_t *vm, rtype_t *etyp, unsigned length)
+{
+    rtype_t *vtyp = vm_retain(vm, rvec_type_create(etyp));
+    return vm_retain(vm, rvec_create(vtyp, length));
+}
+
+static rarray_t *safe_arr_create(vm_ctx_t *vm, rtype_t *etyp, int rank, int *dims)
+{
+    rtype_t *atyp = vm_retain(vm, rarr_type_create(etyp));
+    return vm_retain(vm, rarr_create(atyp, rank, dims));
+}
+
+// extract the types of each pointer in elts[nelts]
+// return the least(ish!) common supertype of them all
+static rtype_t *examine_args(void **elts, int nelts)
+{
+    rtype_t *etyp = NULL;
+    for(int i=0; i<nelts; i++)
+    {
+        rtype_t *typ = r_typeof(elts[i]);
+        if(!etyp)
+            etyp = typ;
+        else
+            etyp = r_common_type(typ, etyp);
+    }
+    return etyp ? etyp : r_type_object;
+}
+
+// mimicking R would mean recursive descent into member vectors during
+// element type determination and copying. we don't do this.
+
+// creates a new vector containing the elements of the rest vector.
+// if they're all the same type (or are scalars so can be converted),
+// the result has that element type.
+static void builtin_vec(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rvector_t *rest;
+    } end_args(args, a);
+
+    if(!a->rest)
+    {
+        builtin_return(r, robject_t *, NULL);
+        return;
+    }
+
+    rvector_t *src = a->rest;
+    rtype_t *etyp = examine_args(rvec_elts(src), rvec_len(src));
+    // XXX move to arith.c??
+    if(rtype_is_scalar(etyp))
+    {
+        robject_t *res = arith_convert(vm, (robject_t *)src, etyp);
+        builtin_return(r, robject_t *, res);
+    }
+    else
+    {
+        rvector_t *dest = safe_vec_create(vm, etyp, rvec_len(src));
+        memcpy(rvec_elts(dest), rvec_elts(src), rvec_len(src) * sizeof(robject_t *));
+        // XXX don't bother, rest list construction does the wrong thing
+        // with named args, due to two-phase arg matching
+        if(is_named((robject_t *)src))
+            copy_names((robject_t *)dest, (robject_t *)src);
+        builtin_return(r, rvector_t *, dest);
+        vm_release(vm, 2);
+    }
+}
+
+static rvector_t *typed_vec_init(vm_ctx_t *vm, rtype_t *etyp, int len, robject_t *val)
+{
+    rvector_t *vec = safe_vec_create(vm, etyp, len);
+
+    if(!val)
+        memset(rvec_elts(vec), 0, len * rtype_eltsz(etyp));
+    else if(!fill_buf(&vec->buf, val))
+        vm_error(vm, "vec_create", "invalid argument type.");
+    vm_release(vm, 2);
+    return vec;
+}
+
+// XXX rationalise these; we want a minimal, orthogonal, useful set of
+// constructors
+static void builtin_typed_vec(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        argbits_t argbits;
+        rint_t len;
+        robject_t *val; // optional
+    } end_args(args, a);
+    argbits_t ab = a->argbits; // TEMP
+
+    if(a->len < 0 || a->len == rint_na)
+        vm_error(vm, "typed_vec", "invalid argument.");
+
+    rtype_t *etyp = *(rtype_t **)fn->cbi->data;
+    rvector_t *res = typed_vec_init(vm, etyp, a->len, !missingp(ab, 1) ? a->val : NULL);
+    builtin_return(r, rvector_t *, res);
+}
+
+static void builtin_vector(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        argbits_t argbits;
+        rtype_t *etyp;
+        rint_t len;
+        robject_t *val; // optional
+    } end_args(args, a);
+    argbits_t ab = a->argbits; // TEMP
+
+    if(a->len < 0 || a->len == rint_na)
+        vm_error(vm, "vector", "invalid argument.");
+
+    rvector_t *res = typed_vec_init(vm, a->etyp, a->len, !missingp(ab, 2) ? a->val : NULL);
+    builtin_return(r, rvector_t *, res);
+}
+
+// mimicks some R behaviour:
+// length(anything except a container) = 1
+// length(NULL) = 0
+static void builtin_length(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *x;
+    } end_args(args, a);
+    rint_t len;
+    if(a->x)
+    {
+        rtype_t *typ = r_typeof(a->x);
+        if(rtype_is_container(typ))
+            len = ((rbuf_t *)a->x)->length;
+        else
+            len = 1;
+    }
+    else
+        len = 0;
+    builtin_return(r, rint_t, len);
+}
+
+static void builtin_names_get(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rvector_t *x;
+    } end_args(args, a);
+    // names(nil) is nil
+    rvector_t *res = a->x ? a->x->names : NULL;
+    builtin_return(r, rvector_t *, res);
+}
+
+static void builtin_names_set(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rvector_t *x;
+        rvector_t *names;
+    } end_args(args, a);
+
+    if(!a->x)
+        vm_error(vm, "names=", "invalid argument.");
+    if(a->names)
+    {
+        assert(r_typeof(a->names) == r_type_vec_symbol);
+        if(rvec_len(a->names) != rvec_len(a->x))
+            vm_error(vm, "names=", "invalid argument length.");
+    }
+    a->x->names = a->names;
+    builtin_return(r, rvector_t *, a->names);
+}
+
+static rvector_t *copy_dimnames(vm_ctx_t *vm, rvector_t *src)
+{
+    int len = rvec_len(src);
+    rvector_t **srcnames = rvec_elts(src);
+    rvector_t *dest = safe_vec_create(vm, r_type_vec_symbol, len);
+    rvector_t **destnames = rvec_elts(dest);
+
+    memcpy(destnames, srcnames, sizeof(rvector_t *) * len);
+    vm_release(vm, 2);
+    return dest;
+}
+
+static void builtin_dimnames_get(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rarray_t *x;
+    } end_args(args, a);
+    // mutation could break the shape invariant! must take a copy.
+    rvector_t *res = NULL;
+    if(a->x && a->x->dimnames)
+        res = copy_dimnames(vm, a->x->dimnames);
+    builtin_return(r, rvector_t *, res);
+}
+
+static void builtin_dimnames_set(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rarray_t *x;
+        rvector_t *dimnames;
+    } end_args(args, a);
+
+    if(!a->x)
+        vm_error(vm, "dimnames=", "invalid argument.");
+    if(a->dimnames)
+    {
+        if(r_typeof(a->dimnames) != r_type_vec_names)
+            vm_error(vm, "dimnames=", "invalid argument type.");
+        if(rvec_len(a->dimnames) != a->x->rank)
+            vm_error(vm, "dimnames=", "invalid argument length.");
+
+        rvector_t **dimnames = rvec_elts(a->dimnames);
+        for(int i=0; i<a->x->rank; i++)
+        {
+            if(dimnames[i])
+            {
+                if(r_typeof(dimnames[i]) != r_type_vec_symbol)
+                    vm_error(vm, "dimnames=", "invalid argument type.");
+                if(rvec_len(dimnames[i]) != a->x->shape[i])
+                    vm_error(vm, "dimnames=", "invalid argument length.");
+            }
+        }
+    }
+    a->x->dimnames = copy_dimnames(vm, a->dimnames);
+    builtin_return(r, rvector_t *, a->dimnames);
+}
+
+static void builtin_fetch(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        argbits_t argbits;
+        robject_t *obj;
+        robject_t *idx; // optional
+        rvector_t *rest; // optional
+    } end_args(args, a);
+    robject_t *res;
+
+    // not an R-ism: nil[anything] is an error
+    if(!a->obj)
+        vm_error(vm, "[", "invalid subscript of nil.");
+    if(!a->rest)
+        res = vec_fetch(vm, a->obj, a->idx);
+    else
+        res = arr_fetch(vm, a->obj, a->idx,
+                        rvec_elts(a->rest), rvec_len(a->rest));
+    builtin_return(r, robject_t *, res);
+}
+
+static void builtin_store(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        argbits_t argbits;
+        robject_t *obj;
+        robject_t *val;
+        robject_t *idx; // optional
+        rvector_t *rest; // optional
+    } end_args(args, a);
+    robject_t *res;
+
+    // R-ism: nil[anything] = anything is an error
+    if(!a->obj)
+        vm_error(vm, "[=", "invalid assignment to nil.");
+    if(!a->rest)
+        res = vec_store(vm, a->obj, a->val, a->idx);
+    else
+        res = arr_store(vm, a->obj, a->val, a->idx,
+                        rvec_elts(a->rest), rvec_len(a->rest));
+    builtin_return(r, robject_t *, res);
+}
+
+// XXX this is not very useful.
+static void builtin_vec_cat(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rvector_t *rest;
+    } end_args(args, a);
+    int len = 0;
+    rvector_t *rest = a->rest;
+    rtype_t *etyp = NULL;
+
+    if(!rest)
+    {
+        builtin_return(r, robject_t *, NULL);
+        return;
+    }
+
+    rvector_t **vecs = rvec_elts(rest);
+    int nrest = rvec_len(rest);
+
+    for(int i=0; i < nrest; i++)
+    {
+        if(!rtype_is_vector(r_typeof(vecs[i])))
+            vm_error(vm, "cat", "can't cat things which aren't vectors.");
+        if(i == 0)
+            etyp = elt_type(&vecs[i]->buf);
+        else if(etyp != elt_type(&vecs[i]->buf))
+            vm_error(vm, "cat", "all arguments must be of the same type.");
+        len += rvec_len(vecs[i]);
+    }
+
+    rvector_t *dest = safe_vec_create(vm, etyp, len);
+    uint8_t *destptr = rvec_elts(dest);
+
+    for(int i=0; i < nrest; i++)
+    {
+        int alen = rvec_len(vecs[i]);
+        size_t sz = alen * rtype_eltsz(etyp);
+
+        memcpy(destptr, rvec_elts(vecs[i]), sz);
+        destptr += sz;
+    }
+
+    // XXX concatenate names
+    builtin_return(r, rvector_t *, dest);
+    vm_release(vm, 2);
+}
+
+static void builtin_runif(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        argbits_t argbits;
+        rint_t n;
+        rdouble_t min, max; // both optional
+    } end_args(args, a);
+    argbits_t ab = a->argbits; // TEMP
+
+    if(isnan(a->min) || isnan(a->max) || a->n < 0
+       || a->n == rint_na || a->max < a->min)
+        vm_error(vm, "runif", "invalid argument.");
+
+    rvector_t *res = safe_vec_create(vm, r_type_double, a->n);
+    rdouble_t *vals = rvec_elts(res);
+
+    if(missingp(ab, 1))
+        a->min = 0;
+    if(missingp(ab, 2))
+        a->max = 1;
+
+    rdouble_t span = a->max - a->min;
+    for(int i=0; i<a->n; i++)
+        vals[i] = unif_rand() * span + a->min;
+    builtin_return(r, rvector_t *, res);
+    vm_release(vm, 2);
+}
+
+static void builtin_rnorm(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        argbits_t argbits;
+        rint_t n;
+        rdouble_t mu, sigma; // both optional
+    } end_args(args, a);
+    argbits_t ab = a->argbits; // TEMP
+
+    if(a->n < 0 || a->n == rint_na)
+        vm_error(vm, "rnorm", "invalid argument.");
+
+    rvector_t *res = safe_vec_create(vm, r_type_double, a->n);
+    rdouble_t *vals = rvec_elts(res);
+
+    if(missingp(ab, 1))
+        a->mu = 0;
+    if(missingp(ab, 2))
+        a->sigma = 1;
+    for(int i=0; i<a->n; i++)
+        vals[i] = rnorm(a->mu, a->sigma);
+    builtin_return(r, rvector_t *, res);
+    vm_release(vm, 2);
+}
+
+
+static void builtin_range(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        rint_t from, to;
+    } end_args(args, a);
+
+    if(a->from == rint_na || a->to == rint_na)
+        vm_error(vm, ":", "invalid argument.");
+
+    int step = (a->from <= a->to) ? 1 : -1;
+    int len = abs(a->to - a->from) + 1;
+    rvector_t *res = safe_vec_create(vm, r_type_int, len);
+    rint_t *vals = rvec_elts(res);
+
+    for(int i = a->from; i != a->to + step; i += step, vals++)
+        *vals = i;
+
+    builtin_return(r, rvector_t *, res);
+    vm_release(vm, 2);
+}
+
+static rarray_t *typed_arr_init(vm_ctx_t *vm, rtype_t *etyp, int rank,
+                                int *dims, robject_t *val)
+{
+    rarray_t *arr = safe_arr_create(vm, etyp, rank, dims);
+    rtype_t *typ = r_typeof(val);
+
+    // all-bits-zero by default
+    if(!val)
+        memset(rvec_elts(arr), 0, rvec_len(arr) * rtype_eltsz(etyp));
+    // vector value and its elements are the right type; recycle along length if needed
+    else if(rtype_is_container(typ) && typ->elt == etyp)
+        fill_buf_from(&arr->buf, (rbuf_t *)val);
+    // single value, initialise all cells with it
+    else if(!fill_buf(&arr->buf, val))
+        vm_error(vm, "array", "invalid argument type.");
+    vm_release(vm, 2);
+    return arr;
+}
+
+static void builtin_array(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        argbits_t argbits;
+        rtype_t *etyp;
+        rvector_t *dims;
+        robject_t *val; // optional
+    } end_args(args, a);
+    argbits_t ab = a->argbits; // TEMP
+
+    if(!a->dims || !a->etyp)
+        vm_error(vm, "array", "invalid argument.");
+
+    // rank is length(dims)
+    int rank = rvec_len(a->dims),
+        *dims = rvec_elts(a->dims);
+
+    // elements must be nonnegative and not NA
+    for(int i=0; i < rank; i++)
+        if(dims[i] < 0 || dims[i] == rint_na)
+            vm_error(vm, "array", "invalid dimension.");
+
+    rarray_t *res = typed_arr_init(vm, a->etyp, rank, dims,
+                                   !missingp(ab, 2) ? a->val : NULL);
+    builtin_return(r, rarray_t *, res);
+}
+
+static void builtin_shape(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *x;
+    } end_args(args, a);
+
+    rtype_t *type = r_typeof(a->x);
+    rvector_t *res = NULL;
+
+    if(rtype_is_array(type))
+    {
+        rarray_t *arr = (rarray_t *)a->x;
+
+        res = safe_vec_create(vm, r_type_int, arr->rank);
+        memcpy(rvec_elts(res), arr->shape, arr->rank * sizeof(int));
+        vm_release(vm, 2);
+    }
+    else
+    {
+        int len;
+
+        if(rtype_is_vector(type))
+            len = ((rbuf_t *)a->x)->length;
+        else
+            len = 1;
+        res = safe_vec_create(vm, r_type_int, 1);
+        *(int *)rvec_elts(res) = len;
+        vm_release(vm, 2);
+    }
+    builtin_return(r, rvector_t*, res);
+}
+
+static void builtin_rank(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *x;
+    } end_args(args, a);
+
+    rtype_t *type = r_typeof(a->x);
+    rint_t rank;
+
+    if(rtype_is_array(type))
+        rank = ((rarray_t *)a->x)->rank;
+    else if(rtype_is_vector(type))
+        rank = 1;
+    else
+        rank = 0;
+    builtin_return(r, rint_t, rank);
+}
+
+
+const static builtin_init_arg_t binary_args[] =
+    init_args({ "x", &r_type_object },
+              { "y", &r_type_object });
+const static builtin_init_arg_t atan2_args[] =
+    init_args({ "y", &r_type_object },
+              { "x", &r_type_object });
+const static builtin_init_arg_t unary_args[] =
+    init_args({ "x", &r_type_object });
+const static builtin_init_arg_t create_args[] =
+    init_args({ "len", &r_type_int, false },
+              { "val", &r_type_object, true });
+
+const extern builtin_ops_t binary_ops, unary_ops, binary_boolean_ops,
+    unary_boolean_ops, conv_ops, reduce_ops, fetch_ops, store_ops,
+    vector_ops, array_ops, pure_ops;
+
+#define init_arith(ft, p, c) \
+    &(arith_builtin_t) { .fntab = ft, .is_pred = p, .op = c }
+
+#define _defarith(n, f, a, o, ft, p, c) \
+    { init_builtin(n, f, &r_type_object, a), \
+      .cbi = init_cbi(o, n, init_arith(ft, p, c)) }
+
+#define defoper(name, op, pred, opcode, n, k...) \
+    _defarith(name, builtin_##n##ary,  n##ary_args, &n##ary##k##_ops, \
+              PASTE2(op, _funcs), pred, opcode)
+
+// these have cbuiltins for type recovery, but don't generate VM instructions
+#define defbinary(name, op, pred) defoper(name, op, pred, 0, bin)
+#define defunary(name, op, pred) defoper(name, op, pred, 0, un)
+// these have instructions to go with them
+#define defbin_ins(name, op, pred) defoper(name, op, pred, ENUM(op), bin)
+#define defuna_ins(name, op, pred) defoper(name, op, pred, ENUM(op), un)
+// these ones are never predicates, but need a different .cbi.ops
+#define defbin_bool(name, op) defoper(name, op, false, ENUM(op, boolean), bin, _boolean)
+#define defuna_bool(name, op) defoper(name, op, false, ENUM(op, boolean), un, _boolean)
+
+// the function and the reduction operator have different names
+#define defreduce(name, op, pred) \
+    _defarith(name, builtin_reduce, unary_args, &reduce_ops, \
+              PASTE3(reduce_, op, _funcs), pred, 0)
+
+// .cbi is needed for these; the builtin_ function looks at .cbi.data to
+// know what type it was called at
+
+// converts its input to have element type t
+#define defconv(n, t) \
+    { init_builtin(n, builtin_convert, &r_type_object, unary_args), \
+      .cbi = init_cbi(&conv_ops, n, &RTYPE(t)) }
+// makes a new vector of type t
+#define defcreate(n, t) \
+    { init_builtin(n, builtin_typed_vec, &r_type_vec_##t, create_args), \
+      .cbi = init_cbi(NULL, n, &RTYPE(t)) }
+// FIXME: generate these from the m4 _ops lists
+const builtin_init_t arith_builtins[] = {
+    defbin_ins("+", add, false),
+    defbin_ins("-", sub, false),
+    defbin_ins("*", mul, false),
+    defbin_ins("/", div, false),
+
+    defbin_bool("&", and),
+    defbin_bool("|", or),
+
+    defbin_ins("==", eql, true),
+    defbin_ins("!=", neq, true),
+    defbin_ins("<", lth, true),
+    defbin_ins("<=", lte, true),
+    defbin_ins(">", gth, true),
+    defbin_ins(">=", gte, true),
+
+    defbin_ins("^", pow, false),
+    // because the arguments need to be named "y", "x"...
+    _defarith("atan2", builtin_binary,  atan2_args,
+              &binary_ops, atan2_funcs, false, 0),
+
+    defuna_bool("!", not),
+    defuna_ins("0-", neg, false),
+
+    defuna_ins("is_na", is_na, true),
+
+    defunary("sqrt", sqrt, false),
+    defunary("sin", sin, false),
+    defunary("cos", cos, false),
+    defunary("tan", tan, false),
+    defunary("asin", asin, false),
+    defunary("acos", acos, false),
+    defunary("atan", atan, false),
+    defunary("log", log, false),
+    defunary("exp", exp, false),
+    defunary("round", round, false),
+
+    defreduce("any", or, true),
+    defreduce("all", and, true),
+    defreduce("sum", add, false),
+    defreduce("prod", mul, false),
+
+    defconv("as_bool", boolean),
+    defconv("as_int", int),
+    defconv("as_double", double),
+
+    defcreate("bool", boolean),
+    defcreate("int", int),
+    defcreate("dbl", double),
+    defcreate("list", object), // slight abuse of notation
+
+    defbuiltin("as_type", builtin_coerce, &r_type_object,
+               { "x", &r_type_object },
+               { "type", &r_type_type }),
+    defbuiltin("vec", builtin_vec, &r_type_vector,
+               { "...", &r_type_vec_object, true }),
+    defcbuiltin("vector", builtin_vector, &r_type_vector,
+                &vector_ops, NULL,
+               { "etyp", &r_type_type, false },
+               { "len", &r_type_int, false },
+               { "val", &r_type_object, true }),
+    defcbuiltin("length", builtin_length, &r_type_int,
+                &pure_ops, NULL,
+               { "x", &r_type_object, false }),
+    defbuiltin("names", builtin_names_get, &r_type_vec_symbol,
+               { "x", &r_type_vector, false }),
+    defbuiltin("names=", builtin_names_set, &r_type_vec_symbol,
+               { "x", &r_type_vector, false },
+               { "names", &r_type_vec_symbol, false }),
+    defbuiltin("dimnames", builtin_dimnames_get, &r_type_vec_names,
+               { "x", &r_type_array, false }),
+    defbuiltin("dimnames=", builtin_dimnames_set, &r_type_vec_names,
+               { "x", &r_type_array, false },
+               { "dimnames", &r_type_vec_names, false }),
+    defbuiltin("cat", builtin_vec_cat, &r_type_vector,
+               { "...", &r_type_vec_object, true }),
+    defbuiltin("runif", builtin_runif, &r_type_vec_double,
+               { "n", &r_type_int, false },
+               { "min", &r_type_double, true },
+               { "max", &r_type_double, true }),
+    defbuiltin("rnorm", builtin_rnorm, &r_type_vec_double,
+               { "n", &r_type_int, false },
+               { "mu", &r_type_double, true },
+               { "sigma", &r_type_double, true }),
+    defcbuiltin("array", builtin_array, &r_type_array,
+                &array_ops, NULL,
+               { "etyp", &r_type_type, false },
+               { "dims", &r_type_vec_int, false },
+               { "val", &r_type_object, true }),
+    defbuiltin("shape", builtin_shape, &r_type_vec_int,
+               { "x", &r_type_object, false }),
+    defcbuiltin("rank", builtin_rank, &r_type_int,
+                &pure_ops, NULL,
+               { "x", &r_type_object, false }),
+    defbuiltin(":", builtin_range, &r_type_vec_int,
+               { "from", &r_type_int, false },
+               { "to", &r_type_int, false }),
+    defcbuiltin("[", builtin_fetch, &r_type_object,
+                &fetch_ops, NULL,
+               { "vec", &r_type_object, false },
+               { "i", &r_type_object, true },
+               { "...", &r_type_vec_object, true }),
+    defcbuiltin("[=", builtin_store, &r_type_object,
+                &store_ops, NULL,
+               { "vec", &r_type_object, false },
+               { "val", &r_type_object, false },
+               { "i", &r_type_object, true },
+               { "...", &r_type_vec_object, true }),
+    { }
+};
+/*@
+
+
+\section*{arith/opt\_builtins.c}
+
+%% builtin optimisation
+
+%% - some CN_CALLs of some (constant builtin) targets can have tighter return types
+%%   than their signatures suggest, because of their (ad-hoc) polymorphism
+%% - some can be folded when called on constants
+%% - these are taken care of by the transfer function, called during sccp
+%% - (and then a general transformation in the opt pass afterwards)
+
+%% - some CN_CALLs can be replaced with a specific vm instruction, instead of actually calling a function
+%% - if this replacement is made, the operands might also need special attention - in particular,
+%%   converting to a specific type. (vm doesn't have ambi-typed opcodes, so e.g. `int+double` needs a conversion)
+%% - and gen_code needs to actually generate the right opcode, of course
+
+
+%% - necessary information for the CN_BUILTIN node:
+%%   - codegen: opcode base, whether it's width or type, rtype from which to compute offset
+%%   - sccp: rbuiltin_t or builtin_opt_t, so it can call .xfer
+%%   - postpass: desired argument type[s] to coerce if needed
+%%     - because CALL applies arithmetic conversion to its arguments, so we must also.
+
+
+%% - current idea:
+%%   struct { cbuiltin_t *bi; rtype_t *optype; } builtin in cnode_t union;
+%%   - ops.trans called with TRANSFER on CALL-of-builtins and BUILTINs. cresult ignored.
+%%   - ops.trans called with TRANSFORM on CALL-of-builtins only.
+%%     this is responsible for (deciding to) call_become_builtin. returns cresult.
+%%   - *_become_* mutate in-place.
+%%   - ops.enforce called in postpass, which can use node.builtin.optype to enforce argument types
+%%   - ops.generate called by gen_code. it uses .optype to form the correct opcode
+
+==arith/opt_builtins.c*/
+#include "global.h"
+#include "ir.h"
+#include "opt.h"
+#include "vm/vm_ops.h"
+#include "gen_code.h"
+#include "arith/scalar.h"
+#include "arith/vec.h"
+#include "arith/dispatch.h"
+
+static void gen_arith(cnode_t *node)
+{
+    const arith_builtin_t *ab = node->builtin.bi->data;
+    assert(ab->op);
+    // OP.type dest, args...
+    asm_op_type(ab->op, node->builtin.optype);
+    asm_stack(loc_for(node));
+    asm_args(&node->builtin.args);
+}
+
+static void gen_generic(cnode_t *node)
+{
+    const arith_builtin_t *ab = node->builtin.bi->data;
+    assert(ab->op);
+    // OP dest, args...
+    asm_op(ab->op);
+    asm_stack(loc_for(node));
+    asm_args(&node->builtin.args);
+}
+
+#if 0
+// XXX unused!
+static void gen_width(cnode_t *node)
+{
+    assert(!"handled");
+    op_code_t op = (op_code_t)(intptr_t)node->builtin.bi->data;
+
+    // OP.width dest, obj, idx
+    asm_op_width(op, node->builtin.optype);
+    asm_stack(loc_for(node));
+    asm_args(&node->builtin.args);
+}
+#endif
+
+// arith
+static inline cresult
+fold_binary(binop_chk_t *chk, binop_fn fn, cell_t *cell, cell_t *xc, cell_t *yc)
+{
+    // constant values available?
+    if(opt.opt_constfold && fn && cell_const_obj(xc) && cell_const_obj(yc))
+    {
+        robject_t *xv = cell_const(xc), *yv = cell_const(yc);
+        rvalue_union_t val;
+        robject_t *obj;
+
+        // fold operation on constants
+        fn(&val, BOXPTR(xv), BOXPTR(yv), 1);
+        obj = c_intern(r_box(chk->typ, &val));
+        cell_set_const(cell, obj); // sets type
+        return CHANGED;
+    }
+    return SUCCESS;
+}
+
+static cresult trans_binary(opt_phase phase, cnode_t *node, cell_t *cell,
+                            const cbuiltin_t *bi, cnode_array_t *args)
+{
+    const arith_builtin_t *ab = bi->data;
+
+    if(!check_nargs(2, node, args))
+        return SUCCESS;
+
+    cell_t *xc = cell_for(aref(args, 0));
+    cell_t *yc = cell_for(aref(args, 1));
+    rtype_t *xt = cell_type(xc), *yt = cell_type(yc);
+
+    // operand types available?
+    if(!xt || !yt)
+        return SUCCESS;
+
+    binop_chk_t chk = { 0 };
+
+    // operation is valid on these types?
+    if(!check_binary(&chk, xt, yt, ab->is_pred))
+    {
+        // check_ requires precise types; this call may not be
+        // statically invalid, but we can't tell, so punt to runtime
+        return SUCCESS;
+    }
+
+    // transfer the return type if required
+    if(phase == TRANSFER)
+        cell_set_type(cell, chk.typ);
+
+    // scalars only
+    // XXX allow constant-folding on nonscalars, but never become_builtin
+    if(chk.xvec || chk.yvec)
+        return SUCCESS;
+
+    binop_fn fn = dispatch_binary(&chk, ab->fntab);
+
+    if(phase == TRANSFER)
+    {
+        // constant values available?
+        return fold_binary(&chk, fn, cell, xc, yc);
+    }
+    if(!fn) // else phase == TRANSFORM
+    {
+        c_error("operation `%s` not supported on `%s` and `%s`.",
+                bi->name, rtype_name(xt), rtype_name(yt));
+        return FAILED;
+    }
+    if(ab->op)
+    {
+        // lower the CALL if possible
+        call_become_builtin(node, bi, chk.optyp, chk.typ);
+        return CHANGED;
+    }
+    return SUCCESS;
+}
+
+static cresult trans_unary(opt_phase phase, cnode_t *node, cell_t *cell,
+                           const cbuiltin_t *bi, cnode_array_t *args)
+{
+    const arith_builtin_t *ab = bi->data;
+
+    if(!check_nargs(1, node, args))
+        return SUCCESS;
+
+    cell_t *xc = cell_for(aref(args, 0));
+    rtype_t *xt = cell_type(xc);
+
+    if(!xt)
+        return SUCCESS;
+
+    unop_chk_t chk = { 0 };
+
+    if(!check_unary(&chk, xt, ab->is_pred))
+        return SUCCESS;
+    if(phase == TRANSFER)
+        cell_set_type(cell, chk.typ);
+    if(chk.vec)
+        return SUCCESS;
+
+    unop_fn fn = dispatch_unary(&chk, ab->fntab);
+
+    if(phase == TRANSFER)
+    {
+        if(opt.opt_constfold && fn && cell_const_obj(xc))
+        {
+            robject_t *xv = cell_const(xc);
+            rvalue_union_t val;
+            robject_t *obj;
+
+            fn(&val, BOXPTR(xv), 1);
+            obj = c_intern(r_box(chk.typ, &val));
+            cell_set_const(cell, obj);
+            return CHANGED;
+        }
+        return SUCCESS;
+    }
+    if(!fn) // else phase == TRANSFORM
+    {
+        c_error("operation `%s` not supported on `%s`.",
+                bi->name, rtype_name(xt));
+        return FAILED;
+    }
+    if(ab->op)
+    {
+        assert(!chk.vec);
+        call_become_builtin(node, bi, xt, chk.typ); // operation occurs at argument type, for e.g. is_na
+        return CHANGED;
+    }
+    return SUCCESS;
+}
+
+static cresult trans_reduce(opt_phase phase, cnode_t *node, cell_t *cell,
+                            const cbuiltin_t *bi, cnode_array_t *args)
+{
+    if(!check_nargs(1, node, args))
+        return SUCCESS;
+
+    rtype_t *xt = arg_type(args, 0);
+
+    if(!xt)
+        return SUCCESS;
+
+    reduce_chk_t chk = { 0 };
+
+    if(check_reduce(&chk, xt) && phase == TRANSFER)
+        cell_set_type(cell, chk.typ);
+    return SUCCESS;
+}
+
+
+static cresult enforce_arith(cnode_t *node)
+{
+    cnode_array_t *args = &node->builtin.args;
+    cresult res = SUCCESS;
+    int i;
+
+    assert(node->builtin.optype);
+    // all args coerced to the given type
+    array_foreach(args, i)
+    {
+        cnode_t **ptr = aptr(args, i);
+        res |= enforce_decl(node, node->builtin.optype, ptr, true);
+    }
+    return res;
+}
+
+// if an alias may be created because of this answer, only scalars
+// (i.e. lowered to BUILTIN) are safe; otherwise we're fine.
+static bool arith_is_pure(cnode_t *node, bool may_alias)
+{
+    return !may_alias || node->type == CN_BUILTIN;
+}
+
+// if an alias may be created because of this answer, the answer is no
+static bool cons_is_pure(cnode_t *node, bool may_alias)
+{
+    return !may_alias;
+}
+
+const builtin_ops_t
+    binary_ops = { trans_binary, enforce_arith, gen_arith,
+                   .is_pure = arith_is_pure },
+    unary_ops = { trans_unary, enforce_arith, gen_arith,
+                  .is_pure = arith_is_pure },
+    binary_boolean_ops = { trans_binary, enforce_arith, gen_generic,
+                           .is_pure = arith_is_pure },
+    unary_boolean_ops = { trans_unary, enforce_arith, gen_generic,
+                          .is_pure = arith_is_pure },
+    reduce_ops = { trans_reduce, NULL, NULL };
+
+#if 0
+// conv, FIXME
+static cresult trans_conv(opt_phase phase, cnode_t *node, cell_t *cell,
+                          const cbuiltin_t *bi, cnode_array_t *args)
+{
+    // return become_copy(node, ...);
+    return SUCCESS;
+}
+#endif
+const builtin_ops_t conv_ops = { };
+
+// container fetch and store
+static rtype_t *trans_vec_fetch(opt_phase phase, cnode_array_t *args)
+{
+    rtype_t *vt = arg_type(args, 0), *it = arg_type(args, 1);
+
+    if(!vt || !it)
+        return NULL;
+
+    idx_chk_t chk = { 0 };
+
+    if(!check_fetch(&chk, vt, it))
+        return NULL;
+    if(phase == TRANSFER)
+        return chk.typ;
+    return (chk.kind == SINGLE) ? chk.typ : NULL;
+}
+
+static rtype_t *trans_arr_fetch(opt_phase phase, cnode_array_t *args)
+{
+    int rank = alen(args) - 1;
+    rtype_t *vt = arg_type(args, 0);
+    rtype_t **ityps = alloca(rank * sizeof(rtype_t *));
+
+    if(!vt)
+        return NULL;
+    for(int i=0; i<rank; i++)
+    {
+        ityps[i] = arg_type(args, i+1);
+        if(!ityps[i])
+            return NULL;
+    }
+
+    arr_chk_t chk = { .kinds = alloca(rank * sizeof(idx_kind)) };
+
+    if(!check_arr_fetch(&chk, vt, ityps, rank))
+        return NULL;
+    if(phase == TRANSFER)
+        return chk.typ;
+    return (rank == 2 && chk.rank == 0) ? chk.typ : NULL;
+}
+
+static cresult trans_fetch(opt_phase phase, cnode_t *node, cell_t *cell,
+                           const cbuiltin_t *bi, cnode_array_t *args)
+{
+    if(!check_arg_names(node) || alen(args) < 2)
+        return SUCCESS;
+
+    rtype_t *typ = (alen(args) == 2)
+        ? trans_vec_fetch(phase, args)
+        : trans_arr_fetch(phase, args);
+
+    if(typ)
+    {
+        if(phase == TRANSFER)
+            cell_set_type(cell, typ);
+        else //(phase == TRANSFORM)
+            call_become_builtin(node, bi, typ, typ);
+        return CHANGED;
+    }
+    return SUCCESS;
+}
+
+static cresult enforce_fetch(cnode_t *node)
+{
+#ifndef NDEBUG
+    rtype_t *type = node->builtin.optype;
+    cnode_array_t *args = &node->builtin.args;
+
+    assert(type);
+    assert(cnode_compat(aref(args, 1), r_type_int));
+    assert(alen(args) != 3 || cnode_compat(aref(args, 2), r_type_int));
+    assert(cnode_compat(aref(args, 0), rvec_type_create(type)) ||
+        cnode_compat(aref(args, 0), rarr_type_create(type)));
+#endif
+    return SUCCESS;
+}
+
+static void gen_fetch(cnode_t *node)
+{
+    bool is_mat = (alen(&node->builtin.args) == 3);
+    // OP.type(.uni) dest, obj, idx[, idx]
+    if(rtype_is_scalar(node->builtin.optype))
+        asm_op_type(is_mat ? OP_getel2 : OP_getelt, node->builtin.optype);
+    else
+        asm_op(is_mat ? OP_getel2ptr : OP_geteltptr);
+    asm_stack(loc_for(node));
+    asm_args(&node->builtin.args);
+}
+
+static rtype_t *trans_vec_store(opt_phase phase, cnode_array_t *args)
+{
+    rtype_t *vt = arg_type(args, 0);
+    rtype_t *rt = arg_type(args, 1);
+    rtype_t *it = arg_type(args, 2); // not an error; see `[=` signature
+
+    if(!vt || !rt || !it)
+        return NULL;
+
+    idx_chk_t chk = { 0 };
+
+    if(!check_store(&chk, vt, it, rt))
+    {
+        //cnode_t *v = aref(args, 0);
+        //...
+        return NULL;
+    }
+
+    // `[=` passes through the replacement value, just like `=`
+    if(phase == TRANSFER)
+        return rt;
+    // optype is the container element type; we will convert arg1 if necessary
+    return (chk.kind == SINGLE) ? vt->elt : NULL;
+}
+
+static rtype_t *trans_arr_store(opt_phase phase, cnode_array_t *args)
+{
+    int rank = alen(args) - 2;
+    rtype_t *vt = arg_type(args, 0);
+    rtype_t *rt = arg_type(args, 1);
+    rtype_t **ityps = alloca(rank * sizeof(rtype_t *));
+
+    if(!vt || !rt)
+        return NULL;
+
+    for(int i=0; i<rank; i++)
+    {
+        ityps[i] = arg_type(args, i+2);
+        if(!ityps[i])
+            return NULL;
+    }
+
+    arr_chk_t chk = { .kinds = alloca(rank * sizeof(idx_kind)) };
+
+    if(!check_arr_store(&chk, vt, ityps, rank, rt))
+        return NULL;
+    if(phase == TRANSFER)
+        return rt;
+    return (rank == 2 && chk.rank == 0) ? vt->elt : NULL;
+}
+
+static cresult trans_store(opt_phase phase, cnode_t *node, cell_t *cell,
+                           const cbuiltin_t *bi, cnode_array_t *args)
+{
+    if(!check_arg_names(node) || alen(args) < 3)
+        return SUCCESS;
+
+    rtype_t *typ = (alen(args) == 3)
+        ? trans_vec_store(phase, args)
+        : trans_arr_store(phase, args);
+
+    if(typ)
+    {
+        if(phase == TRANSFER)
+        {
+            cell_set_type(cell, typ);
+        }
+        else // phase == TRANSFORM
+        {
+            // the opcode for this builtin does not need a new location
+            // allocated, so replace us with the replacement value in
+            // our users
+            cnode_replace_in_users(node, aref(args, 1));
+            // node.decl type not actually used
+            call_become_builtin(node, bi, typ, typ);
+        }
+        return CHANGED;
+    }
+    return SUCCESS;
+}
+
+static cresult enforce_store(cnode_t *node)
+{
+    cnode_array_t *args = &node->builtin.args;
+
+    assert(node->builtin.optype);
+    assert(!cnode_is_used(node));
+    assert(cnode_compat(aref(args, 2), r_type_int));
+    assert(alen(args) != 4 || cnode_compat(aref(args, 3), r_type_int));
+    // convert replacement value to optype
+    return enforce_decl(node, node->builtin.optype, aptr(args,1), true);
+}
+
+static void gen_store(cnode_t *node)
+{
+    bool is_mat = (alen(&node->builtin.args) == 4);
+    // OP.width obj, rpl, idx[, idx]
+    asm_op_width(is_mat ? OP_setel2 : OP_setelt, node->builtin.optype);
+    asm_args(&node->builtin.args);
+}
+
+const builtin_ops_t fetch_ops = { trans_fetch, enforce_fetch, gen_fetch,
+                                  .is_pure = cons_is_pure };
+const builtin_ops_t store_ops = { trans_store, enforce_store, gen_store,
+                                  .is_void = true };
+
+// container constructors
+// FIXME just have the one, and determine what exactly to do based on
+// bi->ops or whatever
+static cresult trans_vector(opt_phase phase, cnode_t *node, cell_t *cell,
+                            const cbuiltin_t *bi, cnode_array_t *args)
+{
+    if(!check_arg_names(node))
+        return SUCCESS;
+    assert(alen(args) > 0);
+
+    cell_t *arg = cell_for(aref(args, 0));
+
+    if(cell_const_obj(arg) && phase == TRANSFER)
+    {
+        robject_t *etyp = cell_const(arg);
+
+        if(r_typeof(etyp) == r_type_type)
+        {
+            cell_set_type(cell, rvec_type_create((rtype_t *)etyp));
+            // although doesn't actually matter, as we are not transforming
+            return CHANGED;
+        }
+    }
+    return SUCCESS;
+}
+
+static cresult trans_array(opt_phase phase, cnode_t *node, cell_t *cell,
+                           const cbuiltin_t *bi, cnode_array_t *args)
+{
+    if(!check_arg_names(node))
+        return SUCCESS;
+    assert(alen(args) > 0);
+
+    cell_t *arg = cell_for(aref(args, 0));
+
+    if(cell_const_obj(arg) && phase == TRANSFER)
+    {
+        robject_t *etyp = cell_const(arg);
+
+        if(r_typeof(etyp) == r_type_type)
+        {
+            cell_set_type(cell, rarr_type_create((rtype_t *)etyp));
+            return CHANGED; // although doesn't really matter, as we are not transforming
+        }
+    }
+    return SUCCESS;
+}
+
+const builtin_ops_t vector_ops = { trans_vector, NULL, NULL, .is_pure = cons_is_pure };
+const builtin_ops_t array_ops = { trans_array, NULL, NULL, .is_pure = cons_is_pure };
+/*@
+
+% */

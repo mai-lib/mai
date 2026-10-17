@@ -1,0 +1,593 @@
+/*@
+\chapter{Scalars}
+\label{scalar}
+
+The runtime provides three \textit{scalar} types -- booleans, integers,
+and double-precision floating point reals. Values of these types may be
+stored in reference objects called \textit{boxes}, in vectors and
+arrays. They correspond to data types provided by the machine, and can
+be operated upon directly by code which has been specialised by the
+compiler.
+
+==rt/scalar.c*/
+//includes//
+//booleans//
+//ints//
+//doubles//
+//scal_descs//
+//operations//
+//boxes//
+//rscal_install//
+//rt_install_scalar_types//
+/*@
+
+
+\section{Scalar Types}
+\label{scalar:type}
+
+An instance of a [[scaldesc_t]] structure describes a scalar type. The
+[[.size]] field contains the size of a single machine scalar of that
+type, in bytes. The [[.width]] callback returns the number of characters
+a value will require when printed; this is passed to [[.print]] to
+correctly format the output. [[.printsz]] bytes of storage will be
+allocated beforehand, in which extra formatting information may be
+stored.
+
+The type will be installed in the global environment as [[.name]].
+
+==scaldesc_t*/
+typedef struct scaldesc
+{
+    char *name;
+    size_t size;
+    int (*width)(const void *, int, void *);
+    void (*print)(FILE *, const void *, int, void *);
+    size_t printsz;
+} scaldesc_t;
+/*@
+
+Code generation and certain builtin functions have similar (but not
+identical) behaviour for values of scalar type (\autoref{vm:ops}). Their
+differences are parameterised by tables indexed by [[scalar_code]].
+
+==scalar_code*/
+typedef enum
+{
+    SC_BOOLEAN = 0,
+    SC_INT,
+    SC_DOUBLE,
+    SC_MAX
+} scalar_code;
+/*@ %
+
+The statically initialised [[scal_descs]] array contains [[scaldesc_t]]s
+for all scalar types; only [[double]]s require extra storage during
+printing, of type [[dwidth_t]].
+
+==scal_descs*/
+const scaldesc_t scal_descs[] = {
+    [SC_BOOLEAN] = {
+        .name = "boolean",
+        .size = sizeof(rboolean_t),
+        .print = boolean_print,
+        .width = boolean_width,
+    },
+    [SC_INT] = {
+        .name = "int",
+        .size = sizeof(rint_t),
+        .print = int_print,
+        .width = int_width,
+    },
+    [SC_DOUBLE] = {
+        .name = "double",
+        .size = sizeof(rdouble_t),
+        .print = double_print,
+        .width = double_width,
+        .printsz = sizeof(dwidth_t)
+    }
+};
+/*@ %
+
+A type of [[SCALAR]] kind will point its [[.scal]] field to an element
+of this array. Since these are in [[scalar_code]] order, [[rscal_code]]
+can compute a type's code by pointer subtraction.
+
+==rscal_code*/
+static inline scalar_code rscal_code(const rtype_t *typ)
+    { return (scalar_code)(typ->scal - scal_descs); }
+/*@ %
+
+The [[.size]] field has an accessor for convenience.
+
+==rscal_size*/
+static inline size_t rscal_size(const rtype_t *typ)
+    { return typ->scal->size; }
+/*@ %
+
+Scalars can undergo ``arithmetic promotion''. A scalar value of a type
+with a lower [[scal_code]] may be implicitly converted to a type with a
+higher code, if necessary. [[rscal_promote]] is defined on types, and
+returns the greater of its two arguments in code order (assuming they
+are both [[SCALAR]]s.)
+
+==rscal_promote*/
+static inline rtype_t *rscal_promote(rtype_t *xt, rtype_t *yt)
+    { return (rscal_code(xt) > rscal_code(yt)) ? xt : yt; }
+/*@ %
+
+
+\subsection{Boxes}
+\label{scalar:box}
+
+Where a scalar value is to be manipulated by code that expects a
+reference object, it will be \textit{boxed} -- stored into one freshly
+allocated for the purpose.
+
+==boxes*/
+//r_box_create//
+//r_box//
+//r_unbox//
+/*@
+
+This allocation is done by [[r_box_create]]. The box comprises an
+[[robject_t]] header followed by one scalar of the given type.
+
+==r_box_create*/
+robject_t *r_box_create(rtype_t *typ)
+{
+    assert(rtype_is_scalar(typ));
+    return gc_alloc(typ, sizeof(robject_t) + rscal_size(typ));
+}
+/*@ %
+
+The [[BOXPTR]] macro returns a pointer to the contents of a box. The
+accessor macro [[UNBOX]] can be used to access (fetch or store) the
+value stored there, if its type is known.
+
+==box accessors*/
+#define UNBOX(typ, box) *((typ *)BOXPTR(box))
+#define BOXPTR(box) ((uint8_t *)(box) + sizeof(robject_t))
+/*@
+
+Otherwise, the functions [[r_box]] and [[r_unbox]] may be used. The
+former creates a new box, into which it copies the given value.
+
+==r_box*/
+robject_t *r_box(rtype_t *typ, const void *value)
+{
+    robject_t *box = r_box_create(typ);
+    memcpy(BOXPTR(box), value, rscal_size(typ));
+    return box;
+}
+/*@ %
+
+The latter copies the value contained in the given box to a destination
+address in memory (probably a stack slot, vector/array element, or
+[[rvalue_union_t]].)
+
+==r_unbox*/
+void r_unbox(void *dest, robject_t *src)
+{
+    rtype_t *typ = r_typeof(src);
+    assert(rtype_is_scalar(typ));
+    memcpy(dest, BOXPTR(src), rscal_size(typ));
+}
+/*@ %
+
+
+\subsection{Operations}
+\label{scalar:ops}
+
+==operations*/
+//rscal_print//
+//rscal_hash//
+//rscal_equal//
+//scal_ops//
+/*@
+
+Scalars of different types have different printed representations, so
+[[rscal_print]] dispatches to the type's [[scal.print]] callback.
+
+This takes the destination [[FILE *]] and (a pointer to) the value
+itself, but also the desired width of the output in characters; which
+allows us to print, for example, the contents of a vector or array with
+all elements having equal width.
+
+The [[scal.width]] callback returns either the width of the given value
+or the previous width specification, whichever is larger. (there are no
+previous values here, so we pass zero.)
+
+==rscal_print*/
+static void rscal_print(FILE *fp, const void *ptr)
+{
+    rtype_t *typ = r_typeof(ptr);
+    void *data = scalprint_init(typ->scal);
+    int width = typ->scal->width(BOXPTR(ptr), 0, data);
+
+    typ->scal->print(fp, BOXPTR(ptr), width, data);
+}
+/*@ %
+
+If more than a single [[int]] is needed to store a type's width
+specification, [[scal.printsz]] will be nonzero. [[scalprint_init]] will
+allocate this amount of memory from the stack; it can then be passed
+through [[scal.width]] to [[scal.print]].
+
+==scalprint_init*/
+#define scalprint_init(scal) memset(alloca(scal->printsz), 0, scal->printsz)
+/*@ %
+
+The hash of a scalar value is the hash of its representation in memory
+and the hash of its type.
+
+==rscal_hash*/
+static uint32_t rscal_hash(const void *ptr)
+{
+    rtype_t *typ = r_typeof(ptr);
+    return hash_code_seed(BOXPTR(ptr), rscal_size(typ), r_hash(typ));
+}
+/*@ %
+
+%% (i.e. the [[equal]] builtin)
+Equality is also defined on the value's representation, and returns a
+binary result. This is used mainly by the system -- arithmetic [[==]]
+takes [[NA]] and [[NaN]] semantics into account, and can also return
+[[NA]] (\autoref{arith}).
+
+==rscal_equal*/
+static bool rscal_equal(const void *x, const void *y)
+{
+    rtype_t *typ = r_typeof(x);
+    return !memcmp(BOXPTR(x), BOXPTR(y), rscal_size(typ));
+}
+/*@ %
+
+Scalars (unsurprisingly) don't refer to other objects, so don't require
+[[ops.gc]] or [[ops.free]] callbacks.
+
+==scal_ops*/
+static const typeops_t scal_ops = {
+    .hash = rscal_hash,
+    .equal = rscal_equal,
+    .print = rscal_print
+};
+/*@ %
+
+
+\section{Booleans}
+
+==booleans*/
+//boolean_width//
+//boolean_print//
+/*@
+
+A [[boolean]] scalar can take on one of three values -- [[true]],
+[[false]] or [[NA]]. It's stored in a byte, since the underlying machine
+has byte-addressable memory (vectors or arrays of booleans admit a
+packed bit representation, but this optimisation has not been done.)
+
+The [[if]] expression expects its predicate to evaluate to a non-[[NA]]
+boolean.
+
+The [[NA]] marker for this type has a representation of all-bits-one,
+but could be any other distinct value.
+
+==rboolean_na*/
+static const rboolean_t rboolean_na = ~0;
+/*@
+
+The printed representation of a boolean is either ``[[true]]'',
+``[[false]]'' or ``[[NA]]''.
+
+==boolean_width*/
+static int boolean_width(const void *ptr, int width, void *data)
+{
+    rboolean_t v = *(rboolean_t *)ptr;
+    int w = (v == rboolean_na) ? 2 : 5-v;
+    return max(width, w);
+}
+/*@ %
+
+The output string is right-justified (padded with spaces) in a field of
+the given [[width]].
+
+==boolean_print*/
+static void boolean_print(FILE *fp, const void *ptr, int width, void *data)
+{
+    rboolean_t v = *(rboolean_t *)ptr;
+    if(v == rboolean_na)
+        fprintf(fp, "%*s", width, "NA");
+    else
+        fprintf(fp, "%*s", width, v ? "true" : "false");
+}
+/*@ %
+
+
+\section{Integers}
+
+The [[integer]] scalar type is the machine integer type, except the
+minimum representable value is taken as the [[NA]] marker. It is 32 bits
+in size (under the ILP-32 and LP-64 data models.)
+%cite ...?
+%%this is technically the first time we mention of data model, so probably needs it
+
+==ints*/
+//int_width//
+//int_print//
+/*@
+
+==rint_na*/
+static const rint_t rint_na = INT_MIN,
+    rint_min = INT_MIN+1,
+    rint_max = INT_MAX;
+/*@
+
+Computing the width of a non-[[NA]] integer is a matter of accounting
+for the optional leading negative sign, then counting the decimal digits
+in the absolute value. An integer [[NA]] also prints as ``[[NA]]''.
+
+==int_width*/
+static int int_width(const void *ptr, int width, void *data)
+{
+    rint_t v = *(rint_t *)ptr;
+    int w;
+    if(v == rint_na)
+        w = 2;
+    else
+        w = (v < 0) + floor(log10(abs(v))) + 1;
+    return max(width, w);
+}
+/*@ %
+
+As with booleans, the output is right-justified in its field.
+
+==int_print*/
+static void int_print(FILE *fp, const void *ptr, int width, void *data)
+{
+    rint_t v = *(rint_t *)ptr;
+    if(v == rint_na)
+        fprintf(fp, "%*s", width, "NA");
+    else
+        fprintf(fp, "%*d", width, v);
+}
+/*@ %
+
+
+\section{Doubles}
+
+The [[double]] scalar type is the machine double-precision
+floating-point type. In IEC 60559 format, it's always 64 bits in size.
+%cite IEC 60559
+
+We don't make use of floating-point exceptions; all NaNs are quiet.
+
+==doubles*/
+//is_na//
+//dwidth_t//
+//double_width//
+//double_print//
+/*@
+
+Since there are a number of representations reserved as NaNs, we take
+one for our [[NA]] marker.
+
+==rdouble_na*/
+static const rdouble_t rdouble_na = __builtin_nan("0xdeadbeef"),
+    rdouble_min = DBL_MIN,
+    rdouble_max = DBL_MAX;
+/*@
+
+[[is_na]] checks for this value with bitwise equality, as comparisons
+between reals are ordered (and would always return [[false]].)
+
+==is_na*/
+static inline bool is_na(rdouble_t val)
+{
+    const uint64_t *pval = (uint64_t *)&val, *pna = (uint64_t *)&rdouble_na;
+    return *pval == *pna;
+}
+/*@ %
+
+When computing the printed width of a value of [[double]] scalar type, a
+preallocated [[dwidth_t]] structure is used to track the number of
+digits before and after the decimal point.
+
+==dwidth_t*/
+typedef struct
+{
+    unsigned short dec, prec;
+} dwidth_t;
+/*@ %
+
+The algorithm is a simplified version of that used by R, implemented by
+the functions [[scientific]] and [[formatReal]]
+\citep[src/main/format.c]{rprojold}.
+
+==double_width*/
+static int double_width(const void *ptr, int width, void *data)
+{
+    rdouble_t val = *(rdouble_t *)ptr;
+    dwidth_t *dwidth = data;
+    int dec = 0, prec = 0;
+    //compute width//
+    //update width//
+}
+/*@ %
+
+[[NA]], [[NaN]]s and [[Inf]]inities have fixed-width string
+representations.
+
+==compute width*/
+if(is_na(val))
+    return max(width, 2);
+else if(!isfinite(val))
+    return max(width, 3 + (signbit(val) != 0));
+else
+{
+    //negative//
+    //non-fractional digits//
+    //shift and round//
+    //fractional digits//
+    //finish//
+}
+/*@
+
+The optional leading negative sign is accounted for. To ensure correct
+rounding in the following code, we take the absolute value of the input
+[[val]].
+
+==negative*/
+dec = (signbit(val) != 0);
+val = fabs(val);
+/*@
+
+The number $10^n$ (for $n \geq 0$) prints with $n+1$ digits. If the
+input is larger than one, taking the logarithm base 10 and rounding down
+gives us $n$. After the addition, [[dec]] contains the number of digits
+before the decimal point. Subtracting the integral part of [[val]]
+leaves the fractional part, upon which we continue to operate.
+%% XXX use modf instead?
+%% val = modf(val, &whole);
+
+==non-fractional digits*/
+if(val > 1.0)
+  dec += floor(log10(val));
+dec++;
+val -= floor(val);
+/*@
+
+The option [[.print_digits]] allows the user to specify the maximum
+number of digits they want printed after the decimal point. Dividing by
+$10^-n$ shifts the decimal point right by $n$ digits. Rounding [[val]]
+to a whole number then discards anything beyond those digits which the
+user requested.
+
+==shift and round*/
+val /= exp10(-opt.print_digits);
+val = nearbyint(val);
+/*@
+
+We don't want to waste output on trailing zeros. Counting digits down
+from the maximum, we shift the decimal point left until a fractional
+part is found (or we run out of digits). Undoing the last decrement then
+leaves [[prec]] containing the number of digits to print after the
+decimal point.
+
+==fractional digits*/
+for(prec = opt.print_digits;
+    prec >= 0 && val == floor(val);
+    prec--, val /= 10);
+prec++;
+/*@
+
+To distinguish [[double]]s from [[int]]s, at least one fractional digit
+is always printed.
+
+==finish*/
+prec = max(prec, 1);
+//printf("= dec %d, prec %d\n", dec, prec);
+/*@
+
+The two counts are accumulated separately. The total width of the field
+is their sum (plus one for the decimal point.)
+
+==update width*/
+dwidth->dec = max(dwidth->dec, dec);
+dwidth->prec = max(dwidth->prec, prec);
+return max(width, dwidth->dec + dwidth->prec + 1);
+/*@
+
+[[NA]] has the same printed representation as for the other scalar
+types. All other values are right-justified in [[width]] columns, with
+precision [[dwidth.prec]].
+
+==double_print*/
+static void double_print(FILE *fp, const void *ptr, int width, void *data)
+{
+    rdouble_t v = *(rdouble_t *)ptr;
+    dwidth_t *dwidth = data;
+
+    assert(dwidth);
+    if(is_na(v))
+        fprintf(fp, "%*s", width, "NA");
+    else
+        fprintf(fp, "%*.*f", width, dwidth->prec, v);
+}
+/*@ %
+
+
+\section{Initialisation}
+
+The convenience function [[rtype_scal_init]] creates and installs a type
+of [[SCALAR]] kind from the specified scalar descriptor.
+
+==rscal_install*/
+static rtype_t *rtype_scal_init(scalar_code code)
+{
+    const scaldesc_t *scal = &scal_descs[code];
+    rtype_t *typ = rtype_create(RT_SCALAR, (void *)scal,
+                                &scal_ops, scal->name);
+    rtype_install(typ, scal->name);
+    return typ;
+}
+/*@ %
+
+[[rt_install_scalar_types]] is called during runtime initialisation, and
+also defines the boolean constants [[true]] and [[false]], and a double
+constant [[Inf]]. [[NA]] is defined as a boolean, since it can be
+promoted to any type higher in the order as necessary.
+
+==rt_install_scalar_types*/
+rtype_t *r_type_int, *r_type_double, *r_type_boolean;
+void rt_install_scalar_types()
+{
+    r_type_double = rtype_scal_init(SC_DOUBLE);
+    r_type_int = rtype_scal_init(SC_INT);
+    r_type_boolean = rtype_scal_init(SC_BOOLEAN);
+
+    r_defscalar("true", r_type_boolean,
+                (rvalue_union_t) { .boolean = true } );
+    r_defscalar("false", r_type_boolean,
+                (rvalue_union_t) { .boolean = false } );
+    r_defscalar("NA", r_type_boolean,
+                (rvalue_union_t) { .boolean = rboolean_na } );
+    r_defscalar("Inf", r_type_double,
+                (rvalue_union_t) { .dfloat = HUGE_VAL } );
+}
+/*@ %
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+/*@ %
+
+==rt/scalar.h*/
+//scalar_code//
+//scaldesc_t//
+//box accessors//
+//rint_na//
+//rdouble_na//
+//rboolean_na//
+//externs//
+//prototypes//
+//rscal_code//
+//rscal_size//
+//rscal_promote//
+//scalprint_init//
+/*@
+
+==externs*/
+extern rtype_t *r_type_int, *r_type_double, *r_type_boolean;
+extern const scaldesc_t scal_descs[];
+/*@ %
+
+==prototypes*/
+robject_t *r_box_create(rtype_t *typ);
+robject_t *r_box(rtype_t *typ, const void *value);
+void r_unbox(void *dest, robject_t *src);
+void rt_install_scalar_types();
+/*@ %
+
+%*/

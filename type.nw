@@ -1,0 +1,836 @@
+/*%@
+\chapter{Types}
+\label{type}
+
+Every object belongs to a \textit{type}. This describes its layout in
+memory, and determines the behaviour of the functions to which it may be
+passed.
+%cite strachey ad-hoc polymorphism??
+
+
+==rt/type.c*/
+//includes//
+//types//
+//subtyping//
+//creation//
+//constructors//
+//rt_bootstrap//
+/*@
+
+[[rtype_t]]s are referred to at run-time by objects, and at compile-time
+by expressions and variables as they are declared by the user or
+recovered by the compiler.
+
+
+\section{Types and Kinds}
+
+A type is an object, so it begins with an included [[robject_t]]
+structure. Its [[.hash]] is precomputed, like a symbol's.
+
+The callbacks in a type's [[.ops]] implement the behaviour of the
+associated runtime functions when they are invoked on an object of the
+given type.
+
+The [[.name]] field contains a printable representation of the type --
+for some kinds of type this will be lazily initialised, and may be
+[[NULL]].
+
+==rtype_t*/
+typedef struct funsig funsig_t;
+typedef struct scaldesc scaldesc_t;
+typedef struct rtype
+{
+    robject_t base;
+    type_kind kind;
+    uint32_t hash;
+    const typeops_t *ops;
+    char *name;
+    union
+    {
+        void *data;
+        funsig_t *sig;
+        const scaldesc_t *scal;
+        struct rtype *elt;
+        const consdesc_t *cons;
+    };
+} rtype_t;
+/*@
+
+A type might belong to a family of types which are related. These
+families are called \textit{kinds} for disambiguation, and the kind of a
+type is recorded in its [[.kind]] field.
+
+==type_kind*/
+typedef enum
+{
+    RT_OBJECT, RT_SCALAR, RT_TYPECONS,
+    RT_CALLABLE, RT_VECTOR, RT_ARRAY, RT_CELL,
+} type_kind;
+/*@
+
+\begin{description}
+\item [[RT_OBJECT]] (\autoref{rt:obj}): This kind of type is not related
+  to any other in any special way. This is the case for [[type]],
+  [[compiled]], [[symbol]], [[string]], and [[nil]].
+\item [[RT_SCALAR]] (\autoref{scalar}): The machine scalar types
+  [[double]], [[int]] and [[boolean]] are of this kind. Values of these
+  types may be unboxed in code specialised to operate on them, or
+  encapsulated in boxes to be treated as reference objects. The
+  [[.scal]] field points to a structure describing the specific scalar
+  type.
+\item [[RT_TYPECONS]] (\autoref{type:cons}): This kind of type is a
+  ``constructor'' and, when given arguments in a declaration, can create
+  other types which are ``instances''. [[vector]], [[array]],
+  [[function]] and [[cell]] are of this kind.
+\item [[RT_CALLABLE]] (\autoref{callable}): An object having a type of
+  this kind can be called from user code. The [[.sig]] field points to a
+  structure describing the argument and return types.
+\item [[RT_VECTOR]], [[RT_ARRAY]] (\autoref{vector}): Types created by
+  the [[vector]] and [[array]] constructors. These refer to the type of
+  elements that their objects can hold via the [[.elt]] field.
+\item [[RT_CELL]] (\autoref{rt:cell}): Types created during the cell
+  introduction phase, of the compiler. Also refers to the type of its
+  contents with [[.elt]].
+\end{description}
+
+
+\subsection{Operations}
+
+==types*/
+//r_typetab//
+//rtype_equal//
+//rtype_hash//
+//rtype_gc//
+//free_type_data//
+//rtype_free//
+//elt_print//
+//rtype_init_name//
+//rtype_print//
+//type_ops//
+/*@
+
+Two types are equal if they're of the same kind, and their kind-specific
+fields are equal. For types of kind [[SCALAR]] or [[TYPECONS]], pointer
+equality is sufficient as their descriptors are static data. [[OBJECT]]
+types with different names are distinct (these are always static
+strings, so pointer equality suffices.)
+
+==rtype_equal*/
+bool sig_equal(funsig_t *a, funsig_t *b);
+static bool rtype_equal(const void *xp, const void *yp)
+{
+    const rtype_t *x = xp, *y = yp;
+
+    if(x->kind != y->kind)
+        return false;
+    switch(x->kind)
+    {
+    case RT_CALLABLE:
+        return sig_equal(x->sig, y->sig);
+    case RT_VECTOR:
+    case RT_ARRAY:
+    case RT_CELL:
+        return r_equal(x->elt, y->elt);
+    case RT_SCALAR:
+        return x->scal == y->scal;
+    case RT_TYPECONS:
+        return x->cons == y->cons;
+    case RT_OBJECT:
+        return x->name == y->name;
+    }
+    return false;
+}
+/*@ %
+
+[[.hash]] is a simple accessor, as it is for symbols.
+
+==rtype_hash*/
+static uint32_t rtype_hash(const void *ptr)
+{
+    return ((rtype_t *)ptr)->hash;
+}
+/*@ %
+
+The [[.elt]] field of a [[VECTOR]], [[ARRAY]] or [[CELL]] type points to
+a managed object, which must be marked during garbage collection. The
+[[.sig]] field of a [[CALLABLE]] isn't itself an object, but contains
+pointers to them, which are marked by [[sig_gc]].
+
+==rtype_gc*/
+void sig_gc(funsig_t *sig);
+static void rtype_gc(void *ptr)
+{
+    rtype_t *type = ptr;
+    assert(r_typeof(type) == r_type_type);
+    switch(type->kind)
+    {
+    case RT_CALLABLE:
+        sig_gc(type->sig);
+        break;
+    case RT_VECTOR:
+    case RT_ARRAY:
+    case RT_CELL:
+        gc_mark(type->elt);
+        break;
+    default:
+        break;
+    }
+}
+/*@ %
+
+The name of a [[VECTOR]], [[ARRAY]], or [[CELL]] type has the form
+``[[label(element)]]'', where [[element]] is the name of the type's
+[[.elt]] field.
+
+==elt_print*/
+static inline void elt_print(FILE *fp, const char *label, const rtype_t *type)
+{
+    fprintf(fp, "%s(", label);
+    r_print(fp, type->elt);
+    fprintf(fp, ")");
+}
+/*@ %
+
+A [[CALLABLE]] type has a name of the form ``[[function(args):ret]]'',
+and is produced by [[sig_print]].
+
+These kinds of type have lazily initialised [[.name]] fields; they start
+as [[NULL]], and are computed when required.
+
+==rtype_init_name*/
+void sig_print(FILE *fp, funsig_t *sig);
+char *rtype_init_name(const rtype_t *type)
+{
+    char *buf = NULL;
+    size_t sz;
+    FILE *fp = open_memstream(&buf, &sz);
+    assert(fp);
+    switch(type->kind)
+    {
+    case RT_CALLABLE:
+        sig_print(fp, type->sig);
+        break;
+    case RT_VECTOR:
+        elt_print(fp, "vector", type);
+        break;
+    case RT_ARRAY:
+        elt_print(fp, "array", type);
+        break;
+    case RT_CELL:
+        elt_print(fp, "cell", type);
+        break;
+    default:
+        break;
+    }
+    fclose(fp);
+    return buf;
+}
+/*@ %
+
+The [[rtype_name]] accessor will initialise a type's [[.name]] field on
+demand.
+
+==rtype_name*/
+static inline const char *rtype_name(rtype_t *type)
+{
+    if(!type->name)
+        type->name = rtype_init_name(type);
+    return type->name;
+}
+/*@ %
+
+This is invoked when a printed representation of the type is required,
+such as in the [[ops.print]] callback, or compiler diagnostic message
+output.
+
+==rtype_print*/
+static void rtype_print(FILE *fp, const void *ptr)
+{
+    fprintf(fp, "%s", rtype_name((rtype_t *)ptr));
+}
+/*@ %
+
+Types are immutable and unique, so are also internalised in the manner
+of symbols. The type table [[r_typetab]] contains all currently live
+types.
+
+==r_typetab*/
+hashset_t *r_typetab;
+/*@ %
+
+When a type is collected as garbage, it can be removed from the table.
+
+==rtype_free*/
+static void rtype_free(void *ptr)
+{
+    hashset_remove(r_typetab, ptr);
+    free_type_data(ptr);
+}
+/*@ %
+
+Lazily initialised [[.name]]s must be deallocated on destruction. A
+[[CALLABLE]] type also needs its [[funsig_t]] freed.
+
+==free_type_data*/
+void sig_free(funsig_t *sig);
+static void free_type_data(rtype_t *type)
+{
+    switch(type->kind)
+    {
+    case RT_CALLABLE:
+        sig_free(type->sig);
+        /* fallthrough */
+    case RT_VECTOR:
+    case RT_ARRAY:
+    case RT_CELL:
+        if(type->name)
+            xfree(type->name);
+        break;
+    default:
+        break;
+    }
+}
+/*@ %
+
+==type_ops*/
+static const typeops_t type_ops = {
+    .free = rtype_free,
+    .gc = rtype_gc,
+    .hash = rtype_hash,
+    .equal = rtype_equal,
+    .print = rtype_print
+};
+/*@ %
+
+
+\subsection{Predicates}
+
+Various builtin functions or compiler optimisations might only apply to
+objects having a certain kind of type. Each simple predicate function
+returns [[true]] when its argument satisfies the test.
+
+==simple predicates*/
+static inline bool rtype_is_vector(const rtype_t *typ)
+    { return typ->kind == RT_VECTOR; }
+static inline bool rtype_is_array(const rtype_t *typ)
+    { return typ->kind == RT_ARRAY; }
+static inline bool rtype_is_scalar(const rtype_t *typ)
+    { return typ->kind == RT_SCALAR; }
+static inline bool rtype_is_callable(const rtype_t *typ)
+    { return typ->kind == RT_CALLABLE; }
+static inline bool rtype_is_constructor(const rtype_t *typ)
+    { return typ->kind == RT_TYPECONS; }
+static inline bool rtype_is_cell(const rtype_t *typ)
+    { return typ->kind == RT_CELL; }
+/*@ %
+
+
+\subsection{Container Types}
+
+A \textit{container} type is either a [[VECTOR]] or an [[ARRAY]]
+(\autoref{vector}).
+
+==simple predicates*/
+static inline bool rtype_is_container(const rtype_t *typ)
+    { return typ->kind == RT_VECTOR || typ->kind == RT_ARRAY; }
+/*@ %
+
+[[rtype_eltsz]] returns the size of an object of the given type, in
+bytes, when stored as an element in a container (since unboxed values of
+[[SCALAR]] types can differ in size.)
+
+==rtype_eltsz*/
+static inline size_t rscal_size(const rtype_t *typ);
+static inline size_t rtype_eltsz(const rtype_t *typ)
+{
+    assert(typ);
+    return rtype_is_scalar(typ)
+        ? rscal_size(typ)
+        : sizeof(robject_t *);
+}
+/*@ %
+
+
+\section{Creation}
+
+==creation*/
+//compute_hash//
+//type_init//
+//rtype_create//
+//r_global_types//
+//rtype_install//
+//rtype_init//
+//rtype_cons_init//
+/*@ %
+
+A type is initialised by populating its fields and computing its hash.
+[[ops]] may be [[NULL]] if the type won't ever be referred to by the
+[[.type]] field of any object -- this is true of type constructors.
+[[name]] may be [[NULL]] if it will be lazily initialised. Assignment to
+the [[.data]] field initialises the union of pointers in a
+kind-oblivious manner (albeit one not strictly standards-conforming.)
+%% XXX `void *` and `char *` share representation & alignment;
+%% as do `struct xxx *` do for all xxx; but the classes don't necessarily
+%% do so with each other!
+
+==type_init*/
+static void type_init(rtype_t *type, type_kind kind, void *data,
+                      const typeops_t *ops, const char *name)
+{
+    *type = (rtype_t) {
+        .base.type = r_type_type,
+        .name = (char *)name,
+        .kind = kind,
+        .data = data,
+        .ops = ops,
+        .hash = 0,
+    };
+    type->hash = compute_hash(type);
+}
+/*@ %
+
+A [[CALLABLE]] type takes the hash of its signature. Other kinds compute
+the hash of the type object itself.
+
+==compute_hash*/
+static uint32_t compute_hash(rtype_t *type)
+{
+    if(type->kind == RT_CALLABLE)
+        return type->sig->hash;
+    return hash_code(type, sizeof(rtype_t));
+}
+/*@ %
+
+A temporary [[rtype_t]] is populated, hashed, and used to probe the type
+table. If found, the equivalent object is returned, else a new one is
+allocated with the contents of the temporary.
+
+==rtype_create*/
+rtype_t *rtype_create(type_kind kind, void *data,
+                      const typeops_t *ops, const char *name)
+{
+    rtype_t *type, *otyp, tmp;
+
+    type_init(&tmp, kind, data, ops, name);
+    otyp = hashset_get(r_typetab, &tmp);
+    if(!otyp)
+    {
+        type = gc_alloc(r_type_type, sizeof(rtype_t));
+        *type = tmp;
+        hashset_insert(r_typetab, type);
+        return type;
+    }
+    free_type_data(&tmp);
+    return otyp;
+}
+/*@ %
+
+The global type environment maps names to types.
+
+==r_global_types*/
+hashmap_t *r_global_types;
+/*@ %
+
+A type may be installed there to make it available for the user to
+mention by name in type specifiers.
+
+==rtype_install*/
+void rtype_install(rtype_t *type, const char *name)
+{
+    hashmap_set(r_global_types, r_intern(name), type);
+}
+/*@ %
+
+[[rtype_init]] creates and installs a type, returning it for assignment
+to one of the [[r_type_]] variables.
+
+==rtype_init*/
+rtype_t *rtype_init(type_kind kind, const typeops_t *ops, const char *name)
+{
+    rtype_t *type = rtype_create(kind, NULL, ops, name);
+    rtype_install(type, name);
+    return type;
+}
+/*@ %
+
+
+\section{Type Constructors}
+\label{type:cons}
+
+Types of kind [[TYPECONS]] can construct new types, given types as
+arguments.
+
+==constructors*/
+//rtype_cons_create//
+//rtype_from_name//
+//rtype_from_node//
+//rtype_from_spec//
+/*@ %
+
+Each type constructor is described by a [[consdesc_t]]. [[.from_spec]]
+is invoked when this type constructor is found in a type specifier, and
+is responsible for creating a new instance. The kind of type which it
+creates is recorded in the [[.kind]] field.
+
+==consdesc_t*/
+typedef struct ast ast_t;
+typedef struct consdesc consdesc_t;
+typedef rtype_t *(*typecons_fn)(const consdesc_t *, unsigned, ast_t *);
+typedef struct consdesc
+{
+    typecons_fn from_spec;
+    type_kind kind;
+} consdesc_t;
+/*@
+
+Testing whether a type is an instance of a given type constructor is a
+matter of matching the instance's [[.kind]] with the constructor's
+[[.cons.kind]].
+
+==simple predicates*/
+static inline bool
+rtype_is_instance(const rtype_t *self, const rtype_t *other)
+    { return other->kind == RT_TYPECONS && other->cons
+          && other->cons->kind == self->kind; }
+/*@ %
+
+Convenience functions allow the creation of type constructors\ldots
+
+==rtype_cons_create*/
+rtype_t *rtype_cons_create(const consdesc_t *cons, const char *name)
+{
+    return rtype_create(RT_TYPECONS, (void *)cons, NULL, name);
+}
+/*@ %
+
+\ldots and their subsequent installation in the global type environment.
+
+==rtype_cons_init*/
+rtype_t *rtype_cons_init(const consdesc_t *cons, const char *name)
+{
+    rtype_t *type = rtype_cons_create(cons, name);
+    rtype_install(type, name);
+    return type;
+}
+/*@ %
+
+
+\section{Type Specifiers}
+
+A declaration or [[type]] expression in user code specifies a type --
+either with a type name, or the application of a type constructor (to
+other type specifiers.)
+
+Given an [[ast_t]] representing a type specifier, [[rtype_from_spec]]
+finds or creates the corresponding [[rtype_t]]. [[NULL]] will be
+returned if this could not be done -- this may or may not be an error,
+depending on the caller.
+
+The [[INVALID]] AST is present when the return type of a function has
+been omitted. A [[NAME]] or a [[SYMBOL]] is a simple specifier, as is a
+[[TOKEN]]. A [[NODE]] is a compound specifier denoting a type instance.
+
+Other ASTs are not expected in type specifiers.
+
+==rtype_from_spec*/
+rtype_t *rtype_from_spec(ast_t *ast)
+{
+    if(!ast)
+        return NULL;
+    switch(ast->type)
+    {
+    case AST_INVALID:
+        return NULL;
+    case AST_NAME:
+    case AST_SYMBOL:
+        return rtype_from_name(ast->symbol);
+    case AST_TOKEN:
+        return rtype_from_name(r_intern(ast_str(ast)));
+    case AST_NODE:
+        assert(alen(ast->children) >= 1);
+        return rtype_from_node(ast->children);
+    default:
+        break;
+    }
+    c_warning("malformed type declaration.");
+    return NULL;
+}
+/*@ %
+
+Names are looked up in the global type environment. Since this
+resolution is done at compile-time, a warning can be emitted if no type
+by that name could be found.
+
+==rtype_from_name*/
+static rtype_t *rtype_from_name(rsymbol_t *name)
+{
+    rtype_t *type = hashmap_get(r_global_types, name, NULL);
+
+    if(!type)
+        c_warning("unknown type `%s`.", r_symstr(name));
+    return type;
+}
+/*@ %
+
+The first element in the AST node should specify a type constructor; if
+it doesn't, a warning is issued and [[NULL]] is returned.
+
+Its [[cons.from_spec]] callback is invoked, passing [[.cons]], the
+argument count, and the remainder of the [[ast_t]] array (usually the
+elements therein denote type specifiers, so it'll call
+[[rtype_from_spec]] recursively.)
+
+==rtype_from_node*/
+static rtype_t *rtype_from_node(ast_array_t *arr)
+{
+    int nargs = alen(arr)-1;
+    ast_t *car = aptr(arr, 0);
+    ast_t *args = (nargs>0) ? aptr(arr,1) : NULL;
+    rtype_t *type = rtype_from_spec(car);
+
+    if(!type)
+        return NULL;
+    if(!rtype_is_constructor(type))
+    {
+        c_warning("type `%s` not a type constructor.", ast_str(car));
+        return NULL;
+    }
+    assert(type->cons && type->cons->from_spec);
+    return type->cons->from_spec(type->cons, nargs, args);
+}
+/*@ %
+
+
+\section{Subtyping}
+\label{type:subtype}
+
+When [[x]] is a subtype of [[y]], an object of type [[x]] can be used in
+a place where one of type [[y]] is expected -- as the right-hand side of
+an assignment or as a function argument, for example.
+%cite liskov substitution principle?
+
+==subtyping*/
+//r_type_compat//
+//r_common_type//
+/*@ %
+
+In object-oriented languages, subtyping usually follows inheritance.
+Here, we have a very simple subtyping relation, existing mostly to
+simplify generic code (such as functions that can operate on vectors of
+any element type). The subtype test is useful for making decisions at
+run-time.
+
+The compiler has the slightly more detailed notion of
+\textit{compatibility}. Although it has the same semantics as subtyping,
+when the test for compatibility is carried out during compilation it can
+have one of three results -- true, false, or ``maybe''. In the last
+case, it could be true for some run-time objects and false for others. A
+check or conversion must be inserted at that point to ensure
+correctness.
+
+==compat*/
+typedef enum { NO, YES, MAYBE } compat;
+/*@ %
+
+[[r_type_compat]] tests whether a [[self]] is compatible with a place
+expecting an [[other]]. [[unbox]] is [[true]] if scalars can be treated
+as unboxed values; [[false]] if scalars should, like all other values,
+be considered reference objects.
+
+==r_type_compat*/
+bool sig_types_equal(funsig_t *self, funsig_t *other);
+compat r_type_compat(const rtype_t *self, const rtype_t *other, bool unbox)
+{
+    assert(self);
+    assert(other);
+    //decide compatibility//
+}
+/*@ %
+
+When this is the case, compatibility is equivalent to subtyping --
+[[int]] is not a subtype of [[double]].
+
+==r_subtypep*/
+static inline bool r_subtypep(const rtype_t *self, const rtype_t *other)
+    { return r_type_compat(self, other, false) == YES; }
+/*@ %
+
+Compatibility is reflexive -- a type is compatible with itself.
+
+==decide compatibility*/
+if(self == other)
+    return YES;
+/*@ %
+
+When scalar values are considered (i.e. at compile-time) implicit
+arithmetic conversion is possible.
+
+==decide compatibility*/
+if(unbox && rtype_is_scalar(self) && rtype_is_scalar(other))
+    return MAYBE;
+/*@ %
+
+A value of statically unknown type (i.e. [[object]]) will have a more
+specific type at run-time, so must be checked.
+
+==decide compatibility*/
+if(self == r_type_object)
+    return MAYBE;
+/*@ %
+
+A place expecting an [[object]] can handle objects of any type, but
+scalars must be boxed.
+
+==decide compatibility*/
+if(other == r_type_object)
+    return (unbox & rtype_is_scalar(self)) ? MAYBE : YES;
+/*@ %
+
+[[nil]] is compatible with every reference type.
+
+==decide compatibility*/
+if(self == r_type_nil)
+    return rtype_is_scalar(other) ? NO : YES;
+/*@ %
+
+A value of any reference type could be [[nil]], so must be checked at
+run-time.
+
+==decide compatibility*/
+if(other == r_type_nil)
+    return rtype_is_scalar(self) ? NO : MAYBE;
+/*@ %
+
+Every instance of a type is compatible with its constructor --
+[[vector(int)]] is compatible with [[vector]], for example.
+
+==decide compatibility*/
+if(rtype_is_instance(self, other))
+    return YES;
+/*@ %
+
+A value that's compatible with a constructor might also be compatible
+with a specific instance -- if all the compiler knows about a value is
+that it's a [[vector]], for example, it will have to insert a check
+before a site which expects a [[vector(double)]].
+
+==decide compatibility*/
+if(rtype_is_instance(other, self))
+    return MAYBE;
+/*@ %
+
+Callables (that is, user-visible functions) are compatible when they
+have identical argument and return types (names are ignored.)
+
+==decide compatibility*/
+if(self->kind == RT_CALLABLE && other->kind == RT_CALLABLE)
+    return sig_types_equal(self->sig, other->sig) ? YES : NO;
+/*@ %
+
+No other types are compatible.
+
+==decide compatibility*/
+return NO;
+/*@ %
+
+Given two types (for example, those of the consequent and alternate
+branches of an [[if]]) the compiler may need to find a type which is a
+supertype of both (the type of the [[if]] expression.)
+
+For precision's sake, this type should be the most specific possible. If
+either type is a subtype of the other, then the latter is chosen. If
+they're scalars, picking the wider of the two enables arithmetic
+conversion. If they share a common type constructor, it's chosen.
+Otherwise the only possibility is [[object]].
+
+==r_common_type*/
+rtype_t *r_common_type(rtype_t *self, rtype_t *other)
+{
+    assert(self);
+    assert(other);
+    if(r_subtypep(self, other))
+        return other;
+    if(r_subtypep(other, self))
+        return self;
+    if(self->kind != other->kind)
+        return r_type_object;
+    switch(self->kind)
+    {
+    case RT_SCALAR: return rscal_promote(self, other);
+    case RT_CALLABLE: return r_type_callable;
+    case RT_VECTOR: return r_type_vector;
+    case RT_ARRAY: return r_type_array;
+    default: break;
+    }
+    return r_type_object;
+}
+/*@ %
+
+
+\section{Initialisation}
+
+The global type environment and type tables are created at
+initialisation time. The latter contains only types, so the specialised
+[[rtype_hash]] and [[rtype_equal]] functions can be used.
+
+Unusually for an object, [[r_type_type]]'s [[.type]] is [[r_type_type]].
+This otherwise illegal self-reference is facilitated via collusion with
+the allocator (\autoref{gc:alloc}). The [[.type]] field can then be
+correctly initialised.
+
+==rt_bootstrap*/
+rtype_t *r_type_type;
+void rt_bootstrap()
+{
+    r_global_types = hashmap_create(rsym_hash, ptr_eq);
+    r_typetab = hashset_create(rtype_hash, rtype_equal);
+    r_type_type = rtype_create(RT_OBJECT, NULL, &type_ops, "type");
+    r_type_type->base.type = r_type_type;
+}
+/*@ %
+
+
+\section*{Miscellanea}
+
+%% .c misc
+==includes*/
+#include "global.h"
+#include "ast.h"
+/*@ %
+
+%% .h and misc
+==rt/type.h*/
+//type_kind//
+//consdesc_t//
+//rtype_t//
+//compat//
+//prototypes//
+//externs//
+
+//simple predicates//
+//rtype_eltsz//
+//r_subtypep//
+//rtype_name//
+/*@
+
+==externs*/
+extern hashmap_t *r_global_types;
+extern hashset_t *r_typetab;
+extern rtype_t *r_type_type;
+/*@ %
+
+==prototypes*/
+compat r_type_compat(const rtype_t *self, const rtype_t *other, bool unbox);
+rtype_t *r_common_type(rtype_t *self, rtype_t *other);
+char *rtype_init_name(const rtype_t *type);
+rtype_t *rtype_create(type_kind kind, void *data,
+                      const typeops_t *ops, const char *name);
+rtype_t *rtype_cons_create(const consdesc_t *cons, const char *name);
+rtype_t *rtype_init(type_kind kind, const typeops_t *ops, const char *name);
+rtype_t *rtype_cons_init(const consdesc_t *cons, const char *name);
+void rtype_install(rtype_t *type, const char *name);
+rtype_t *rtype_from_spec(ast_t *ast);
+void rt_bootstrap();
+/*@ %
+
+%*/

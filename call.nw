@@ -1,0 +1,350 @@
+/*@
+
+\chapter{Calling Convention}
+\label{call}
+
+The compiler and VM agree on a particular treatment of argument and
+return values, so that callable objects can be invoked from call sites
+which may be oblivious to their signatures. This is the \textit{calling
+  convention}; every function and call site adheres to it.
+
+
+\section{Callee}
+
+The ordered list of a function's formal arguments, their names and their
+types, along with its return type, comprises its signature
+(\autoref{callable:sig}).
+
+When called, the code of a function expects an [[argbits_t]] as a first,
+hidden, argument; furthest below [[bp]] in the stack frame
+(\autoref{vm:frame). Each bit in this value corresponds to a formal
+argument of the callee; it's set if the caller has provided the
+corresponding actual argument.
+
+Arguments are expected in the order, and with the types, specified by
+the signature's [[.args]] array. Arguments of scalar type are expected
+to be unboxed into the stack frame, and may undergo arithmetic promotion
+(\autoref{scalar:type}). An omitted argument will have been given its
+zero value.
+
+On return, the function's code indicates the value of the specified
+[[.ret_type]] that the caller should take as its result. When this is a
+scalar, it's not boxed.
+
+
+\section{Caller}
+
+The expression that calls a function can provide its actual arguments in
+a number of ways. Each can be \textit{named}, \textit{omitted}, the
+\textit{rest} vector ``[[...]]''; or the default, \textit{positional}.
+
+Before the call proceeds, the actual arguments must be \textit{matched}
+with the formal arguments of the callee.
+
+\subsection{Fast Call}
+\label{call:fast}
+
+When the compiler knows the signature of the function being called, it
+can use the \textit{fast call} convention (the call must also not
+require allocation of a rest vector, but this is an implementation
+limitation and could be relaxed without difficulty.)
+
+Arguments are matched at compile-time, and opcodes generated to assign
+their values directly to the appropriate slots in the stack frame of the
+callee. Scalars passed in this manner are left unboxed. Since the return
+type is known, scalar return values don't need boxing either.
+
+\subsection{Universal Call}
+\label{call:uni}
+
+The \textit{universal call} convention is used in all other cases.
+
+Actual arguments are supplied by sub-opcodes, with the same names and in
+the same order as the call expression. Argument matching (and
+rest-vector creation, when necessary) occurs at run-time. Values are
+passed as reference objects; scalars must be boxed before being used in
+such a call. The result of a call is also expected to be a reference
+object; scalars will be boxed upon return.
+
+
+\section{Argument Matching}
+\label{call:match}
+
+The argument matching process is defined in its own module, used by both
+compiler and VM.
+
+==rt/call.c*/
+//includes//
+//call_sequence//
+//nargs_excluding_rest//
+//get_kwd_arg//
+//get_pos_arg//
+//set_argbit//
+//call_match_kwd//
+//call_match_pos//
+//call_match_omit//
+//no_match_rest//
+//call_match_rest//
+/*@ %
+
+
+\subsection{Sequencing}
+
+Given the [[args]] and their [[names]], the [[call_sequence]] function
+invokes the provided callbacks in a specific sequence, passing along the
+provided user data [[ptr]]. All invocations must succeed in order for
+[[true]] to be returned.
+
+==call_sequence*/
+bool call_sequence(void *ptr, void **args, rsymbol_t **names, int nargs,
+                   bool (*rest_fn)(void *, void *),
+                   bool (*kwd_fn)(void *, rsymbol_t *, void *),
+                   bool (*pos_fn)(void *, void *),
+                   bool (*omit_fn)(void *))
+{
+    bool r = true;
+
+    if(names)
+    {
+        //named//
+    }
+    //positional//
+    return r;
+}
+/*@ %
+
+First, [[kwd_fn]] is called on each argument with a [[name]] (that isn't
+``[[...]]'').
+
+==named*/
+for(int i = 0; r && i < nargs; i++)
+{
+    void *arg = args[i];
+    rsymbol_t *name = names[i];
+
+    if(name && name != r_sym_rest)
+        r &= kwd_fn(ptr, name, arg);
+}
+/*@
+
+Then each remaining argument, in the order given, is passed to one of
+the other callbacks: ``[[...]]'' to [[rest_fn]], [[NULL]] to
+[[omit_fn]], otherwise [[pos_fn]].
+
+==positional*/
+for(int i = 0; r && i < nargs; i++)
+{
+    void *arg = args[i];
+
+    if(names && names[i] == r_sym_rest)
+        r &= rest_fn(ptr, arg);
+    else if(names && names[i])
+        continue;
+    else if(arg)
+        r &= pos_fn(ptr, arg);
+    else
+        r &= omit_fn(ptr);
+}
+/*@
+
+
+%% A named actual argument supplies the corresponding formal argument with
+%% its value, no matter where it occurs in the call expression.
+
+%% Named elements from  ``[[...]]'' override earlier arguments.
+
+
+\subsection{Matchers}
+\label{call:argmatch}
+
+The compiler passes the matcher functions to [[call_sequence]] when
+optimising a [[CALL]] node to [[CALL_FAST]] (\autoref{opt_post:call}).
+
+It also invokes [[call_sequence]] when generating code for a universal
+call with a different set of callbacks, emitting a sub-opcode for each
+argument. The VM then interprets these, invoking the matchers during
+execution (\autoref{vm:call}).
+
+The [[call_ctx_t]] structure provides assignment callbacks to the
+matchers, as well as the signature [[.sig]] of the function being
+called. [[.posbits]] tracks the arguments already assigned to, and so
+unavailable for use by positionals. [[.argbits]] tracks the arguments
+that are present in the call, and will be passed to the callee.
+
+Matchers and their callbacks return [[false]] on failure.
+
+==call_ctx_t*/
+typedef struct
+{
+    argbits_t posbits; // arguments unavailable for use by positionals
+    argbits_t argbits; // arguments present in call
+    funsig_t *sig; // signature of the function being called
+    bool (*append_rest)(void *, rsymbol_t *, void *);
+    bool (*set_arg)(void *, argdesc_t *, void *);
+} call_ctx_t;
+/*@ %
+
+The [[set_argbit]] helper records the assignment of an argument at
+position [[i]] by setting the corresponding bit in [[.posbits]]. In case
+it's [[omit]]ted, the corresponding bit in [[.argbits]] will be left
+unset.
+
+==set_argbit*/
+static inline bool set_argbit(call_ctx_t *ctx, int i, bool omit)
+{
+    if(i >= sizeof(argbits_t)*8)
+        return false;
+    if(!omit)
+        ctx->argbits |= 1<<i;
+    ctx->posbits |= 1<<i;
+    return true;
+}
+/*@ %
+
+A named actual argument is matched by [[call_match_kwd]]. When a formal
+argument is found with the same [[name]], the corresponding position
+[[i]] is marked occupied, and the value [[val]] assigned by
+[[.set_arg]]. Otherwise it's added to the rest vector by [[.append_rest]].
+
+==call_match_kwd*/
+bool call_match_kwd(void *ptr, rsymbol_t *name, void *val)
+{
+    call_ctx_t *ctx = ptr;
+    int i;
+    argdesc_t *arg = get_kwd_arg(ctx->sig, name, &i);
+
+    if(!arg)
+        return ctx->append_rest(ctx, name, val);
+    return set_argbit(ctx, i, false) && ctx->set_arg(ctx, arg, val);
+}
+/*@ %
+
+Given a [[name]], the [[get_kwd_arg]] helper finds the [[argdesc_t]]
+with the same [[.name]] in the function signature [[sig]], passing back
+its index in [[*iptr]]. If none exist, it returns [[NULL]].
+
+==get_kwd_arg*/
+static argdesc_t *get_kwd_arg(funsig_t *sig, rsymbol_t *name, int *iptr)
+{
+    for(int i = 0; i < sig->nargs; i++)
+    {
+        argdesc_t *arg = &sig->args[i];
+
+        if(arg->name == name)
+        {
+            *iptr = i;
+            return arg;
+        }
+    }
+    return NULL;
+}
+/*@ %
+
+A positional actual argument is matched by [[call_match_pos]]. It
+supplies a value for the first formal argument that hasn't already been
+assigned, at position [[i]]. If none remain, it's added to the rest
+vector.
+
+==call_match_pos*/
+bool call_match_pos(void *ptr, void *val)
+{
+    call_ctx_t *ctx = ptr;
+    int i = ffs(~ctx->posbits)-1;
+    argdesc_t *arg = get_pos_arg(ctx->sig, i);
+
+    if(!arg)
+        return ctx->append_rest(ctx, NULL, val);
+    return set_argbit(ctx, i, false) && ctx->set_arg(ctx, arg, val);
+}
+/*@ %
+
+If the signature [[sig]] contains ``[[...]]'', it must be the last
+argument, and will be provided specially. It can't be given a value by
+positional matching, so is ignored by the [[get_pos_arg]] helper.
+
+==get_pos_arg*/
+static argdesc_t *get_pos_arg(funsig_t *sig, int i)
+{
+    if(i < 0 || i >= nargs_excluding_rest(sig))
+        return NULL;
+    return &sig->args[i];
+}
+/*@ %
+
+The number of positional arguments in a signature containing ``[[...]]''
+is one fewer than [[.nargs]].
+
+==nargs_excluding_rest*/
+static inline int nargs_excluding_rest(funsig_t *sig)
+{
+    return sig->has_rest ? sig->nargs - 1 : sig->nargs;
+}
+/*@ %
+
+An omitted actual argument is signalled with [[call_match_omit]]. It
+matches the first unassigned formal argument, like a positional, but
+does not set [[.argbits]] or supply a value to the [[.set_arg]]
+callback. A [[NULL]] value is added to the rest vector, should the
+argument be surplus to requirements.
+
+==call_match_omit*/
+bool call_match_omit(void *ptr)
+{
+    call_ctx_t *ctx = ptr;
+    int i = ffs(~ctx->posbits)-1;
+    bool r = true;
+
+    if(i < 0)
+        return false;
+    if(i >= nargs_excluding_rest(ctx->sig))
+        r = ctx->append_rest(ctx, NULL, NULL);
+    return r & set_argbit(ctx, i, true);
+}
+/*@ %
+
+When the rest vector ``[[...]]'' is supplied as an actual argument to a
+call, the [[call_match_rest]] matcher will match its elements as
+arguments. This entails a recursive invocation of [[call_sequence]].
+
+==call_match_rest*/
+bool call_match_rest(void *ptr, void **args, rsymbol_t **names, int nargs)
+{
+    return call_sequence(ptr, args, names, nargs, no_match_rest,
+                         call_match_kwd, call_match_pos, call_match_omit);
+}
+/*@ %
+
+Rest vectors do not nest. In this case, the [[no_match_rest]] matcher
+returns [[false]] to signal its failure.
+
+==no_match_rest*/
+bool no_match_rest(void *ptr, void *rest)
+    { return false; }
+/*@ %
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+/*@ %
+
+==rt/call.h*/
+//call_ctx_t//
+
+// first arg is a call_ctx_t *
+// the void * decl is so you can use them as callbacks with call_sequence
+bool call_match_kwd(void *ptr, rsymbol_t *name, void *val);
+bool call_match_pos(void *ptr, void *val);
+bool call_match_omit(void *ptr);
+bool call_match_rest(void *ptr, void **args, rsymbol_t **names, int nargs);
+bool no_match_rest(void *ptr, void *rest);
+
+bool call_sequence(void *ptr, void **args, rsymbol_t **names, int nargs,
+                   bool (*rest_fn)(void *, void *),
+                   bool (*kwd_fn)(void *, rsymbol_t *, void *),
+                   bool (*pos_fn)(void *, void *),
+                   bool (*omit_fn)(void *));
+/*@ %
+
+% */

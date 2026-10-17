@@ -1,0 +1,1662 @@
+/*@
+\chapter{Parser}
+\label{parser}
+
+The parser subsystem is the first stage in the compiler, operating on
+textual input. We specify the language it is to recognise with a LALR(1)
+grammar; the GNU \texttt{bison} parser generator then gives us the
+[[yyparse]] function which forms the subsystem's core.
+%cite GNU bison
+
+==grammar.y*/
+%code top {
+  //grammar includes//
+}
+%code requires {
+  //grammar.h//
+}
+%code {
+  //ast macros//
+}
+//declarations//
+//terminals//
+//precedence//
+%%
+//rules//
+%%
+//tok_empty//
+//ast functions//
+/*@
+
+Assuming no errors are encountered, it creates from the input program
+an \textit{abstract syntax tree}.
+
+
+\section{Abstract Syntax Tree}
+\label{parser:ast}
+
+Each syntactic construct, when parsed, produces one or more instances of
+the [[ast_t]] structure. The [[.type]] tag determines which field in the
+union is populated.
+
+==ast_t*/
+typedef struct ast ast_t;
+typedef ARRAY(ast_t) ast_array_t;
+typedef struct ast
+{
+    asttype type;
+    union
+    {
+        //ast union//
+    };
+} ast_t;
+/*@ %
+
+==asttype*/
+typedef enum
+{
+    AST_INVALID, AST_NODE, AST_TOKEN,
+    AST_INT, AST_DOUBLE, AST_STRING,
+    AST_QUOTED, AST_SYMBOL, AST_NAME
+} asttype;
+/*@ %
+
+Values of the [[asttype]] enumeration are interpreted as follows.
+
+\subhead{[[AST_NODE]]} Internal tree node, with array of [[.children]].
+All other types are leaves.
+
+==ast union*/
+ast_array_t *children;
+/*@
+\subhead{[[AST_TOKEN]]} A reserved identifier recognised by the parser.
+A value of [[yytokentype]] (from the generated [[grammar.h]]) is stored
+in the [[.token]] field.
+
+==ast union*/
+int token;
+/*@
+
+\subhead{[[AST_INT]]} Literal, stored in [[.integer]] field.
+
+\subhead{[[AST_DOUBLE]]} Literal, stored in [[.dfloat]] field.
+
+\subhead{[[AST_STRING]]} Literal, stored in [[.string]] field.
+
+==ast union*/
+int integer;
+double dfloat;
+char *string;
+/*@
+
+\subhead{[[AST_QUOTED]]} Literal (quoted) symbol.
+
+\subhead{[[AST_SYMBOL]]} Symbolic identifier, probably a variable
+reference.
+
+\subhead{[[AST_NAME]]} Name of a formal or actual argument.
+
+These are all stored in the [[.symbol]] field. Symbols are
+garbage-collected strings, internalised in the runtime's symbol table
+(\autoref{rt:symbol}).
+
+==ast union*/
+rsymbol_t *symbol;
+/*@
+
+\subhead{[[AST_INVALID]]} Marks an omitted argument.
+
+[[ast_null]] is a convenient source of this.
+
+==ast_null*/
+ast_t ast_null = { .type = AST_INVALID };
+/*@ %
+
+Simple predicates are supplied for testing if a particular [[ast_t]] is the symbol
+``[[...]]'', used for naming a ``rest vector''\ldots
+
+==ast_is_rest*/
+static inline bool ast_is_rest(ast_t *ast)
+    { return (ast->type == AST_SYMBOL && ast->symbol == r_sym_rest); }
+/*@ %
+
+\ldots or an omitted argument marker.
+
+==ast_is_omitted*/
+static inline bool ast_is_omitted(ast_t *ast)
+    { return ast->type == AST_INVALID; }
+/*@ %
+
+Utility functions create ASTs of various shapes.
+
+==ast functions*/
+//ast_va//
+//ast_set//
+//ast_append//
+//ast_prepend//
+//ast_free_node//
+//ast_fini//
+/*@
+
+[[ast_va]] creates and returns a [[NODE]], with children copied in
+order from its [[NULL]]-terminated vararg list of pointers.
+
+==ast_va*/
+static ast_t ast_va(ast_t *head, ...)
+{
+    ast_array_t *arr;
+
+    if(head)
+    {
+        va_list ap;
+        ast_t *ptr;
+
+        array_alloc(&arr, 2);
+        array_push(arr, *head);
+        va_start(ap, head);
+        while((ptr = va_arg(ap, ast_t *)))
+            array_push(arr, *ptr);
+        va_end(ap);
+    }
+    else
+        array_alloc(&arr, 0);
+    return (ast_t) { .type = AST_NODE, .children = arr };
+}
+/*@ %
+
+[[ast_set]] copies the given [[ast]] to the [[i]]th child of [[expr]].
+
+==ast_set*/
+static ast_t ast_set(ast_t *expr, ast_t *ast, int i)
+{
+    assert(expr->type == AST_NODE && expr->children);
+    assert(alen(expr->children) > i);
+    aset(expr->children, i, *ast);
+    return *expr;
+}
+/*@ %
+
+[[ast_append]] and [[ast_prepend]] add the given [[ast]] to the end and
+beginning of [[expr]]'s [[.children]], respectively.
+
+==ast_append*/
+static ast_t ast_append(ast_t *expr, ast_t *ast)
+{
+    assert(expr->type == AST_NODE && expr->children);
+    array_push(expr->children, *ast);
+    return *expr;
+}
+/*@ %
+
+==ast_prepend*/
+static ast_t ast_prepend(ast_t *expr, ast_t *ast)
+{
+    assert(expr->type == AST_NODE && expr->children);
+    array_insert(expr->children, 0, *ast);
+    return *expr;
+}
+/*@ %
+
+A [[STRING]] owns its [[.string]] value. A [[NODE]] owns its vector of
+[[.children]]\ldots
+
+==ast_fini*/
+void ast_fini(ast_t *ast)
+{
+    if(ast->type == AST_NODE)
+        ast_free_node(ast->children);
+    else if(ast->type == AST_STRING)
+        xfree(ast->string);
+}
+/*@ %
+
+\ldots which must be recursively deallocated.
+
+==ast_free_node*/
+static void ast_free_node(ast_array_t *arr)
+{
+    ast_t *ptr;
+
+    array_foreach_ptr(arr, ptr)
+        ast_fini(ptr);
+    array_free(arr);
+}
+/*@ %
+
+A handful of AST construction and mutation macros improve concision when
+writing rule actions.
+
+==ast macros*/
+//prototypes//
+#define AST1(a) ast_va(&a, NULL)
+#define AST2(a, b) ast_va(&a, &b, NULL)
+#define AST3(a, b, c) ast_va(&a, &b, &c, NULL)
+#define AST4(a, b, c, d) ast_va(&a, &b, &c, &d, NULL)
+#define ENDN(l, a, i) ast_set(&l, &a, i)
+#define END1(l, a) ENDN(l, a, 0)
+#define PUSH(l, a) ast_append(&l, &a)
+#define PREP(l, a) ast_prepend(&l, &a)
+/*@ %
+
+
+\section{Declarations}
+
+The [[YYSTYPE]] macro specifies the type of semantic value which grammar
+rules operate upon (and so the type of object ultimately returned by the
+parser.)
+
+==YYSTYPE*/
+#define YYSTYPE ast_t
+/*@ %
+
+We use some extensions of \texttt{bison} over \texttt{yacc}.
+[[api.pure]] moves state from global variables to a function argument,
+making the generated parser re-entrant. [[api.push-pull]] is more
+interesting -- it produces a [[yypush_parse]] function which can be
+invoked to parse one token at a time. This is ideal for interactive use
+(the original [[yyparse]] behaviour is provided via the wrapper
+[[yypull_parse]].)
+%cite yacc from somewhere?
+
+%don't %defines "grammar.h", separate builddir means we need to specify this in the makerule
+%api.pure becomes api.pure full in 3.0+
+==declarations*/
+%define api.pure
+%define api.push-pull both
+/*@ %
+
+Subsystem context is kept in a [[pctx_t]]; it's passed to the generated
+parser entry points, which in turn make it available to the lexer and
+rule actions.
+
+==declarations*/
+%parse-param {pctx_t *ctx}
+%lex-param {pctx_t *ctx}
+/*@ %
+
+When recovering from a parse error, \texttt{bison} discards symbols and
+their semantic values from its internal stack. The latter may have
+allocated memory, so must free it.
+
+When a parse succeeds, the initial symbol is discarded in the same way.
+Since its semantic value is desired result of the parse, it should not
+be discarded.
+
+==declarations*/
+%destructor { if(!ctx->done) ast_fini(&$$); } <>
+%error-verbose // deprecated; should be %define parse.error verbose in 3.0+
+/*@ %
+
+\subsection{Parser Context}
+
+==pctx_t*/
+typedef struct yypstate yypstate;
+typedef struct pctx pctx_t;
+typedef struct pctx
+{
+    //parser context//
+} pctx_t;
+/*@ %
+
+\texttt{bison}'s state is stored in the [[.ps]] field, merely to keep
+related objects together. When the parse succeeds, [[.done]] and the
+[[.result]] value are set.
+
+==parser context*/
+yypstate *ps;
+bool done;
+ast_t result;
+/*@
+
+Interactive use requires distinguishing between partial and complete
+expressions. When a newline is input and the preceding expression is complete, it
+should be recognised and evaluated. When incomplete, a continuation prompt
+should be displayed so further input may be entered.
+
+[[.expr]] is set by rules which parse complete expressions. [[.nest]]
+counts the depth of parenthesis, bracket and brace blocks. [[.brk]]
+is set when a newline is encountered in an incomplete expression.
+
+==parser context*/
+bool expr;
+unsigned nest;
+bool brk;
+/*@
+
+Interactive use also complicates solution of the ``dangling [[else]]''
+problem. [[.ifexpr]] is set when an [[if]] expression has been parsed;
+[[.ltok]] and [[.lval]] then buffer a token's worth of lookahead in the
+case the next token lexed is not an [[ELSE]].
+
+==parser context*/
+bool ifexpr;
+int ltok;
+ast_t lval;
+/*@
+
+[[.buf]] is a scratch buffer used by the lexer. [[.get]], [[.unget]] and
+[[.data]] decouple the lexer from the details of stream access.
+
+==parser context*/
+char *buf;
+int (*get)(pctx_t *);
+void (*unget)(int, pctx_t *);
+void *data;
+/*@
+
+\subsection{Tokens}
+\label{parser:token}
+
+A \textit{token} is a terminal symbol in the grammar. The name of a
+single character token is just that character. Tokens which match
+keywords or values are given names with [[%token]] and
+[[%precedence]]/[[%left]]/[[%right]] declarations.
+
+==terminals*/
+%token LIT_INT LIT_DBL LIT_BOOL LIT_SYM LIT_STR ID TYPE FUNCTION
+%token WHILE FOR BREAK CONTINUE LET VAR GLOBAL CONST INCLUDE LEXERR
+/*@ %
+
+Some terminals require precedence to be specified, to disambiguate
+shift/reduce conflicts between rules in which they appear. This list is
+ordered from lowest to highest. Function call (parenthesised argument
+list) and subscript (bracketed indices) have higher precedence than any
+operators; and assignment, lower.
+%cite bison manual, probably
+
+==precedence*/
+%precedence RET
+%precedence IF
+%precedence ELSE
+%right '='
+%left OR AND
+%nonassoc '>' GE '<' LE EQ NE
+%left '&' '|'
+%left '+' '-'
+%left '*' '/' '%'
+%left ':'
+%precedence '!' UMINUS UPLUS
+%left '^'
+%precedence '[' '('
+/*@ %
+
+
+\section{Lexical Analysis}
+
+The \textit{lexer} [[yylex]] consumes characters from an input stream,
+producing one token per invocation. Each token can have an AST as its
+\textit{semantic value}.
+
+==lexer.c*/
+//lexer includes//
+//input functions//
+//input macros//
+//eat_ws//
+//numbers//
+//lex_id//
+//lex_quoted//
+//keywords//
+//make_sym//
+//make_str//
+//make_delim//
+//l_lex//
+//yylex//
+/*@
+
+[[l_getc]] and [[l_ungetc]] wrap the input functions in the parser
+context to track the current line number.
+
+==input functions*/
+static inline int l_getc(pctx_t *ctx)
+    { return ctx->get(ctx); }
+static inline void l_ungetc(int c, pctx_t *ctx)
+    { ctx->unget(c, ctx); }
+/*@ %
+
+Spaces and tabs are whitespace. A comment begins with a ``\#'', extends
+to the end of the line (or the input), and is also considered
+whitespace. [[eat_ws]] consumes this until it encounters a
+non-whitespace character, returning the latter.
+
+==eat_ws*/
+static int eat_ws(pctx_t *ctx)
+{
+    int c = l_getc(ctx);
+
+    while(c == ' ' || c == '\t')
+        c = l_getc(ctx);
+    if(c == '#')
+    {
+        c = l_getc(ctx);
+        while(c != '\n' && c != '\0' && c != EOF)
+            c = l_getc(ctx);
+    }
+    return c;
+}
+/*@ %
+
+Some terminals can have more than one value -- numbers, identifiers,
+quoted strings. To lex one of these, one or more characters are copied
+from the input to a temporary buffer, as long as some condition holds.
+The [[CPCHAR]] and [[CPCHARS]] macros encapsulate this. They use the
+local variables [[c]], [[ptr]], [[end]], and [[ctx]].
+
+==input macros*/
+#define CPCHARS(cond)                                   \
+    for(; (cond) && c && ptr < end; c = l_getc(ctx))    \
+        *((ptr)++) = c
+#define CPCHAR(cond)                             \
+    if((cond) && c && ptr < end)                 \
+    {                                            \
+        *((ptr)++) = c;                          \
+        c = l_getc(ctx);                         \
+    }
+/*@ %
+
+\subsection{Lexer}
+
+The [[l_lex]] function is the core of the lexer. It returns one of the
+terminal tokens; if this has a useful semantic value, it will overwrite
+the [[ast_null]] initially stored at [[out]].
+
+Whitespace separates tokens, so [[eat_ws]] is called, and the returned
+character [[c]] used to distinguish what kind of token has been
+encountered.
+
+==l_lex*/
+static int l_lex(YYSTYPE *out, pctx_t *ctx)
+{
+    int c = eat_ws(ctx);
+    *out = ast_null;
+    switch(c)
+    {
+    //match char//
+    default:
+        break;
+    }
+    //match op//
+    //match kwd//
+    //make token//
+}
+/*@ %
+
+End-of-input markers are recognised by the grammar. [[bison]] puns
+single characters as tokens, so we can return them immediately.
+
+==match char*/
+case '\0':
+case EOF:
+    return c;
+/*@ %
+
+A digit means a number must follow.
+
+==match char*/
+case '0' ... '9':
+    return make_number(out, ctx, c);
+/*@ %
+
+One or more newlines count as a single token, regardless of whitespace.
+
+==match char*/
+case '\n':
+    while((c = eat_ws(ctx)) == '\n');
+    l_ungetc(c, ctx);
+    return '\n';
+/*@ %
+
+Delimited tokens are strings which start and end with the same character.
+
+Anything surrounded by acute accents ``[[`]]'' represents an identifier,
+as in R.
+
+A string surrounded by apostrophes ``[[']]`` denotes a literal symbol.
+Two symbols with the same name are, in fact, the same object, so compare
+[[eq]].
+
+A string surrounded by quotation marks ``[["]]'' is a literal string.
+These are not, at present, very useful -- mostly for [[print]]ing,
+explaining why a program [[stop]]ped, and naming files to [[include]].
+
+==match char*/
+case '`':
+    return make_delim(out, ctx, '`', ID, make_sym);
+case '\'':
+    return make_delim(out, ctx, '\'', LIT_SYM, make_sym);
+case '\"':
+    return make_delim(out, ctx, '"', LIT_STR, make_str);
+/*@
+
+Some operators are two characters long. If [[c]] matches the start of
+one, check the next character. If that matches the next character of the
+same one, then that operator specifies the token we've lexed.
+
+Otherwise, put the second char back; the first character denotes a
+different operator, so return one of those instead.
+
+==match op*/
+int i = match_kwd_char(op2, lengthof(op2), c);
+if(i != -1)
+{
+    int token = c;
+    c = l_getc(ctx);
+    if(c == op2[i].str[1])
+        token = op2[i].token;
+    else
+        l_ungetc(c, ctx);
+    return make_tok(out, token);
+}
+/*@
+
+If [[c]] is an underscore, period or letter, it must be part of either a
+keyword or an identifier. Each keyword lexes to a different terminal.
+Identifiers lex to [[ID]], with a [[SYMBOL]] as semantic value.
+
+==match kwd*/
+if(c == '_' || c == '.' || isalpha(c))
+{
+    char *str = lex_id(ctx, c);
+    int i = match_kwd_str(kwd, lengthof(kwd), str);
+    if(i != -1) // keyword
+        return make_tok(out, kwd[i].token);
+    return make_sym(out, str, ID);
+}
+/*@
+
+Otherwise, [[c]] is probably some single-character operator. Return it;
+the grammar can complain if it isn't recognised.
+
+==make token*/
+return make_tok(out, c);
+/*@
+
+Terminals are not exclusively the grammar's concern. They'll be used
+later on by [[ir_convert]], so carry [[TOKEN]]s [[ast_t]]s as semantic
+values.
+
+==make_tok*/
+static inline int make_tok(YYSTYPE *out, int tok)
+{
+    *out = (ast_t) { .type = AST_TOKEN, .token = tok };
+    return tok;
+}
+/*@ %
+
+An identifier can contain digits, as well as underscores, periods and letters.
+
+==lex_id*/
+static char *lex_id(pctx_t *ctx, int c)
+{
+    char *ptr = ctx->buf, *end = ctx->buf + L_BUFSIZE - 1;
+
+    CPCHARS(isalnum(c) || c == '_' || c == '.');
+    l_ungetc(c, ctx);
+    assert(ptr < end);
+    *ptr = '\0';
+    return ctx->buf;
+}
+/*@ %
+
+\subsection{Numbers}
+
+Literal integers and double-precision floating-point reals are
+represented by the tokens [[LIT_INT]] and [[LIT_DBL]], respectively.
+
+==numbers*/
+//make_integer//
+//make_double//
+//lex_number//
+//make_number//
+/*@
+
+Whether the digit [[c]] begins the former or the latter is determined by
+[[lex_number]].
+
+==make_number*/
+static int make_number(YYSTYPE *out, pctx_t *ctx, int c)
+{
+    int tok = lex_number(ctx, c);
+    if(tok == LIT_DBL)
+        return make_double(out, ctx);
+    else if(tok == LIT_INT)
+        return make_integer(out, ctx);
+    return tok;
+}
+/*@ %
+
+If a decimal point or exponent marker is encountered, it's a double,
+otherwise it's an integer. Digits (and these markers, if present) are
+copied into the context's scratch buffer [[.buf]].
+
+==lex_number*/
+static int lex_number(pctx_t *ctx, int c)
+{
+    char *ptr = ctx->buf, *end = ctx->buf + L_BUFSIZE - 1;
+    int tok = LIT_INT;
+    CPCHARS(isdigit(c));
+    if(c == '.')
+    {
+        tok = LIT_DBL;
+        CPCHAR(true);
+        CPCHARS(isdigit(c));
+    }
+    if(c == 'e' || c == 'E')
+    {
+        tok = LIT_DBL;
+        CPCHAR(true);
+        CPCHAR(c == '+' || c == '-');
+        CPCHARS(isdigit(c));
+    }
+    l_ungetc(c, ctx);
+    assert(ptr < end);
+    *ptr = '\0';
+    return tok;
+}
+/*@ %
+
+From there, an integer can be lexed with [[strtol]]\ldots
+
+==make_integer*/
+static int make_integer(YYSTYPE *out, pctx_t *ctx)
+{
+    long int val = 0;
+    char *ptr;
+    errno = 0;
+    val = strtol(ctx->buf, &ptr, 10);
+    if(ptr == ctx->buf)
+    {
+        yyerror(ctx, "can't parse integer literal");
+        return LEXERR;
+    }
+    else if(errno == ERANGE || val > INT_MAX || val < INT_MIN)
+    {
+        yyerror(ctx, "integer literal out of range");
+        return LEXERR;
+    }
+
+    *out = (ast_t) { .type = AST_INT, .integer = (int)val };
+    return LIT_INT;
+}
+/*@ %
+
+\ldots or a double, with [[strtod]].
+
+==make_double*/
+static int make_double(YYSTYPE *out, pctx_t *ctx)
+{
+    double val = 0;
+    char *ptr;
+    errno = 0;
+    val = strtod(ctx->buf, &ptr);
+    if(ptr == ctx->buf)
+    {
+        yyerror(ctx, "can't parse floating-point literal");
+        return LEXERR;
+    }
+    else if(errno == ERANGE)
+    {
+        yyerror(ctx, "floating-point literal out of range");
+        return LEXERR;
+    }
+
+    *out = (ast_t) { .type = AST_DOUBLE, .dfloat = val };
+    return LIT_DBL;
+}
+/*@ %
+
+A [[LEXERR]] is returned instead if the literal value is out of range or
+otherwise invalid.
+
+\subsection{Quotation}
+
+Quoted identifiers, and literal symbols and strings, are all delimited
+tokens. Assuming an end [[delim]] is found, the [[assign]] function can
+create an [[ast_t]] from the copied characters and return the token.
+
+==make_delim*/
+static inline int make_delim(YYSTYPE *out, pctx_t *ctx, char delim, int tok,
+                             int (*assign)(YYSTYPE *, char *, int))
+{
+    if(!lex_quoted(ctx, delim))
+        return LEXERR;
+    return assign(out, ctx->buf, tok);
+}
+/*@ %
+
+Within a delimited token, the backslash ``[[\]]'' introduces an escape
+sequence, but currently only newline is specially handled.
+
+==lex_quoted*/
+static bool lex_quoted(pctx_t *ctx, char close)
+{
+    char *ptr = ctx->buf, *end = ctx->buf + L_BUFSIZE - 1;
+    int c = l_getc(ctx);
+
+    while(1)
+    {
+        CPCHARS(c != close && c != '\\');
+        if(c == '\\')
+        {
+            c = l_getc(ctx);
+            if(c=='n')
+                c = '\n';
+            CPCHAR(true);
+            continue;
+        }
+        break;
+    }
+
+    if(c != close)
+    {
+        l_ungetc(c, ctx);
+        return false;
+    }
+    assert(ptr < end);
+    *ptr = '\0';
+    return true;
+}
+/*@ %
+
+A [[SYMBOL]] will probably be interpreted as a variable name, whereas
+when [[QUOTED]] it will denote itself, as a literal.
+
+==make_sym*/
+static inline int make_sym(YYSTYPE *out, char *str, int tok)
+{
+    asttype type = (tok == ID) ? AST_SYMBOL : AST_QUOTED;
+    *out = (ast_t) { .type = type, .symbol = r_intern(str) };
+    return tok;
+}
+/*@ %
+
+A [[STRING]] copies its value out of the scratch buffer to somewhere
+more permanent.
+
+==make_str*/
+static inline int make_str(YYSTYPE *out, char *str, int tok)
+{
+    *out = (ast_t) { .type = AST_STRING, .string = strdup(str) };
+    return tok;
+}
+/*@ %
+
+\subsection{Keywords and Operators}
+
+==keywords*/
+//kwdspec_t//
+//op2//
+//kwd//
+//match_kwd_char//
+//match_kwd_str//
+//make_tok//
+//find_kwd//
+//ast_str//
+/*@
+
+A keyword specifier pairs a string with a token.
+
+==kwdspec_t*/
+typedef struct
+{
+    const char *str;
+    int token;
+} kwdspec_t;
+/*@ %
+
+[[op2]] specifies the two-character-long operators.
+
+==op2*/
+static const kwdspec_t op2[] = {
+    { "&&", AND },
+    { "||", OR },
+    { "!=", NE },
+    { "==", EQ },
+    { ">=", GE },
+    { "<=", LE },
+};
+/*@ %
+
+[[kwd]] specifies the keywords.
+
+==kwd*/
+static const kwdspec_t kwd[] = {
+    { "type", TYPE },
+    { "if", IF },
+    { "else", ELSE },
+    { "function", FUNCTION },
+    { "return", RET },
+    { "while", WHILE },
+    { "for", FOR },
+    { "break", BREAK },
+    { "continue", CONTINUE },
+    { "let", LET },
+    { "var", VAR },
+    { "global", GLOBAL },
+    { "const", CONST },
+    { "include", INCLUDE },
+};
+/*@ %
+
+Helper functions match, against a table of keyword specifiers, a single character\ldots
+
+==match_kwd_char*/
+static int match_kwd_char(const kwdspec_t *tab, int len, int c)
+{
+    for(int i=0; i<len; i++)
+        if(tab[i].str[0] == c)
+            return i;
+    return -1;
+}
+/*@ %
+
+\ldots or a string. The index of the matching specifier is returned;
+[[-1]] if none was found.
+
+==match_kwd_str*/
+static int match_kwd_str(const kwdspec_t *tab, int len, char *str)
+{
+    for(int i=0; i<len; i++)
+        if(!strcmp(tab[i].str, str))
+            return i;
+    return -1;
+}
+/*@ %
+
+It is sometimes necessary to ``unlex'' an [[ast_t]] back to a string --
+currently, this only applies to [[SYMBOL]]s, [[NAME]]s and [[TOKEN]]s.
+This is easy enough for the first two; the last needs a search through
+the specifier tables for one with a matching [[.token]].
+
+==ast_str*/
+const char *ast_str(ast_t *ast)
+{
+    static char buf[2];
+
+    assert(ast->type == AST_SYMBOL || ast->type == AST_NAME || ast->type == AST_TOKEN);
+    if(ast->type == AST_SYMBOL || ast->type == AST_NAME)
+        return r_symstr(ast->symbol);
+
+    const char *str = find_kwd(op2, lengthof(op2), ast->token);
+    if(str)
+        return str;
+    str = find_kwd(kwd, lengthof(kwd), ast->token);
+    if(str)
+        return str;
+    buf[0] = ast->token;
+    return buf;
+}
+/*@ %
+
+The [[find_kwd]] helper performs this reverse lookup.
+
+==find_kwd*/
+static const char *find_kwd(const kwdspec_t *tab, int len, int token)
+{
+    for(int i=0; i<len; i++)
+        if(tab[i].token == token)
+            return tab[i].str;
+    return NULL;
+}
+/*@ %
+
+\subsection{Lexer Wrapper}
+
+Some `features' of the language require collusion between the lexer and
+the grammar. [[yylex]], the traditional \texttt{bison} entry point
+function, implements these workarounds.
+
+==yylex*/
+int yylex(YYSTYPE *out, pctx_t *ctx)
+{
+    //lexer wrapper//
+}
+/*@ %
+
+If a lookahead token [[.ltok]] is present, it should be consumed instead
+of invoking [[l_lex]].
+
+==lexer wrapper*/
+int tok;
+if(ctx->ltok != tok_empty)
+{
+    tok = ctx->ltok;
+    *out = ctx->lval;
+    ctx->ltok = tok_empty;
+    ctx->lval = (ast_t){ 0 };
+}
+else
+    tok = l_lex(out, ctx);
+/*@
+
+If, following an [[if]] expression and its terminating newline, an
+[[else]] is seen, it's passed through to the grammar. Otherwise a
+terminating ``[[;]]'' is synthesised, and the lexed token saved.
+
+==lexer wrapper*/
+if(ctx->ifexpr)
+{
+    if(tok != ELSE)
+    {
+        ctx->ltok = tok;
+        ctx->lval = *out;
+        tok = ';';
+    }
+    ctx->ifexpr = false;
+}
+/*@
+
+Expressions can continue over several lines. If a newline can't be
+interpreted as terminating a ``complete'' expression (as signaled by the
+[[.expr]] flag in collusion with rule actions,) it should be skipped;
+the following token is returned by the tail call. Setting the [[.brk]]
+flag gives the interactive parser loop the opportunity to accept further
+input.
+
+==lexer wrapper*/
+if(tok == '\n')
+{
+    if(!ctx->expr)
+    {
+        ctx->brk = true;
+        return yylex(out, ctx);
+    }
+}
+ctx->expr = false;
+return tok;
+/*@
+
+When a nonterminal that could end an expression is reduced, its rule
+sets [[.expr]] to signal that, should the following token be a newline,
+it's significant to the grammar and the lexer ought not to eat it.
+
+Needless to say, this is frightfully ad-hoc and fragile -- if
+\texttt{bison} needs a lookahead token to decide between shifting and
+reducing the rule, the action won't be able to write [[.expr]] until
+after the lexer's read it.
+
+
+\section{Grammar}
+\label{parser:grammar}
+
+The grammar is block-structured, curly-braced and expression-oriented,
+hewing close to R. It's fairly relaxed, in the sense that not all
+recognised inputs are legal programs (this is determined during
+conversion to IR, in \autoref{ir_convert}.)
+
+If the parser encounters an error, it notifies its caller. Otherwise, a
+list of expressions has been recognised. The [[.done]] flag is set and
+the [[.result]] updated -- this [[NODE]] is the root of the tree;
+each child being a top-level expression.
+
+%% when moving error handling to allow detecting more than one syntax
+%% error, be sure to reset ctx flags!
+==rules*/
+start:      exprlist { ctx->done = true; ctx->result = $1; }
+    |       error { YYABORT; } ;
+/*@ %
+
+An expression list is a sequence of declaration expressions.
+
+==rules*/
+exprlist:   dexpr { $$ = AST1($1); }
+    |       exprlist eos dexpr { $$ = PUSH($1, $3); }
+    |       exprlist eos { $$ = $1; } ;
+/*@ %
+
+They are separated by newlines or semicolons. If the former is
+encountered while within a nested construct, more input is solicited
+from the interactive parser loop with [[.brk]].
+
+==rules*/
+eos:        '\n' { if(ctx->nest > 0) ctx->brk = true; }
+    |       ';' ;
+/*@ %
+
+The lexer consumes newlines only when it's certain it's safe to do so,
+passing them to the grammar in all other cases. If needed, they can then
+be ignored with the [[nl]] rule, which matches an optional newline.
+
+==rules*/
+nl:         { $$ = ast_null; } | '\n' { ctx->brk = true; } ;
+/*@ %
+
+Parentheses ``[[(]]'', brackets ``[[[]]'', and braces ``[[{]]'' surround
+nested constructs.
+
+==rules*/
+paren:      '(' { ctx->nest++; } ;
+bracket:    '[' { ctx->nest++; } ;
+brace:      '{' { ctx->nest++; } ;
+/*@ %
+
+A newline appearing before the closing delimiter of a parenthesised or
+bracketed construct can be ignored (but not braced, as it would
+conflict with a trailing [[eos]].)
+
+==rules*/
+parclo:     nl ')' { ctx->nest--; } ;
+brkclo:     nl ']' { ctx->nest--; } ;
+braclo:     '}' { ctx->nest--; } ;
+/*@ %
+
+A declaration expression is a declaration list introduced with one of
+``[[let]]'', ``[[var]]'', ``[[global]]'', or ``[[const]]''; or an
+assignment expression.
+
+==rules*/
+dexpr:      aexpr
+    |       LET decllist { $$ = AST2($1, $2); }
+    |       VAR decllist { $$ = AST2($1, $2); }
+    |       GLOBAL decllist { $$ = AST2($1, $2); }
+    |       CONST decllist { $$ = AST2($1, $2); } ;
+/*@ %
+
+An assignment expression is just an expression; or an assignment
+``[[=]]'', with an expression on the left-hand side and another
+assignment expression on the right-hand side (this is a separate rule
+because the same symbol is used to name actual arguments in a function
+call expression.)
+
+==rules*/
+aexpr:      expr %prec '=' { $$ = $1; }
+    |       expr '=' aexpr { $$ = AST3($2, $1, $3); } ;
+/*@ %
+
+A parenthesised expression is just an [[aexpr]] inside
+parentheses.
+
+==rules*/
+pexpr:      paren aexpr parclo { $$ = $2; } ;
+/*@ %
+
+An expression is an [[if]] expression, an [[if]] expression followed by
+an [[else]] expression, or a primary expression. This may end a complete
+expression, so the [[.expr]] flag is set upon reduction to signal the
+lexer.
+
+==rules*/
+expr:       primary
+            {
+                $$ = $1;
+                if(yychar == YYEMPTY || yychar == '\n')
+                    ctx->expr = true;
+            }
+    |       ifexpr { $$ = $1; ctx->expr = true; }
+    |       ifexpr elseexpr { $$ = PUSH($1, $2); ctx->expr = true; } ;
+/*@ %
+
+When an [[if]] expression is followed immediately by a newline within a
+nested construct, the lexer is informed via the [[.ifexpr]] flag, and
+the newline discarded.
+
+The value of the [[else]] expression's [[aexpr]] is just appended to the
+preceding AST (since it'll always be an [[ifexpr]].)
+
+==rules*/
+ifexpr:     IF pexpr aexpr
+            {
+                $$ = AST3($1, $2, $3);
+                if(yychar == '\n' && ctx->nest > 0)
+                {
+                    ctx->ifexpr = true;
+                    yyclearin;
+                    ctx->brk = true;
+                }
+            } ;
+elseexpr:   ELSE aexpr { $$ = $2; } ;
+/*@ %
+
+The primary expression rule comprises most other expressions in the
+language.
+
+Identifiers, literals, parenthesised expressions for overriding
+precedence, unary and binary operations are all fairly conventional.
+
+==rules*/
+primary:    ID
+    |       literal
+    |       pexpr
+    |       block
+    |       unary
+    |       binary
+/*@ %
+
+A function call inserts the expression denoting the callee as the first
+child of the resulting [[NODE]], in the manner of a LISP S-expression
+\citep{mccarthy60}.
+
+A subscript operation inserts the expression denoting the collection
+being indexed into as the second child; the first will be ``[[[]]''
+(which may be pronounced ``[[aref]]''.)
+
+==rules*/
+    |       expr args { $$ = END1($2, $1); }
+    |       expr subs { $$ = ENDN($2, $1, 1); }
+/*@ %
+
+A function expression has a list of formal arguments, an optional return
+type, and an [[aexpr]] body.
+
+==rules*/
+    |       FUNCTION formals rtopt nl aexpr { $$ = AST4($1, $3, $2, $5); }
+/*@ %
+
+A [[while]] loop takes a [[pexpr]] for its predicate, but a [[for]] loop
+requires a more complex list. Both also have [[aexpr]] bodies.
+
+==rules*/
+    |       WHILE pexpr aexpr { $$ = AST3($1, $2, $3); }
+    |       FOR forlist aexpr { PUSH($2, $3); $$ = END1($2, $1); }
+/*@ %
+
+[[break]], [[continue]] and [[return]] transfer control flow, and should
+probably be considered statements by the grammer (IR conversion does so
+in its stead.)
+
+==rules*/
+    |       RET expr { $$ = AST2($1, $2); }
+    |       BREAK
+    |       CONTINUE
+/*@ %
+
+The file named by the argument of [[include]] will be read and parsed
+during IR conversion, its AST taking the place of the expression in the
+including program.
+
+==rules*/
+    |       INCLUDE LIT_STR { $$ = AST2($1, $2); } ;
+/*@ %
+
+A lexed literal token is a literal, as is a type expression -- the
+terminal ``[[type]]'' followed by a type specifier in parentheses.
+
+==rules*/
+literal:    LIT_INT | LIT_DBL | LIT_BOOL | LIT_STR | LIT_SYM
+    |       TYPE paren type parclo { $$ = AST2($1, $3); } ;
+/*@ %
+
+A block is a brace-delimited list of expressions. Unlike a top-level
+[[exprlist]], the [[NODE]] created begins with a ``[[{]]'' terminal.
+
+==rules*/
+block:      brace exprlist braclo { $$ = PREP($2, $1); }
+    |       brace braclo { $$ = AST1($1); } ;
+/*@ %
+
+The application of a unary operator takes an expression as its operands
+(because [[bison]] runs before [[cpp]], macros involving the [[$n]]
+semantic variables can't be defined nicely outside.)
+
+The operator token is placed first in the [[NODE]], like a function
+call.
+
+==rules*/
+unary:      '!' expr
+            {
+                #define UNOP $$ = AST2($1, $2)
+                UNOP;
+            }
+    |       '-' expr %prec UMINUS { UNOP; }
+    |       '+' expr %prec UPLUS  { UNOP; }
+/*@ %
+
+Binary operators operate in a similar manner.
+
+==rules*/
+binary:     expr ':' expr
+            {
+                #define BINOP $$ = AST3($2, $1, $3)
+                BINOP;
+            }
+    |       expr '+' expr { BINOP; }
+    |       expr '-' expr { BINOP; }
+    |       expr '*' expr { BINOP; }
+    |       expr '/' expr { BINOP; }
+    |       expr '^' expr { BINOP; }
+    |       expr '%' expr { BINOP; }
+    |       expr '&' expr { BINOP; }
+    |       expr '|' expr { BINOP; }
+    |       expr '<' expr { BINOP; }
+    |       expr LE expr  { BINOP; }
+    |       expr EQ expr  { BINOP; }
+    |       expr NE expr  { BINOP; }
+    |       expr GE expr  { BINOP; }
+    |       expr '>' expr { BINOP; }
+    |       expr AND expr { BINOP; }
+    |       expr OR expr  { BINOP; } ;
+/*@ %
+
+The return type of a function is, if specified, separated from the
+argument list by a ``[[:]]'' terminal. Formal arguments themselves are
+optional, but the enclosing parentheses are not.
+
+==rules*/
+rtopt:      { $$ = ast_null; } | ':' type { $$ = $2; } ;
+formals:    paren decllist parclo { $$ = $2; }
+    |       paren parclo { $$ = ast_va(NULL); } ;
+/*@ %
+
+A [[for]] loop takes, in order, an optional list of declarations, a
+conditional, and an optional iteratior, enclosed in parentheses and
+separated by semicolons.
+
+==rules*/
+forlist: paren dlopt ';' aexpr ';' aexopt parclo
+    { $$ = AST4(ast_null, $2, $4, $6); } ;
+dlopt:      { $$ = ast_null; }
+    |       decllist ;
+aexopt:     { $$ = ast_null; }
+    |       aexpr ;
+/*@ %
+
+Lists of actual arguments and subscripts differ only in the brackets
+they're enclosed in.
+
+The empty [[args]] and [[subs]] can't consume an optional newline
+without introducing ambiguity, so must mention their closing delimiter
+(and reduce the [[.nest]] count) explicitly.
+
+==rules*/
+args:       paren arglist parclo { $$ = $2; }
+    |       paren ')' { $$ = AST1(ast_null); ctx->nest--; } ;
+subs:       bracket arglist brkclo { $$ = PREP($2, $1); }
+    |       bracket ']' { $$ = AST2($1, ast_null); ctx->nest--; } ;
+/*@ %
+
+Each argument in the comma-separated list can be omitted (its element in
+the call's [[NODE]] will be [[INVALID]]) or preceded by a [[name]]
+``[[=]]'' (the name likewise precedes the argument expression's element
+in the call.)
+
+==rules*/
+arglist:    arg { $$ = AST2(ast_null, $1); }
+    |       name '=' expr { $$ = AST3(ast_null, $1, $3); }
+    |       arglist ',' arg { $$ = PUSH($1, $3); }
+    |       arglist ',' name '=' expr { PUSH($1, $3); $$ = PUSH($1, $5); } ;
+arg:        { $$ = ast_null; } | expr ;
+/*@ %
+
+A [[name]] is lexed as an identifier, but parsed with a type of [[NAME]]
+instead of [[SYMBOL]], so IR conversion can distinguish otherwise
+ambiguous AST sequences.
+
+==rules*/
+name:       ID { $$ = $1; $$.type = AST_NAME; ctx->expr = true; } ;
+/*@ %
+
+Declaration lists are comma-separated and non-empty. A declaration
+comprises a name, which may be preceded by an optional type specifier
+and followed by an optional initial expression.
+
+==rules*/
+decllist:   decl { $$ = AST1($1); }
+    |       decllist ',' decl { $$ = PUSH($1, $3); } ;
+decl:       name
+    |       name initexpr { $$ = AST2($1, $2); }
+    |       type name { $$ = AST2($1, $2); }
+    |       type name initexpr { $$ = AST3($1, $2, $3); } ;
+initexpr:   '=' expr { $$ = $2; } ;
+/*@ %
+
+Types are either named or constructed. [[type]] and [[function]] are
+type names but also terminal symbols, so don't lex as [[name]]s and must
+be matched separetely. Constructor invocation follows the name with a
+parenthesis-enclosed comma-separated list of type arguments.
+
+The [[function]] type also allows specification of return type in the
+same manner as a function expression (it ends up the second child in the
+[[NODE]], and is [[INVALID]] if omitted.)
+
+==rules*/
+type:       name
+    |       name typeargs { $$ = END1($2, $1); }
+    |       TYPE
+    |       FUNCTION
+    |       FUNCTION typeargs { $$ = PREP($2, $1); }
+    |       FUNCTION typeargs ':' type { END1($2, $4); $$ = PREP($2, $1); } ;
+typeargs:   paren typelist parclo { $$ = $2; }
+    |       paren parclo { $$ = AST1(ast_null); } ;
+typelist:   type { $$ = AST2(ast_null, $1); }
+    |       typelist ',' type { $$ = PUSH($1, $3); } ;
+/*@ %
+
+
+\section{Parser Interface}
+
+Connecting input sources to the lexer and generated [[yyparse]]
+functions is the purpose of the [[parser.c]] module.
+
+==parser.c*/
+//parser includes//
+//ast_null//
+//file_getc//
+//file_ungetc//
+//linedata_t//
+//line_getc//
+//line_ungetc//
+//pctx_init//
+//pctx_fini//
+//read_line//
+//parse_line//
+//p_readline//
+//p_file//
+//p_source//
+//yyerror//
+/*@
+
+[[stdio]] handles buffering when reading from files. The [[FILE]]
+pointer is stashed in the parser context's [[.data]] field.
+
+==file_getc*/
+static int file_getc(pctx_t *ctx)
+    { return getc(ctx->data); }
+/*@ %
+
+==file_ungetc*/
+static void file_ungetc(int c, pctx_t *ctx)
+    { ungetc(c, ctx->data); }
+/*@ %
+
+For a line read interactively, we keep the string [[.str]], a cursor
+[[.ptr]], and the limit [[.end]].
+
+==linedata_t*/
+typedef struct
+{
+    char *str, *ptr, *end;
+} linedata_t;
+/*@ %
+
+The string returned by [[readline]] ends in a [[NUL]] byte, although the
+user typed a newline. We undo this. Reading past the end of the line
+returns [[EOF]].
+
+==line_getc*/
+static int line_getc(pctx_t *ctx)
+{
+    linedata_t *data = ctx->data;
+    int c = EOF;
+
+    if(data->ptr < data->end)
+        c = *data->ptr++;
+    if(c == '\0')
+        c = '\n';
+    return c;
+}
+/*@ %
+
+Once this occurs, the stream has ended, and further reads will always
+return [[EOF]] (no error checking here; the lexer oughtn't [[.ungetc]]
+with a value not returned by the previous [[.getc]].)
+
+==line_ungetc*/
+static void line_ungetc(int c, pctx_t *ctx)
+{
+    linedata_t *data = ctx->data;
+
+    if(c != EOF)
+        data->ptr--;
+}
+/*@ %
+
+Parser context is initialised by setting the input fields, allocating a
+new [[bison]] state and temporary lexer buffer.
+
+==pctx_init*/
+static void pctx_init(pctx_t *ctx, int (*get)(pctx_t *),
+                      void (*unget)(int, pctx_t *), void *data)
+{
+    *ctx = (pctx_t) {
+        .ps = yypstate_new(),
+        .result = ast_null,
+        .buf = xmalloc(L_BUFSIZE),
+        .ltok = tok_empty,
+        .get = get,
+        .unget = unget,
+        .data = data
+    };
+}
+/*@ %
+
+(which must be deallocated when no longer needed.)
+
+==pctx_fini*/
+static void pctx_fini(pctx_t *ctx)
+{
+    yypstate_delete(ctx->ps);
+    xfree(ctx->buf);
+}
+/*@ %
+
+The generated parser calls [[yyerror]] when a syntax error is
+encountered; its message is forwarded to the compiler for later display.
+
+==yyerror*/
+void yyerror(pctx_t *ctx, const char *err)
+{
+    c_error("%s", err);
+}
+/*@ %
+
+Parsing a file initialises the context with [[.nest]] nonzero -- the
+newline following an [[if]] expression's consequent mustn't be
+interpreted as ending the [[if]] without first looking ahead for an
+[[else]].
+
+[[yypull_parse]] calls [[yylex]] repeatedly, constructs the
+AST and, if successful, returns zero. After extracting the desired
+[[.result]], so do we.
+
+If unsuccessful, this must be freed -- it's possible for some
+[[exprlist]] to have reduced to [[start]] (assigning [[.result]]), then
+an unexpected token cause a syntax error.
+
+==p_file*/
+static int p_file(FILE *input, ast_t *result)
+{
+    int status;
+    pctx_t ctx;
+
+    pctx_init(&ctx, file_getc, file_ungetc, input);
+    ctx.nest = 1;
+    status = yypull_parse(ctx.ps, &ctx);
+    if(status == 0)
+        *result = ctx.result;
+    else
+        ast_fini(&ctx.result);
+    pctx_fini(&ctx);
+    return status;
+}
+/*@ %
+
+A convenience wrapper handles the [[FILE]], allowing users to specify a
+filename instead.
+
+==p_source*/
+int p_source(char *name, ast_t *result)
+{
+    int r;
+    FILE *fp = fopen(name, "r");
+
+    if(fp)
+    {
+        r = p_file(fp, result);
+        fclose(fp);
+    }
+    else
+        r = -errno;
+    return r;
+}
+/*@ %
+
+Parsing interactive input is done a line at a time. The parser context
+is initialised, and an initial prompt [[p1]] is displayed. A line is
+read from the terminal; if successful (i.e. the user didn't input
+[[EOF]]) the line is parsed and the prompt changed to the continuation
+[[p2]]. This goes on until the user quits, or the parser encounters a
+syntax error, or the start nonterminal is recognised.
+%cite GNU readline
+
+==p_readline*/
+int p_readline(char *p1, char *p2, ast_t *result)
+{
+    linedata_t data;
+    pctx_t ctx;
+    int status;
+    char *prompt = p1;
+
+    pctx_init(&ctx, line_getc, line_ungetc, &data);
+    do
+    {
+        status = read_line(&ctx, prompt);
+        if(status != 0)
+            break;
+        status = parse_line(&ctx, prompt == p1);
+        prompt = p2;
+    } while(status == YYPUSH_MORE);
+    if(status == 0)
+        *result = ctx.result;
+    else
+        ast_fini(&ctx.result);
+    pctx_fini(&ctx);
+    return status;
+}
+/*@ %
+
+[[readline]] prints the [[prompt]] and handles terminal input, returning
+[[NULL]] on [[EOF]]. If the [[line]] isn't blank, we add it to the input
+history. The [[linedata_t]] is initialised with the cursor at the
+beginning, and the limit set to encompass the length of the string plus
+the terminating [[NUL]].
+
+==read_line*/
+static int read_line(pctx_t *ctx, char *prompt)
+{
+    linedata_t *data = ctx->data;
+    char *line = readline(prompt);
+
+    rl_free_undo_list();
+    if(!line)
+        return -1;
+    if(*line)
+        add_history(line);
+    *data = (linedata_t) {
+        .str = line,
+        .ptr = line,
+        .end = line + strlen(line) + 1
+    };
+    return 0;
+}
+/*@
+
+Tokens are [[yylex]]ed from the line buffer and fed to [[yypush_parse]]
+one at a time, as it continues to return [[YYPUSH_MORE]]. [[.brk]] has
+the opportunity to interrupt input after either step. If the user's
+initial line is blank, we return with [[status]] 1 to quit the outer
+loop.
+
+Whichever way the inner loop ends, the input string can now be
+discarded.
+
+==parse_line*/
+static int parse_line(pctx_t *ctx, bool isfirst)
+{
+    linedata_t *data = ctx->data;
+    int status = isfirst ? 1 : YYPUSH_MORE;
+
+    ctx->brk = false;
+    do
+    {
+        ast_t val;
+        int tok = yylex(&val, ctx);
+        if(!ctx->brk)
+            status = yypush_parse(ctx->ps, tok, &val, ctx);
+    } while(!ctx->brk && status == YYPUSH_MORE);
+    xfree(data->str);
+    return status;
+}
+/*@
+
+
+\section*{Miscellanea}
+
+%% grammar.y
+==grammar includes*/
+#include "global.h"
+#include "ast.h"
+#include "grammar.h"
+/*@ %
+
+==prototypes*/
+static ast_t ast_va(ast_t *head, ...);
+static ast_t ast_set(ast_t *expr, ast_t *ast, int i);
+static ast_t ast_append(ast_t *expr, ast_t *ast);
+static ast_t ast_prepend(ast_t *expr, ast_t *ast);
+/*@ %
+
+==tok_empty*/
+const int tok_empty = YYEMPTY;
+/*@ %
+
+%% lexer.c
+==lexer includes*/
+#include "global.h"
+#include "ast.h"
+#include "grammar.h"
+#include <ctype.h>
+#include <limits.h>
+#include <errno.h>
+/*@ %
+
+%% parser.c
+==parser includes*/
+#include "global.h"
+#include "ast.h"
+#include "grammar.h"
+#include <signal.h>
+#include <errno.h>
+#include <readline/readline.h>
+#include <readline/history.h>
+/*@ %
+
+%% ast.h
+==ast.h*/
+//asttype//
+//ast_t//
+//ast_is_rest//
+//ast_is_omitted//
+//ast prototypes//
+/*@
+
+==ast prototypes*/
+void ast_fini(ast_t *ast);
+const char *ast_str(ast_t *ast);
+int p_source(char *name, ast_t *ast);
+int p_readline(char *p1, char *p2, ast_t *result);
+/*@ %
+
+%% grammar.h
+==grammar.h*/
+//YYSTYPE//
+//pctx_t//
+//grammar externs//
+//L_BUFSIZE//
+//grammar prototypes//
+/*@ %
+
+==grammar externs*/
+extern ast_t ast_null;
+extern const int tok_empty;
+/*@ %
+
+==L_BUFSIZE*/
+#define L_BUFSIZE 256
+/*@ %
+
+==grammar prototypes*/
+int yylex(YYSTYPE *out, pctx_t *ctx);
+void yyerror(pctx_t *ctx, const char *err);
+/*@ %
+
+%*/
+

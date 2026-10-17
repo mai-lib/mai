@@ -1,0 +1,19 @@
+
+Build the executable: `make build`
+	This requires GCC 5ish, Bison 3.0, sed, GNU M4.
+        This produces the binary 'build/main'
+
+Build the pdf: `make doc`
+	This requires noweb and a LaTeX distribution.
+        This produces the document 'writeup.pdf' formatted for binding.
+
+Build both: `make all`
+
+Remove all intermediates and outputs: `make clean`
+
+Remove all source files as well: `make distclean`
+	noweb will be required to extract them from the .nw documents.
+
+`make V=1 [target]` to see verbose commands.
+`make DEBUG=1 [target]` to set CFLAGS for debugging.
+`make DOC=preview doc` for slightly nicer on-screen reading (perhaps).

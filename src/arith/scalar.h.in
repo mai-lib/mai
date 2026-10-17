@@ -1,0 +1,124 @@
+/*
+  m4_include(`arith/arith.m4')
+*/
+
+// return true if the value is NA
+#define boolean_na(v) ((v) == rboolean_na)
+#define int_na(v) ((v) == rint_na)
+#define double_na(v) (isnan(v))
+// convert the value to the type
+#define boolean_conv(v) ((v) != 0)
+#define double_conv(v) (rdouble_t)(v)
+#define int_conv(v) ((((v) > INT_MAX) | ((v) <= INT_MIN)) ? rint_na : (rint_t)(v))
+
+// do not take `r`: compute it explicitly and hope that common
+// subexpression elimination does its thing.
+// return true if the operation over- or underflowed
+#define add_xflow(x, y) ((x > 0) ^ (y < (x + y)))
+#define signs(a, b) ((a < 0) ^ (b < 0))
+#define sub_xflow(x, y) (signs(x, y) & signs(x, (x - y)))
+#define mul_xflow(x, y) (((int64_t)x * (int64_t)y) != (x * y))
+#define div_xflow(x, y) (y==0)
+// XXX inefficient
+#define pow_xflow(x, y) (fabs(pow(x,y)) > (INT_MAX-1))
+
+// m4_define({{expand_binary}}, {{
+static inline rtype_t paste(arith, op_name, xtype, ytype)(xtype_t x, ytype_t y)
+{
+    return (check_na(x, xtype) | check_na(y, ytype) | op_xflow(x, y))
+        ? make_na(rtype)
+        : op_binary(x, y);
+}
+// }})
+// m4_define({{expand_unary}}, {{
+static inline rtype_t paste(arith, op_name, xtype)(xtype_t x)
+{
+    rtype_t r = op_unary(x);
+    return check_na(x, xtype) ? make_na(rtype) : r;
+}
+// }})
+// M4 prefer native double NA handling, thanks to C arithmetic conversion
+// m4_pushdef({{double_na}}, {{0}})
+
+// for_types({{numeric_types}}, {{
+// for_ops({{arith_ops}}, {{
+expand_binary()
+// }})
+// }})
+
+// for_type({{numeric_types}}, {{
+// for_ops({{arith_unary_ops}}, {{
+expand_unary()
+// }})
+// }})
+
+// M4 for other ops, we must explicitly check
+// m4_popdef({{double_na}})
+// M4 overflow doesn't occur outside arithmetic
+// m4_pushdef({{op_xflow}}, {{0}})
+// M4 ops from now on return boolean
+// m4_pushdef({{rtype}}, {{boolean}})
+
+// for_types({{numeric_types}}, {{
+// for_ops({{rela_ops}}, {{
+expand_binary()
+// }})
+// }})
+// for_types({{scalar_types}}, {{
+// for_ops({{eql_ops}}, {{
+expand_binary()
+// }})
+// }})
+
+// m4_pushdef({{xtype}}, {{boolean}}) m4_pushdef({{ytype}}, {{boolean}})
+// for_ops({{bool_ops}}, {{
+expand_binary()
+// }})
+// for_ops({{bool_unary_ops}}, {{
+expand_unary()
+// }})
+// m4_popdef({{xtype}}) m4_popdef({{ytype}})
+// for_type({{scalar_types}}, {{
+static inline rboolean_t paste(arith, is_na, xtype)(xtype_t x)
+{
+    return check_na(x, xtype);
+}
+// }})
+
+// M4 reset defs to default
+// m4_popdef({{rtype}})
+// m4_popdef({{op_xflow}})
+// for_types({{scalar_types}}, {{
+// m4_ifelse(xtype, ytype, {{}}, {{
+static inline ytype_t paste(arith, conv, xtype, to, ytype)(xtype_t x)
+{
+    return (check_na(x, xtype)) ? make_na(ytype) : op_conv(x, ytype);
+}
+// }})
+// }})
+// for_type({{scalar_types}}, {{
+static inline xtype_t paste(arith, conv, ptr, to, xtype)(robject_t *x)
+{
+    if(r_typeof(x) != make_type_obj(xtype))
+        return make_na(xtype);
+    return UNBOX(xtype_t, x);
+}
+
+static inline robject_t *paste(arith, conv, xtype, to, ptr)(xtype_t x)
+{
+    robject_t *box = r_box_create(make_type_obj(xtype));
+    UNBOX(xtype_t, box) = x;
+    return box;
+}
+// }})
+enum {
+    CODE_boolean = SC_BOOLEAN,
+    CODE_int = SC_INT,
+    CODE_double = SC_DOUBLE,
+    CODE_MAX_SCALAR,
+    CODE_ptr = CODE_MAX_SCALAR,
+    CODE_MAX
+};
+enum {
+    CODE_sca, CODE_vec
+};

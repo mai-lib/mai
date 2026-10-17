@@ -1,0 +1,943 @@
+/*@
+\chapter{Inline Expansion}
+\label{opt_inline}
+
+If a call site is known to refer to another function in the program
+being compiled, it's possible to \textit{inline} a copy of the called
+function's body into the caller at that location. This transformation is
+also known as ``procedure integration'' or $\beta$-expansion.
+
+The inlining process commingles the contexts of the call site and called
+function \citep[Section 6]{wegman91} which can allow further
+optimisation -- in particular, the specialisation of functions with
+generic behaviour.
+%cite something for procedure integration?
+%cite lambda calculus?
+
+==opt_inline.c*/
+//includes//
+//ir copy//
+//ir fixup//
+//inline expansion//
+//heuristics//
+//can_inline//
+//inline_lambdas//
+/*@
+
+
+\section {Entry Point}
+\label{opt_inline:inline}
+
+The [[inline_lambdas]] function is called from the analysis-optimisation
+loop (\autoref{opt:opt}) with an array of [[nodes]]. These contain the
+call sites within the [[caller]] function known to invoke [[LAMBDA]]s
+whose IR objects are available to the compiler.
+
+Each such [[CALL]] [[node]] is considered; the [[callee]] extracted from
+its [[.target]]'s LatticeCell (\autoref{opt:cell}). If [[can_inline]]
+allows it, [[call_normalise]] statically matches the arguments
+(\autoref{opt_post:call}), and [[should_inline]] confirms it, the body
+of the called function is copied and spliced into the caller by
+[[expand_inline]].
+
+==inline_lambdas*/
+cresult inline_lambdas(cfunction_t *caller, cnode_array_t *nodes)
+{
+    cresult res = SUCCESS;
+    cnode_t *node;
+
+    if(!opt.opt_inline)
+        return SUCCESS;
+    array_foreach_entry(nodes, node)
+    {
+        assert(cell_const_lambda(cell_for(node->call.target)));
+        cfunction_t *callee = cell_const(cell_for(node->call.target));
+        funsig_t *sig = callee->cl_type->sig;
+
+        if(can_inline(node, caller, callee)
+           && call_normalise(node, sig) == CHANGED
+           && should_inline(node, caller, callee))
+            res |= expand_inline(node, caller, callee);
+    }
+    return res;
+}
+/*@
+
+Certain conditions prevent the inlining of the [[callee]] function in
+its [[caller]], and are detected by [[can_inline]].
+
+\begin{itemize}
+\item Functions are not inlined into themselves to avoid excessive
+  expansion.
+\item Functions are not inlined into the top-level function.
+\item Functions with closed variables are only inlined into their
+  lexical parent.
+\end{itemize}
+
+These are all overly conservative, and should be relaxed with
+appropriate implementation changes.
+
+==can_inline*/
+static bool can_inline(cnode_t *site, cfunction_t *caller, cfunction_t *callee)
+{
+    if(caller == callee)
+        return false;
+    if(!caller->parent)
+       return false;
+    if(!cfunc_has_closure(callee))
+        return true;
+    if(callee->parent == caller)
+        return true;
+    return false;
+}
+/*@
+
+
+\section{Heuristics}
+
+==heuristics*/
+//args_spec//
+//args_const//
+//score_function//
+//should_inline//
+/*@
+
+A very simple-minded, aggressive heuristic is implemented by the
+[[should_inline]] function. The [[caller]] may have no more than
+[[MAX_NODES]] added through inlining. If the [[callee]] is only called
+once, at the call [[site]], it will be inlined; likewise if it's ``small
+enough'' (less than [[MIN_NODES]] in size, with no child functions of
+its own). Otherwise, inlining occurs if [[score_function]] returns a
+value below the [[CUTOFF]].
+
+Each inline expansion decision makes a tradeoff between code size and
+(ideally) execution time. Needless to say, the effects of the heuristic
+parameters on various representative codes are significant, and require
+further investigation.
+
+==should_inline*/
+#define MAX_NODES 256
+#define MIN_NODES 8
+#define CUTOFF 32
+static bool should_inline(cnode_t *site, cfunction_t *caller,
+                          cfunction_t *callee)
+{
+    if(caller->ninlined + callee->nnodes > MAX_NODES)
+        return false;
+    if(cnode_only_used_by(callee->node, site))
+        return true;
+    if(callee->nfuncs == 0 && callee->nnodes < MIN_NODES)
+        return true;
+    return score_function(site, callee) < CUTOFF;
+}
+/*@
+
+[[score_function]] computes a weighted sum of the number of nodes and
+child functions in the [[callee]], reduced proportionally by a factor
+representing the degree to which the actual arguments at the call
+[[site]] are specialised or constant.
+
+==score_function*/
+#define WEIGHT_FUNC 8
+#define WEIGHT_NODE 1
+#define WEIGHT_SPEC 0.5
+#define WEIGHT_CONST 0.25
+static float score_function(cnode_t *site, cfunction_t *fn)
+{
+    float factor, score;
+
+    score = fn->nfuncs * WEIGHT_FUNC + fn->nnodes * WEIGHT_NODE;
+    factor = (args_spec(&site->call.args, fn->cl_type->sig) * WEIGHT_SPEC +
+              args_const(&site->call.args) * WEIGHT_CONST);
+    score -= score * factor;
+    return score;
+}
+/*@
+
+[[args_spec]] returns the proportion of the [[args]] which are more
+specialised than (i.e. are strict subtypes of) the declared types in the
+function signature [[sig]].
+
+==args_spec*/
+static float args_spec(cnode_array_t *args, funsig_t *sig)
+{
+    float factor = 0;
+    int i, n = alen(args) > 0 ? alen(args) : 1;
+    assert(alen(args) == sig->nargs);
+
+    array_foreach(args, i)
+    {
+        cnode_t *arg = aref(args, i);
+        rtype_t *atyp = decl_type(arg ? arg->decl : NULL);
+        rtype_t *ftyp = sig->args[i].type;
+
+        if(atyp != ftyp && r_subtypep(atyp, ftyp))
+            factor += 1;
+    }
+    return factor / n;
+}
+/*@
+
+[[args_const]] returns the proportion of the [[args]] which are constant
+values (i.e. supplied by [[CONST]] nodes.)
+
+==args_const*/
+static float args_const(cnode_array_t *args)
+{
+    float factor = 0;
+    int i, n = alen(args) > 0 ? alen(args) : 1;
+
+    array_foreach(args, i)
+    {
+        cnode_t *arg = aref(args, i);
+
+        if(arg && arg->type == CN_CONST)
+            factor += 1;
+    }
+    return factor / n;
+}
+/*@
+
+
+\section{Inline Expansion}
+
+==inline expansion*/
+//nil_actual//
+//enforce_inline_args//
+//bind_closed_values//
+//bind_args//
+//link_exits//
+//expand_inline//
+/*@
+
+[[expand_inline]] is responsible for completing the integration of the
+[[callee]] into the body of the [[caller]]. The IR objects of the former
+are duplicated and added to the latter via [[copy_into]]; a pointer is
+retained to the [[entry]] block of the copied function. Its [[RETURN]]
+nodes are collected in the [[exits]] array.
+
+The actual arguments of a [[CALL]] node can have type conversions added
+during postpass (\autoref{opt_post:enforce}); this one is being elided,
+so [[enforce_inline_args]] is called instead.
+
+The block in the [[caller]] containing the call [[site]] is split into
+two halves, [[above]] and [[below]]. Value flow is connected first: if
+the [[callee]] has closed variables, their values are gathered [[above]]
+the split by [[bind_closed_values]]. Formal arguments in the copied
+[[entry]] block are bound to their actual values by [[bind_args]].
+
+Next is control flow: the block [[above]] the call site is linked to the
+[[entry]]. The collected [[exits]] are connected [[below]] it by
+[[link_exits]], which returns the [[value]] yielded by the inlined
+function. The replacement and removal of the call site completes the
+inlining process.
+
+==expand_inline*/
+static cresult expand_inline(cnode_t *site, cfunction_t *caller,
+                             cfunction_t *callee)
+{
+    cresult res = SUCCESS;
+    cnode_array_t exits = ARRAY_INIT;
+    cblock_t *entry, *above, *below;
+    cnode_t *value;
+
+    array_init(&exits, 1);
+    entry = copy_into(caller, callee, NULL, &exits);
+    caller->ninlined += callee->nnodes;
+    res |= enforce_inline_args(site, callee);
+    below = site->block;
+    above = split_block(caller, site);
+    if(cfunc_has_closure(callee))
+        bind_closed_values(above, caller, callee);
+    bind_args(site, entry, caller, callee);
+    link_blocks(entry, above);
+    res |= link_exits(below, callee, &exits, &value);
+    cnode_replace_in_users(site, value);
+    cnode_remove(site);
+    return res | CHANGED;
+}
+/*@
+
+%% this admits specialisation. e.g.
+%% fn = function(vector foo) { ... x ... }
+%% let vector(int) x = ...; fn(x)
+%% enforce_decl notes that vector(int) <= vector, and doesn't insert a copy.
+%% the BIND's .decl of vector is ignored by ssa, and its users get the vector(int) directly
+
+The type conversions available to [[enforce_inline_args]] are more
+lenient than those required at a [[CALL]] or [[CALL_FAST]] node -- now
+unconstrained by the calling convention (\autoref{call}),
+[[enforce_decl]] need not box scalar actual arguments when their
+corresponding formal argument lacks a declared type (\autoref{ir:decl}).
+
+A [[NULL]] in the [[args]] array signifies an omitted actual argument.
+Its value is provided explicitly by [[nil_actual]].
+
+==enforce_inline_args*/
+static cresult enforce_inline_args(cnode_t *site, cfunction_t *fn)
+{
+    cnode_array_t *args = &site->call.args;
+    funsig_t *sig = fn->cl_type->sig;
+    cresult res = SUCCESS;
+    int i;
+
+    array_foreach(args, i)
+    {
+        cnode_t **ptr = aptr(args, i);
+        rtype_t *adecl = sig->args[i].type;
+
+        if(!*ptr)
+            *ptr = nil_actual(site, adecl);
+        else
+            res |= enforce_decl(site, adecl, ptr, false);
+    }
+    assert(cnode_compat(site, sig->ret_type) == YES);
+    return res;
+}
+/*@
+
+During a call, an omitted argument will be given an appropriate zero
+value by the VM's calling mechanism. In IR, this can be given by a
+[[CONST]] node yielding the [[nil_init]] value of appropriate type
+[[adecl]] (the call [[site]] becomes a user of the new [[node]]).
+
+==nil_actual*/
+static inline cnode_t *nil_actual(cnode_t *site, rtype_t *adecl)
+{
+    cnode_t *node = cnode_insert_before(site, CN_CONST);
+    node->constant = c_intern(nil_init(adecl));
+    node->decl = adecl;
+    cnode_add_user(site, node);
+    return node;
+}
+/*@
+
+A reference to a closed variable (\autoref{ir_pre:closure}) reads its
+value from the function's captured environment. After the [[callee]] is
+inlined, this may no longer be available. The [[bind_closed_values]]
+function supplies such references with the values captured by the
+[[LAMBDA]] node.
+
+For each constant [[var]] not bound by a lexical ancestor, a [[BIND]]
+node is created in the preceding [[block]], assigning to the variable
+the corresponding [[val]] from the [[.lambda.closure]] array.
+
+Other closed variables are either available in the [[caller]]'s
+environment (if bound by an ancestor) or don't require treatment here
+(if not constant).
+
+==bind_closed_values*/
+static void bind_closed_values(cblock_t *block, cfunction_t *caller,
+                               cfunction_t *callee)
+{
+    cvar_array_t *vars = &callee->closure;
+    cnode_array_t *vals = &callee->node->lambda.closure;
+    int i;
+
+    array_foreach(vars, i)
+    {
+        cvar_t *var = aref(vars, i);
+        cnode_t *val = aref(vals, i), *node;
+
+        if(!val)
+            continue;
+        if(var->local.binder != caller)
+            continue;
+        node = cnode_append(block, CN_BIND);
+        node->decl = val->decl;
+        node->set.var = var;
+        node->set.value = val;
+        cnode_add_user(node, val);
+    }
+}
+/*@
+
+Formal arguments receive their actual values in a similar manner in
+[[bind_args]]. The [[BIND]] nodes in the copied entry [[block]] of the
+[[callee]] are examined in order.
+
+The first will have [[.set.var]] [[NULL]], and conveys the [[argbits]].
+Having been computed and stored in the [[site]]'s [[.call.argbits]]
+field by the prior invocation of [[call_normalise]], a [[CONST]] node
+with this value can replace the [[BIND]].
+%ref BIND node???
+%ref argbits, wherever that ends up
+
+Others (with [[.set.value]]s [[NULL]]) reference the formal arguments,
+in order. Each is assigned the corresponding actual value from the
+[[.call.args]] array; this value also replaces the [[BIND]] node in its
+users (the latter will be removed during SSA conversion).
+
+==bind_args*/
+static void bind_args(cnode_t *site, cblock_t *block, cfunction_t *caller,
+                      cfunction_t *callee)
+{
+    cnode_array_t *args = &site->call.args;
+    cnode_t *node;
+    int nargs = 0;
+
+    list_foreach_entry(&block->cnode_head, node, cnode_list)
+    {
+        if(node->type != CN_BIND)
+            continue;
+        if(!node->set.var)
+        {
+            cnode_reset(node);
+            node->type = CN_CONST;
+            node->constant = c_intern(r_box(r_type_int, &site->call.argbits));
+            node->decl = r_type_int;
+        }
+        else if(!node->set.value)
+        {
+            cnode_t *val = aref(args, nargs);
+
+            node->set.value = val;
+            cnode_add_user(node, val);
+            cnode_replace_in_users(node, val);
+            nargs++;
+        }
+    }
+}
+/*@
+
+The [[exits]] array passed to [[link_exits]] contains all of the
+[[RETURN]] nodes in the copied [[callee]].
+
+Each value returned can have a type conversion added during postpass,
+similar to the actual arguments of a call. Since the [[RETURN]] is also
+being elided, [[enforce_decl]] is invoked similarly, without the
+necessity of boxing scalar values in the absence of declared
+[[ret_type]].
+
+The block ended by the [[RETURN]] is linked to the [[block]] following
+the call site; the element in [[exits]] is replaced by the returned
+value, and the [[RETURN]] node is removed.
+
+If the function has more than one [[RETURN]], a [[PHI]] node joins their
+values (taking ownership of [[exits]]). Otherwise the array is
+superfluous, and the single value is returned in [[*pval]].
+
+==link_exits*/
+static cresult link_exits(cblock_t *block, cfunction_t *callee,
+                          cnode_array_t *exits, cnode_t **pval)
+{
+    rtype_t *ret_type = callee->cl_type->sig->ret_type;
+    cnode_t **ptr;
+    cresult res = SUCCESS;
+
+    assert(alen(exits) > 0);
+    array_foreach_ptr(exits, ptr)
+    {
+        cnode_t *node = *ptr;
+        assert(node->type == CN_RETURN);
+        res |= enforce_decl(node, ret_type, &node->ret.value, false);
+        *ptr = node->ret.value;
+        link_blocks(block, node->block);
+        cnode_remove(node);
+    }
+    if(alen(exits) > 1)
+    {
+        cnode_t *arg;
+
+        *pval = cnode_prepend(block, CN_PHI);
+        (*pval)->phi.args = *exits;
+        array_foreach_entry(exits, arg)
+            cnode_add_user(*pval, arg);
+    }
+    else
+    {
+        *pval = aref(exits, 0);
+        array_fini(exits);
+    }
+    return res;
+}
+/*@
+
+
+\section{IR Copy}
+
+==ir copy*/
+//copy_ctx//
+//copy_one_function//
+//copy_functions//
+//copy_one_var//
+//number_vars//
+//copy_vars//
+//copy_one_block//
+//copy_one_node//
+//copy_body//
+//copy_into//
+/*@
+
+The process of inlining involves the exact duplication of IR objects.
+Unfortunately, these make liberal use of pointers to each other.
+Fortunately, each kind of object is densely numbered and accurately
+counted. Originals are mapped to copies through an intermediate set of
+arrays indexed by object [[.id]], stored in the [[copy_ctx_t]]
+structure.
+
+Functions are copied recursively -- if the function [[.src]] being
+copied is a descendent of the function being inlined, [[.parent]] is
+non-[[NULL]] and points to the context established for its enclosing
+function.
+
+The remaining fields store the functions, blocks, nodes and variables
+copied from the function [[.src]].
+
+==copy_ctx*/
+typedef struct copy_ctx
+{
+    struct copy_ctx *parent;
+    cfunction_t *src;
+    cfunction_t **functions;
+    cblock_t **blocks;
+    cnode_t **nodes;
+    cvar_t **vars;
+} copy_ctx_t;
+/*@
+
+The [[copy_into]] function copies all IR objects contained in the
+function [[src]] into the function [[dest]]. Variables are copied (by
+[[copy_vars]]) before nested functions (by [[copy_functions]]).
+[[copy_body]] copies blocks and nodes, then [[fixup]] rewrites intra-IR
+pointers. Duplication complete, the context is emptied and the copied
+[[entry]] block is returned.
+
+==copy_into*/
+static void fixup(copy_ctx_t *ctx, cfunction_t *dest, cnode_array_t *exits);
+static cblock_t *copy_into(cfunction_t *dest, cfunction_t *src,
+                           copy_ctx_t *parent, cnode_array_t *exits)
+{
+    cblock_t *entry;
+    copy_ctx_t ctx = { .src = src, .parent = parent };
+
+    copy_vars(&ctx, dest);
+    copy_functions(&ctx, dest);
+    entry = copy_body(&ctx, dest);
+    fixup(&ctx, dest, exits);
+    if(ctx.vars)
+        xfree(ctx.vars);
+    if(ctx.nodes)
+        xfree(ctx.nodes);
+    if(ctx.blocks)
+        xfree(ctx.blocks);
+    if(ctx.functions)
+        xfree(ctx.functions);
+    return entry;
+}
+/*@
+
+
+\subsection{Variables}
+
+Variables aren't numbered by the ubiquitous [[cfunc_rdfo]], so
+[[copy_vars]] must first count and number them with [[number_vars]].
+Assuming the function [[src]] contains any, the [[.vars]] array is
+initialised and populated with a copy of each [[var]] on the function's
+[[cvar_head]] list.
+
+==copy_vars*/
+static void copy_vars(copy_ctx_t *ctx, cfunction_t *dest)
+{
+    cfunction_t *src = ctx->src;
+    int nvars = number_vars(src);
+    cvar_t *var;
+
+    if(nvars == 0)
+        return;
+    ctx->vars = xmalloc(nvars * sizeof(cvar_t *));
+    list_foreach_entry(&src->cvar_head, var, cvar_list)
+        ctx->vars[var->id] = copy_one_var(dest, var);
+}
+/*@
+
+[[number_vars]] returns the number of variables owned by [[fn]], after
+assigning them [[.id]]s in list order.
+
+==number_vars*/
+static int number_vars(cfunction_t *fn)
+{
+    int nvars = 0;
+    cvar_t *var;
+
+    list_foreach_entry(&fn->cvar_head, var, cvar_list)
+        var->id = nvars++;
+    return nvars;
+}
+/*@
+
+[[copy_one_var]] copies the [[LEXICAL]] variable [[var]] to the function
+[[dest]], updating its [[.local.binder]] accordingly.
+
+==copy_one_var*/
+static cvar_t *copy_one_var(cfunction_t *dest, cvar_t *var)
+{
+    assert(!cvar_is_global(var));
+    cvar_t *copy = cvar_create(var->name, var->type, var->decl);
+
+    copy->local = var->local;
+    copy->local.binder = dest;
+    copy->is_const = var->is_const;
+    copy->id = var->id;
+    list_add_before(&dest->cvar_head, &copy->cvar_list);
+    return copy;
+}
+/*@
+
+
+\subsection{Functions}
+
+The child functions of the function [[src]], if any, are copied into
+[[dest]] by [[copy_functions]]; these copies populate the context
+[[.functions]] array.
+
+==copy_functions*/
+static void copy_functions(copy_ctx_t *ctx, cfunction_t *dest)
+{
+    cfunction_t *src = ctx->src, *fn;
+
+    if(src->nfuncs == 0)
+        return;
+    ctx->functions = xmalloc(src->nfuncs * sizeof(cfunction_t *));
+    list_foreach_entry(&src->cfunc_head, fn, cfunc_list)
+        ctx->functions[fn->id] = copy_one_function(ctx, dest, fn);
+}
+/*@
+
+For each, [[copy_one_function]] creates a new child of the [[dest]]
+function, initialises its fields, and recursively invokes [[copy_into]]
+to duplicate the source [[child]]'s objects (its [[.node]] is set when
+we fix up the copied [[LAMBDA]]; [[.closure]] is also set in fixup.)
+
+==copy_one_function*/
+static cblock_t *copy_into(cfunction_t *, cfunction_t *,
+                           copy_ctx_t *, cnode_array_t *);
+static cfunction_t *copy_one_function(copy_ctx_t *ctx, cfunction_t *dest,
+                                      cfunction_t *child)
+{
+    cfunction_t *copy = cfunc_create(dest);
+
+    copy->cl_type = child->cl_type;
+    copy->nfuncs = child->nfuncs;
+    copy->nblocks = child->nblocks;
+    copy->nnodes = child->nnodes;
+    copy->id = child->id;
+    copy->ninlined = child->ninlined;
+    copy->entry = copy_into(copy, child, ctx, NULL);
+    return copy;
+}
+/*@
+
+
+\subsection{Blocks \& Nodes}
+
+The nodes and blocks of [[src]] are copied into [[dest]] by
+[[copy_body]], and the context arrays populated. The copy made of the
+[[entry]] block is returned.
+
+==copy_body*/
+static cblock_t *copy_body(copy_ctx_t *ctx, cfunction_t *dest)
+{
+    cfunction_t *src = ctx->src;
+    cblock_t *block, *entry = NULL;
+
+    assert(src->nblocks>0 && src->nnodes>0);
+    ctx->blocks = xmalloc(src->nblocks * sizeof(cblock_t *));
+    ctx->nodes = xmalloc(src->nnodes * sizeof(cnode_t *));
+    list_foreach_entry(&src->cblock_head, block, cblock_list)
+    {
+        cnode_t *node;
+        cblock_t *newblock = copy_one_block(dest, block);
+
+        ctx->blocks[block->id] = newblock;
+        if(block == src->entry)
+            entry = newblock;
+        list_foreach_entry(&block->cnode_head, node, cnode_list)
+        {
+            cnode_t *newnode = copy_one_node(newblock, node);
+
+            ctx->nodes[node->id] = newnode;
+        }
+    }
+    return entry;
+}
+/*@
+
+[[copy_one_block]] creates a copy of a [[block]] and links it into the
+[[dest]] function's [[.cblock_head]] list; its [[.succ]] and [[.pred]]
+arrays will be copied during fixup.
+
+==copy_one_block*/
+static cblock_t *copy_one_block(cfunction_t *dest, cblock_t *block)
+{
+    cblock_t *copy = cblock_create();
+
+    copy->id = block->id;
+    copy->start = block->start;
+    copy->end = block->end;
+    list_add_before(&dest->cblock_head, &copy->cblock_list);
+    return copy;
+}
+/*@
+
+[[copy_one_node]] copies a [[node]] into the given [[block]]; since most
+of its fields are pointers to other nodes, they will be copied during
+fixup.
+
+==copy_one_node*/
+static cnode_t *copy_one_node(cblock_t *block, cnode_t *node)
+{
+    cnode_t *copy = cnode_append(block, node->type);
+
+    copy->id = node->id;
+    copy->decl = node->decl;
+    copy->file = node->file;
+    return copy;
+}
+/*@
+
+
+\section{IR Fixup}
+
+==ir fixup*/
+//blocks_fixup//
+//nodes_fixup//
+//var_fixup//
+//fixup macros//
+//fixup//
+/*@
+
+Copied objects in [[dest]] contain pointer fields which, if copied
+na\"{i}vely, would refer to the originals in [[src]]. The [[fixup]] function
+avoids this inconsistency by mapping each through the appropriate array
+kept by the context.
+
+An array of [[exits]] is passed when [[src]] is the callee being inlined
+into [[dest]]. The arguments of the former become locals in the latter.
+Otherwise [[src]] is one of the callee's lexical descendents, and the
+variables in its [[.closure]] require fixup.
+
+==fixup*/
+static void fixup(copy_ctx_t *ctx, cfunction_t *dest,
+                  cnode_array_t *exits)
+{
+    cfunction_t *src = ctx->src;
+    cblock_t *sblock;
+    cvar_t *var;
+
+    if(exits)
+    {
+        list_foreach_entry(&src->cvar_head, var, cvar_list)
+            if(var->local.is_arg)
+                ctx->vars[var->id]->local.is_arg = false;
+    }
+    else
+    {
+        array_foreach_entry(&src->closure, var)
+            array_push(&dest->closure, var_fixup(ctx, var));
+    }
+    list_foreach_entry(&src->cblock_head, sblock, cblock_list)
+    {
+        //block fixup//
+    }
+}
+/*@
+
+Each [[sblock]] in the [[src]] is paired, via its [[.id]] and the
+[[.blocks]] array, with a corresponding [[dblock]] in the [[dest]]. Each
+[[snode]] within it is likewise paired with a corresponding [[dnode]].
+
+==block fixup*/
+cblock_t *dblock = ctx->blocks[sblock->id];
+cnode_t *snode;
+
+BLOCKS(pred);
+BLOCKS(succ);
+list_foreach_entry(&sblock->cnode_head, snode, cnode_list)
+{
+    cnode_t *dnode = ctx->nodes[snode->id];
+
+    NODES(users);
+    switch(snode->type)
+    {
+        //fixup switch//
+    }
+}
+/*@
+
+This established, a number of macros then assist in the mapping process.
+The [[f]] argument names a field. Its value in the destination object
+will be the copied object which corresponds to the original object that
+is the field's referent in the source.
+
+[[NODE]] and [[FUNC]] each map a pointer to a node or a function,
+respectively.
+
+==fixup macros*/
+#define NODE(f) dnode->f = ctx->nodes[snode->f->id]
+#define FUNC(f) dnode->f = ctx->functions[snode->f->id]
+/*@
+
+Arrays of blocks and nodes are mapped elementwise by helper functions,
+which are called by [[BLOCKS]] and [[NODES]].
+
+==fixup macros*/
+#define BLOCKS(f) dblock->f = blocks_fixup(ctx, &sblock->f)
+#define NODES(f) dnode->f = nodes_fixup(ctx, &snode->f)
+/*@
+
+A reference to a variable is also mapped by a helper, invoked by
+[[VAR]].
+
+==fixup macros*/
+#define VAR(f) dnode->f = var_fixup(ctx, snode->f)
+/*@
+
+The [[COPY]] macro is for fields of any other type; these don't need
+fixing up.
+
+==fixup macros*/
+#define COPY(f) dnode->f = snode->f
+/*@
+
+[[CALL]] nodes have [[.names]]; [[CALL_FAST]] have [[.argbits]]. They
+share [[.target]] and [[.args]].
+
+==fixup switch*/
+case CN_CALL:
+case CN_CALL_FAST:
+    NODE(call.target);
+    NODES(call.args);
+    if(snode->type == CN_CALL)
+        array_copy(&dnode->call.names, &snode->call.names);
+    else
+        COPY(call.argbits);
+    break;
+/*@
+
+[[SET]] and [[BIND]] nodes share fields, but the latter may have both or
+either set to [[NULL]].
+
+==fixup switch*/
+case CN_SET:
+case CN_BIND:
+    if(snode->set.var)
+        VAR(set.var);
+    if(snode->set.value)
+        NODE(set.value);
+    break;
+/*@
+
+The [[.function]]'s backpointer to the [[LAMBDA]] is set after it's
+fixed up.
+
+==fixup switch*/
+case CN_LAMBDA:
+    FUNC(lambda.function);
+    NODES(lambda.closure);
+    dnode->lambda.function->node = dnode;
+    break;
+/*@
+
+If [[exits]] was provided, each copied [[RETURN]] node is recorded
+within.
+
+==fixup switch*/
+case CN_RETURN:
+    NODE(ret.value);
+    if(exits)
+        array_push(exits, dnode);
+    break;
+/*@
+
+No other [[.type]]s of node need particularly special treatment.
+
+==fixup switch*/
+case CN_REF:
+    VAR(ref.var);
+    break;
+case CN_IF:
+    NODE(ifelse.cond);
+    break;
+case CN_PHI:
+    NODES(phi.args);
+    break;
+case CN_BUILTIN:
+    COPY(builtin.bi);
+    COPY(builtin.optype);
+    NODES(builtin.args);
+    break;
+case CN_COPY:
+    NODE(copy.value);
+    break;
+case CN_CONST:
+    COPY(constant);
+    break;
+/*@
+
+[[blocks_fixup]] returns a copy of the [[psrc]] array, with each
+element mapped to its corresponding copy in [[.blocks]].
+
+==blocks_fixup*/
+static cblock_array_t blocks_fixup(copy_ctx_t *ctx, cblock_array_t *psrc)
+{
+    cblock_array_t dest = ARRAY_INIT;
+    cblock_t **ptr;
+
+    array_copy(&dest, psrc);
+    array_foreach_ptr(&dest, ptr)
+        *ptr = ctx->blocks[(*ptr)->id];
+    return dest;
+}
+/*@
+
+[[nodes_fixup]] does the same with [[.nodes]], aside from any [[NULL]]s.
+
+==nodes_fixup*/
+static cnode_array_t nodes_fixup(copy_ctx_t *ctx, cnode_array_t *psrc)
+{
+    cnode_array_t dest = ARRAY_INIT;
+    cnode_t **ptr;
+
+    array_copy(&dest, psrc);
+    array_foreach_ptr(&dest, ptr)
+    {
+        if(*ptr)
+            *ptr = ctx->nodes[(*ptr)->id];
+    }
+    return dest;
+}
+/*@
+
+Variables are a little more tricky, because they may belong to some
+ancestor of the function being copied.
+
+This is why [[copy_into]] calls [[copy_vars]] in preorder --
+[[var_fixup]] can follow the recursion back via the context's
+[[.parent]] field, to find the function which binds the variable
+[[var]], and so the [[.vars]] array that maps it to its copy. If
+[[var]] is a global, or not bound by a function we're copying, it
+doesn't need fixing up.
+
+==var_fixup*/
+static cvar_t *var_fixup(copy_ctx_t *ctx, cvar_t *var)
+{
+    if(cvar_is_global(var))
+        return var;
+    for(; ctx && var->local.binder != ctx->src; ctx = ctx->parent);
+    if(!ctx)
+        return var;
+    return ctx->vars[var->id];
+}
+/*@
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+#include "ir.h"
+#include "opt.h"
+/*@
+
+*/

@@ -1,0 +1,456 @@
+/*@
+\chapter{Cell Introduction}
+\label{opt_closure}
+
+A closure captures variables, but a [[LAMBDA]] node copies values
+(\autoref{ir_pre:closure}). A captured variable which is constant only
+has one value, so these are equivalent. For each of the others, to
+account for the discrepancy -- and allow sharing between closures -- the
+compiler introduces a \textit{cell}, a container for a single value
+(\autoref{rt:cell}). The [[LAMBDA]] then copies a reference to the cell,
+and the code generated for the function accesses its value indirectly.
+
+==opt_closure.c*/
+//includes//
+//cell builtins//
+//cell helpers//
+//cell rewrites//
+//cfunc_cell_rewrite//
+//ir_cell_rewrite//
+//ir_cell_finalize//
+//ir_cell_intro//
+/*@
+
+Cell introduction corresponds to the ``assignment conversion'' of
+\citet{kranz86} or the ``assignment elimination'' of \citet{clinger94}.
+It is is performed in two phases by [[ir_cell_intro]]. A closed mutable
+variable is ``celled''; for these, the [[cvar_is_celled]] predicate
+returns [[true]] (\autoref{ir:varfn}).
+
+==ir_cell_intro*/
+cresult ir_cell_intro(cfunction_t *fn)
+{
+    return ir_cell_rewrite(fn) | ir_cell_finalize(fn);
+}
+/*@
+
+The first phase, [[ir_cell_rewrite]], transforms each function [[fn]]
+with a call to [[cfunc_cell_rewrite]]; if this adds any new nodes,
+they're numbered by another call to [[cfunc_rdfo]]. Child functions are
+recursively transformed in preorder.
+
+==ir_cell_rewrite*/
+static cresult ir_cell_rewrite(cfunction_t *fn)
+{
+    cresult res = cfunc_cell_rewrite(fn);
+    if(changed(res))
+        cfunc_rdfo(fn);
+    return res | cfunc_map_children(fn, ir_cell_rewrite);
+}
+/*@
+
+In the second phase, [[ir_cell_finalize]] finishes the treatment of
+celled variables bound by the function [[fn]]. Their [[.decl]] and
+[[.is_const]] fields are updated to reflect their changed types and
+immutability. [[cfunc_populate_closure]] fills the [[NULL]] elements
+left for them in the [[.closure]] arrays of each child function's
+[[LAMBDA]] node. They're now eligible for SSA conversion
+(\autoref{ir_ssa}), which is carried out at this point (when necessary,)
+before continuing the recursive traversal.
+
+==ir_cell_finalize*/
+cresult cfunc_populate_closure(cfunction_t *fn);
+static cresult ir_cell_finalize(cfunction_t *fn)
+{
+    cvar_t *var;
+    cresult res;
+
+    list_foreach_entry(&fn->cvar_head, var, cvar_list)
+    {
+        if(cvar_is_celled(var))
+        {
+            var->decl = cell_decl_type(var);
+            var->is_const = true;
+        }
+    }
+    res = cfunc_map_children(fn, cfunc_populate_closure);
+    if(changed(res))
+        cfunc_ssa_convert(fn);
+    return res | cfunc_map_children(fn, ir_cell_finalize);
+}
+/*@
+
+Within the body of a function [[fn]], nodes involving celled variables
+are rewritten by [[cfunc_cell_rewrite]]. The node list traversal is
+[[_safe]], as we may modify [[.cnode_list.next]].
+
+==cfunc_cell_rewrite*/
+static cresult cfunc_cell_rewrite(cfunction_t *fn)
+{
+    cresult res = SUCCESS;
+    cblock_t *block;
+
+    list_foreach_entry(&fn->cblock_head, block, cblock_list)
+    {
+        cnode_t *node, *tmp;
+
+        list_foreach_entry_safe(&block->cnode_head, node, tmp, cnode_list)
+        {
+            switch(node->type)
+            {
+                //rewrite switch//
+            default:
+                break;
+            }
+        }
+    }
+    return res;
+}
+/*@
+
+A [[REF]] of a celled variable is rewritten by [[cell_intro_get]].
+
+==rewrite switch*/
+case CN_REF:
+{
+    cvar_t *var = node->ref.var;
+    if(!cvar_is_celled(var))
+        continue;
+    cell_intro_get(node, var);
+    res |= CHANGED;
+    break;
+}
+/*@
+
+A [[BIND]] of a celled variable is rewritten by [[cell_intro_arg]], if
+it's introducing an argument, or [[cell_intro_local]] if not. A [[SET]]
+is rewritten by [[cell_intro_set]].
+
+==rewrite switch*/
+case CN_SET:
+case CN_BIND:
+{
+    cvar_t *var = node->set.var;
+    if(!var || !cvar_is_celled(var))
+        continue;
+    if(!node->set.value)
+        cell_intro_arg(node, var);
+    else if(node->type == CN_BIND)
+        cell_intro_local(node, var, node->set.value);
+    else
+        cell_intro_set(node, var, node->set.value);
+    res |= CHANGED;
+    break;
+}
+/*@
+
+
+\section{Rewrite Rules}
+
+The variable $v$ of type $t$ will hold a value of type [[cell(]]$t$[[)]]
+instead. Each [[REF]] of such a variable is followed by an invocation of
+the [[cell_get]] [[BUILTIN]] to extract the value from the cell.
+
+\medskip\noindent\begin{tabular}{lll}
+  i. & [[REF]] $v$ & : $t$ \\
+  \hline
+  ii. & [[REF]] $v$ & : [[cell(]]$t$[[)]] \\
+  i. & [[CELL_GET]] ii & : $t$ \\
+\end{tabular}
+
+==cell rewrites*/
+static void cell_intro_get(cnode_t *node, cvar_t *var)
+{
+    cnode_t *ref = cnode_insert_before(node, CN_REF);
+
+    init_ref(ref, var);
+    cnode_reset(node);
+    init_cellget(node, var, ref);
+}
+/*@
+
+A [[SET]] of $v$ first [[REF]]s the variable to get the cell before
+storing the value $val$ into it with the [[cell_set]] [[BUILTIN]].
+
+\medskip\noindent\begin{tabular}{lll}
+  i. & [[SET]] $v$ $val$ \\
+  \hline
+  ii. & [[REF]] $v$ & : [[cell(]]$v$[[.decl)]] \\
+  i. & \multicolumn{2}{l}{[[CELL_SET]] ii $val$} \\
+\end{tabular}
+
+==cell rewrites*/
+static void cell_intro_set(cnode_t *node, cvar_t *var, cnode_t *val)
+{
+    cnode_t *ref = cnode_insert_before(node, CN_REF);
+
+    init_ref(ref, var);
+    cnode_reset(node);
+    init_cellset(node, var, ref, val);
+}
+/*@
+
+To rewrite the initial [[BIND]] node for a celled argument $v$, a cell
+is created by the [[cell_make]] [[BUILTIN]], initialised by [[cell_set]]
+with the value of the argument, then the variable is [[SET]] to the cell
+itself.
+
+\medskip\noindent\begin{tabular}{lll}
+  i. & [[BIND]] $v$ [[NULL]] & : $t$ \\
+  \hline
+  ii. & [[BIND]] $v$ [[NULL]] & : $t$ \\
+  i. & [[CELL_MAKE]] & : [[cell(]]$t$[[)]] \\
+  iii. & \multicolumn{2}{l}{[[CELL_SET]] i ii} \\
+  iv. & [[SET]] $v$ i \\
+\end{tabular}
+
+==cell rewrites*/
+static void cell_intro_arg(cnode_t *node, cvar_t *var)
+{
+    cnode_t *bind = cnode_insert_before(node, CN_BIND);
+    cnode_t *cset = cnode_insert_after(node, CN_BUILTIN);
+    cnode_t *set = cnode_insert_after(cset, CN_SET);
+
+    assert(var->decl == node->decl);
+    init_bind(bind, var, NULL, var->decl);
+    init_cellset(cset, var, node, bind);
+    init_set(set, var, node);
+    cnode_reset(node);
+    init_cellmake(node, var);
+}
+/*@
+
+The [[BIND]] node for a celled local variable $v$ is rewritten in a
+similar manner, modulo the availability of the initial value $val$.
+
+\medskip\noindent\begin{tabular}{lll}
+  i. & [[BIND]] $v$ $val$ & : $t$ \\
+  \hline
+  ii. & [[CELL_MAKE]] & : [[cell(]]$t$[[)]] \\
+  iii.  & \multicolumn{2}{l}{[[CELL_SET]] ii $val$} \\
+  i. & [[BIND]] $v$ ii & : [[cell(]]$t$[[)]] \\
+\end{tabular}
+
+==cell rewrites*/
+static void cell_intro_local(cnode_t *node, cvar_t *var, cnode_t *val)
+{
+    cnode_t *cmake = cnode_insert_before(node, CN_BUILTIN);
+    cnode_t *cset = cnode_insert_before(node, CN_BUILTIN);
+
+    init_cellmake(cmake, var);
+    init_cellset(cset, var, cmake, val);
+    cnode_reset(node);
+    init_bind(node, var, cmake, cmake->decl);
+}
+/*@
+
+
+\section{Helper Functions}
+
+Some helper functions simplify the rewriting process.
+
+==cell helpers*/
+//cell_decl_type//
+//init_ref//
+//init_set//
+//init_bind//
+//init_cellaccess//
+//init_cellset//
+//init_cellget//
+//init_cellmake//
+/*@
+
+The type of cell required for the variable [[var]] depends on its
+declared type, and is returned by [[cell_decl_type]].
+
+==cell_decl_type*/
+static inline rtype_t *cell_decl_type(cvar_t *var)
+    { return rcell_type_create(decl_type(var->decl)); }
+/*@
+
+A rewritten [[REF]] returns a value of this type.
+
+==init_ref*/
+static inline void init_ref(cnode_t *node, cvar_t *var)
+{
+    node->ref.var = var;
+    node->decl = cell_decl_type(var);
+}
+/*@
+
+A rewritten [[SET]] uses its value [[val]].
+
+==init_set*/
+static inline void init_set(cnode_t *node, cvar_t *var, cnode_t *val)
+{
+    node->set.var = var;
+    if(val)
+    {
+        node->set.value = val;
+        cnode_add_user(node, val);
+    }
+}
+/*@
+
+A rewritten [[BIND]] also yields a value of the type [[decl]].
+
+==init_bind*/
+static inline
+void init_bind(cnode_t *node, cvar_t *var, cnode_t *val, rtype_t *decl)
+{
+    node->type = CN_BIND;
+    init_set(node, var, val);
+    node->decl = decl;
+}
+/*@
+
+A [[node]] which accesses the celled variable [[var]] is initialised
+with [[init_cellaccess]]. The meaning of [[arg1]] and [[arg2]] will
+depend on the particular [[BUILTIN]] [[bi]]. The [[.builtin.optype]]
+field holds the type of the cell.
+
+==init_cellaccess*/
+static inline
+void init_cellaccess(cnode_t *node, cvar_t *var, const cbuiltin_t *bi,
+                     cnode_t *arg1, cnode_t *arg2)
+{
+    cnode_array_t args = ARRAY_INIT;
+
+    if(arg1)
+    {
+        array_push(&args, arg1);
+        cnode_add_user(node, arg1);
+    }
+    if(arg2)
+    {
+        array_push(&args, arg2);
+        cnode_add_user(node, arg2);
+    }
+    node->type = CN_BUILTIN;
+    node->builtin.bi = bi;
+    node->builtin.args = args;
+    node->builtin.optype = cell_decl_type(var);
+}
+/*@
+
+An invocation of [[cell_make]] yields the cell created for [[var]].
+
+==init_cellmake*/
+static inline void init_cellmake(cnode_t *node, cvar_t *var)
+{
+    init_cellaccess(node, var, &cell_make, NULL, NULL);
+    node->decl = node->builtin.optype;
+}
+/*@
+
+[[cell_get]] yields the value contained in the [[cell]].
+
+==init_cellget*/
+static inline void init_cellget(cnode_t *node, cvar_t *var, cnode_t *cell)
+{
+    init_cellaccess(node, var, &cell_get, cell, NULL);
+    node->decl = node->builtin.optype->elt;
+}
+/*@
+
+[[cell_set]] stores [[val]] into [[cell]], and doesn't yield a value.
+
+==init_cellset*/
+static inline
+void init_cellset(cnode_t *node, cvar_t *var, cnode_t *cell, cnode_t *val)
+{
+    init_cellaccess(node, var, &cell_set, cell, val);
+}
+/*@
+
+
+\section{Builtins}
+
+The [[.generate_fn]] callbacks for [[cell_make]], [[cell_get]] and
+[[cell_set]] are invoked during code generation
+(\autoref{gen_code:ctx}), and use the [[asm]] helper functions
+(\autoref{gen_code:asm}) to emit instructions appropriate to the types
+of values they manipulate.
+
+[[.trans_fn]] callbacks are unnecessary, as [[ir_optimise]] is never
+called after [[ir_cell_intro]]. The [[.enforce_fn]] callback for
+[[cell_set]], called during postpass, ensures that its first argument --
+the updated value -- is of the cell's element type.
+
+==enforce_cell_set*/
+static cresult enforce_cell_set(cnode_t *node)
+{
+    cnode_array_t *args = &node->builtin.args;
+    assert(cnode_compat(aref(args, 0), node->builtin.optype));
+    return enforce_decl(node, node->builtin.optype->elt, aptr(args, 1), true);
+}
+/*@
+
+The [[cellmake]] instruction (\autoref{vm:cellmake}) creates a new cell
+of type [[.optype]].
+
+==gen_cell_make*/
+static void gen_cell_make(cnode_t *node)
+{
+    asm_op(OP_cellmake);
+    asm_stack(loc_for(node));
+    asm_offset(const_index(node->builtin.optype));
+}
+/*@
+
+Opcodes for the [[cellget]] and [[cellset]] instructions
+(\autoref{vm:cells}) depend on the contained value's size.
+
+==gen_cell_get*/
+static void gen_cell_get(cnode_t *node)
+{
+    asm_op_width(OP_cellget, node->builtin.optype->elt);
+    asm_stack(loc_for(node));
+    asm_args(&node->builtin.args);
+}
+/*@
+
+==gen_cell_set*/
+static void gen_cell_set(cnode_t *node)
+{
+    asm_op_width(OP_cellset, node->builtin.optype->elt);
+    asm_args(&node->builtin.args);
+}
+/*@
+
+The [[cell_set]] builtin does not return a value, so has its
+[[.is_void]] flag set; no stack location need be allocated for it.
+
+==cell builtins*/
+//gen_cell_make//
+static const cbuiltin_t cell_make = {
+    &(builtin_ops_t) { .generate_fn = gen_cell_make },
+    NULL, "cell_make"
+};
+//gen_cell_get//
+static const cbuiltin_t cell_get = {
+    &(builtin_ops_t) { .generate_fn = gen_cell_get },
+    NULL, "cell_get"
+};
+//enforce_cell_set//
+//gen_cell_set//
+static const cbuiltin_t cell_set = {
+    &(builtin_ops_t) { .enforce_fn = enforce_cell_set,
+                       .generate_fn = gen_cell_set,
+                       .is_void = true },
+    NULL, "cell_set"
+};
+/*@
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+#include "ir.h"
+#include "opt.h"
+#include "vm/vm_ops.h"
+#include "gen_code.h"
+/*@
+
+% */

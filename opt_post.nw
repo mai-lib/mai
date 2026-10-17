@@ -1,0 +1,542 @@
+/*@
+\chapter{Postpass}
+\label{opt_post}
+
+Previous passes (\autoref{opt:analysis}) have recovered the types of
+values yielded and used by the nodes in the program (\autoref{ir:node}).
+Code generation imposes additional constraints on certain of these, and
+[[BUILTIN]]s can specify their own via callbacks.
+
+The \textit{postpass} performed by this module satisfies these
+constraints, transforms [[CALL]]s to [[CALL_FAST]], and removes
+redundant [[COPY]] nodes.
+
+==opt_post.c*/
+//post includes//
+//type enforcement//
+//copy optimisation//
+//cfunc_postpass//
+//ir_postpass//
+/*@
+
+
+\section{Entry Point}
+
+The module entry point realises a simple preorder recursive traversal of
+the functions in the input.
+
+==ir_postpass*/
+cresult ir_postpass(cfunction_t *fn)
+{
+    return cfunc_postpass(fn) | cfunc_map_children(fn, ir_postpass);
+}
+/*@
+
+The [[cfunc_postpass]] function is invoked for each. This runs
+[[cfunc_post_enforce]], then iterates [[cfunc_post_copy]] to
+convergence; cleaning up and renumbering if anything [[changed]].
+
+==cfunc_postpass*/
+static cresult cfunc_postpass(cfunction_t *fn)
+{
+    cresult r, res = cfunc_post_enforce(fn);
+
+    do res |= (r = cfunc_post_copy(fn));
+    while(r == CHANGED);
+    if(changed(res))
+    {
+        cfunc_cleanup(fn);
+        cfunc_rdfo(fn);
+    }
+    return res;
+}
+/*@
+
+
+\section{Type Enforcement}
+\label{opt_post:enforce}
+
+==type enforcement*/
+//enforce_signature//
+//enforce_fastcall//
+//enforce_call//
+//enforce_phi//
+//cfunc_post_enforce//
+/*@
+
+[[cfunc_post_enforce]] is responsible for inserting the type checks and
+conversions that code generation requires, and visits each [[node]] in
+the function [[fn]].
+
+==cfunc_post_enforce*/
+static cresult cfunc_post_enforce(cfunction_t *fn)
+{
+    cblock_t *block;
+    cnode_t *node, *tmp;
+    cresult res = SUCCESS;
+
+    list_foreach_entry(&fn->cblock_head, block, cblock_list)
+    {
+        list_foreach_entry_safe(&block->cnode_head, node, tmp, cnode_list)
+        {
+            switch(node->type)
+            {
+                //post switch//
+            default:
+                break;
+            }
+        }
+    }
+    return res;
+}
+/*@
+
+The condition of an [[IF]] condition must have [[boolean]] type.
+
+==post switch*/
+case CN_IF:
+    res |= enforce_decl(node, r_type_boolean,
+                        &node->ifelse.cond, true);
+    break;
+/*@
+
+The value [[RETURN]]ed from the function must match the declared type of
+the latter.
+
+==post switch*/
+case CN_RETURN:
+    res |= enforce_decl(node, fn->cl_type->sig->ret_type,
+                        &node->ret.value, true);
+    break;
+/*@
+
+A [[CALL]] node, if its arguments can be statically matched, may be
+transformed to become [[_FAST]]. In any case, its arguments and result
+value may require conversion according to the calling convention.
+
+==post switch*/
+case CN_CALL:
+    res |= enforce_call(node, node->call.target->decl);
+    break;
+/*@
+
+A [[CALL_FAST]] node is unusual to see here, but can result from a
+failed inlining attempt (\autoref{opt_inline:inline}).
+
+==post switch*/
+case CN_CALL_FAST:
+    res |= enforce_fastcall(node, node->call.target->decl);
+    break;
+/*@
+
+Most [[SET]] nodes have been removed; one that remains refers to a
+global variable. If it has a declared type, this was enforced during
+prepass (\autoref{ir_pre:set}). The remainder have conversions inserted
+here (boxing scalars, most likely).
+%% Otherwise it's held off, so that those
+%% which are [[.is_const]] and [[GLOBAL_INT]] might have types recovered
+%% from their initialisers.
+
+==post switch*/
+case CN_SET:
+    res |= enforce_decl(node, node->set.var->decl, &node->set.value, true);
+    break;
+/*@
+
+Some [[BUILTIN]]s have specific requirements with respect to the types
+of their arguments. They can insert any necessary conversions via the
+optional [[.enforce_fn]] callback.
+%ref wherever the actual code for some/all builtin .enforce_fn/.generate_fn ends up
+
+==post switch*/
+case CN_BUILTIN:
+{
+    const cbuiltin_t *bi = node->builtin.bi;
+
+    if(bi->ops->enforce_fn)
+        res |= bi->ops->enforce_fn(node);
+    break;
+}
+/*@
+
+Codegen expects that the arguments of a [[PHI]] all have types compatible
+with the value yielded by the node itself (\autoref{gen_unssa}).
+
+==post switch*/
+case CN_PHI:
+    res |= enforce_phi(node, node->decl);
+    break;
+/*@
+
+[[enforce_phi]] checks each argument. If a conversion is required, the
+[[COPY]] is inserted at the end of the corresponding predecessor block,
+to preserve the semantics of the $\phi$-function.
+
+==enforce_phi*/
+static cresult enforce_phi(cnode_t *node, rtype_t *decl)
+{
+    int i;
+    cresult res = SUCCESS;
+
+    array_foreach(&node->phi.args, i)
+    {
+        cnode_t **pval = aptr(&node->phi.args, i);
+
+        if(cnode_compat(*pval, decl) == MAYBE)
+        {
+            cblock_t *pred = aref(&node->block->pred, i);
+
+            *pval = guard_decl(cnode_append(pred, CN_COPY),
+                               node, decl, *pval);
+            res |= CHANGED;
+        }
+    }
+    return res;
+}
+/*@
+
+[[enforce_call]] first ensures that the target of a [[CALL]] node is
+[[callable]], should its [[type]] be known. In this case, enough
+information is available to attempt argument matching with
+[[call_normalise]]; if this succeeds, it becomes a [[CALL_FAST]] node.
+
+Whatever the outcome, any type conversions required to sastisfy the
+calling convention will be added by [[enforce_signature]].
+
+==enforce_call*/
+static cresult enforce_call(cnode_t *node, rtype_t *type)
+{
+    cresult res = SUCCESS;
+
+    if(type && type != r_type_object && type != r_type_callable)
+    {
+        if(!rtype_is_callable(type))
+        {
+            c_error("value of type `%s` is not callable.", decl_name(type));
+            return FAILED;
+        }
+        res |= call_normalise(node, type->sig);
+    }
+    return res | enforce_signature(node, type);
+}
+/*@
+
+A [[CALL_FAST]] node must actually supply the mandatory formal arguments
+of its target, in addition to satisfying the calling convention.
+
+==enforce_fastcall*/
+static cresult enforce_fastcall(cnode_t *node, rtype_t *type)
+{
+    assert(type && type->sig);
+    if((node->call.argbits & type->sig->reqbits) != type->sig->reqbits)
+    {
+        c_error("required argument not supplied.");
+        return FAILED;
+    }
+    return enforce_signature(node, type);
+}
+/*@
+
+[[enforce_signature]] ensures that caller and callee are in agreement
+about the types of argument and result values -- that the actual
+arguments [[args]] have types compatible with the formal arguments
+specified in the callee's signature [[sig]] (\autoref{callable:sig}),
+and that the expected return type [[.decl]] is compatible with the
+specified return type (\autoref{ir:decl}).
+
+If the [[node]] is a [[CALL]], [[sig]] is [[NULL]] and the universal
+calling convention applies (\autoref{call:uni}). Arguments and result
+must be reference objects; scalars need to be boxed or unboxed,
+respectively.
+
+Otherwise it's a [[CALL_FAST]]; the [[type]] of the callee specifies the
+types of argument it expects and the type of value it returns
+(\autoref{call:fast}).
+
+Actual arguments may be omitted in either case, hence the check for
+[[*ptr]].
+
+==enforce_signature*/
+static cresult enforce_signature(cnode_t *node, rtype_t *type)
+{
+    funsig_t *sig = node->type == CN_CALL ? NULL : type->sig;
+    cnode_array_t *args = &node->call.args;
+    cresult res = SUCCESS;
+    int i;
+
+    assert(node->type == CN_CALL || rtype_is_callable(type));
+    array_foreach(args, i)
+    {
+        cnode_t **ptr = aptr(args, i);
+        rtype_t *decl = sig ? sig->args[i].type : r_type_object;
+
+        if(*ptr)
+            res |= enforce_decl(node, decl, ptr, true);
+    }
+    res |= enforce_val(node, sig ? sig->ret_type : r_type_object);
+    return res;
+}
+/*@
+
+
+\section{Copy Optimisations}
+
+[[COPY]] nodes are generally inserted conservatively, and some
+occurences may be profitably replaced with equivalent but better
+performing alternatives.
+
+==copy optimisation*/
+//copy_of_const//
+//update_copy//
+//cfunc_post_copy//
+/*@
+
+The [[COPY]] nodes in function [[fn]] are tested for redundancy by
+[[cfunc_post_copy]]. Since they may be removed, the node list traversal
+is [[safe]].
+
+==cfunc_post_copy*/
+static cresult cfunc_post_copy(cfunction_t *fn)
+{
+    cblock_t *block;
+    cnode_t *node, *tmp;
+    cresult res = SUCCESS;
+
+    list_foreach_entry(&fn->cblock_head, block, cblock_list)
+    {
+        list_foreach_entry_safe(&block->cnode_head, node, tmp, cnode_list)
+        {
+            if(node->type == CN_COPY)
+                res |= update_copy(node, node->copy.value);
+        }
+    }
+    return res;
+}
+/*@
+
+[[update_copy]] determines whether the [[node]] converting a given
+value [[val]] is statically unnecessary.
+
+First, the value is checked for compatibility against the type to which
+it's converted. A [[NO]] is unlikely and erroneous; a [[YES]] means that
+the conversion is redundant and the [[COPY]] may be removed after being
+replaced with [[val]] in its users.
+
+A [[MAYBE]] confirms the necessity of its presence, but there is a
+further optimisation to attempt, if it's a [[CONST]] node that's being
+copied.
+
+==update_copy*/
+static cresult update_copy(cnode_t *node, cnode_t *val)
+{
+    switch(cnode_compat(val, node->decl))
+    {
+    case NO:
+        c_error("value of type `%s` found where type `%s` expected.",
+                decl_name(val->decl), decl_name(node->decl));
+        return FAILED;
+    case YES:
+        cnode_replace_in_users(node, val);
+        cnode_remove(node);
+        return CHANGED;
+    case MAYBE:
+        break;
+    }
+    if(val->type == CN_CONST)
+        return copy_of_const(node, val->constant);
+    return SUCCESS;
+}
+/*@
+
+[[copy_of_const]] tries to perform the conversion specified by the
+[[COPY]] [[node]] ahead of time. The object [[obj]] is converted to the
+type [[.decl]]; if successful, the [[COPY]] is be replaced with the
+equivalent [[CONST]], via [[node_become_constant]].
+
+==copy_of_const*/
+static cresult copy_of_const(cnode_t *node, robject_t *obj)
+{
+    bool valid;
+
+    obj = constant_convert(obj, node->decl, &valid);
+    if(valid)
+    {
+        node_become_constant(node, obj);
+        return CHANGED;
+    }
+    return SUCCESS;
+}
+/*@
+
+
+\section{Call Normalisation}
+\label{opt_post:call}
+
+A [[CALL]] to a function of known type (i.e. signature) has the
+opportunity to use the fast calling convention. This requires matching
+actual to formal arguments at compile-time, a task performed by
+[[call_sequence]] and the matcher functions (\autoref{call:match}).
+
+==opt_call.c*/
+//call includes//
+//ir_call_ctx_t//
+//set_arg//
+//append_rest//
+//fail_rest//
+//call_become_fast//
+//call_normalise//
+/*@
+
+This matching will produce an array of argument values in the correct
+order for generating a fast call sequence (\autoref{gen_code:call}),
+stored in the [[.args]] field of the [[ir_call_ctx]] structure.
+Alongside the [[.base]] context used by the matchers, [[.pres]] points
+to the result to be returned, which the callbacks can use to signal
+errors.
+
+==ir_call_ctx_t*/
+typedef struct
+{
+    call_ctx_t base;
+    cnode_array_t args;
+    cresult *pres;
+} ir_call_ctx_t;
+/*@
+
+[[call_normalise]] attempts to convert, from [[CALL]] to [[CALL_FAST]],
+the [[node]] calling a function with signature [[sig]]. After [[ctx]] is
+initialised it invokes [[call_sequence]], passing the actual [[args]]
+and [[names]] supplied by the [[.call]].
+
+On success, [[call_become_fast]] changes the node's [[.type]] as well as
+giving it ownership of the matched [[.args]] (otherwise, these must be
+explicitly freed). All arguments required by the function must indeed be
+supplied by the call; if not, the normalisation has [[FAILED]].
+
+==call_normalise*/
+cresult call_normalise(cnode_t *node, funsig_t *sig)
+{
+    cresult res = SUCCESS;
+    cnode_t **args = adata(&node->call.args);
+    rsymbol_t **names = call_has_names(node)
+                      ? adata(&node->call.names) : NULL;
+    int nargs = alen(&node->call.args);
+    ir_call_ctx_t ctx = {
+        .base = {
+            .posbits = 0,
+            .argbits = 0,
+            .sig = sig,
+            .append_rest = sig->has_rest
+                         ? append_rest : fail_rest,
+            .set_arg = set_arg
+        },
+        .args = ARRAY_INIT,
+        .pres = &res
+    };
+
+    array_resize(&ctx.args, sig->nargs);
+    if(call_sequence(&ctx, (void **)args, names, nargs, no_match_rest,
+                     call_match_kwd, call_match_pos, call_match_omit))
+    {
+        if(sig->reqbits != (ctx.base.argbits & sig->reqbits))
+        {
+            res |= FAILED;
+            c_error("required argument not supplied.");
+        }
+        else
+        {
+            res |= CHANGED;
+            call_become_fast(node, sig, &ctx.args, ctx.base.argbits);
+        }
+    }
+    else
+        array_fini(&ctx.args);
+    return res;
+}
+/*@
+
+The rest vector ``[[...]]'' has statically unknown contents.
+[[no_match_rest]] prevents the normalisation if it's encountered, since
+we can't do anything sensible with it. An enhancement would involve
+invoking [[call_normalise]] in an earlier pass where [[cell_t]]
+[[.value]]s are available, to take advantage of constants discovered by
+SCCP.
+
+The [[set_arg]] callback is invoked for each matched argument, giving
+the formal [[arg]] corresponding to the actual value [[val]]. Pointer
+arithmetic yields the index [[i]] to be assigned in the fast call
+argument array.
+
+==set_arg*/
+static bool set_arg(void *ptr, argdesc_t *arg, void *val)
+{
+    ir_call_ctx_t *ctx = ptr;
+    int i = arg - ctx->base.sig->args;
+
+    aset(&ctx->args, i, val);
+    return true;
+}
+/*@
+
+If a rest vector is required, the [[append_rest]] callback returns
+[[false]] and the call won't be normalised. This shortcoming could be
+enhanced by instead inserting the appropriate [[BUILTIN]] invocations to
+create a fresh vector and assign its elements.
+
+==append_rest*/
+static bool append_rest(void *ptr, rsymbol_t *name, void *val)
+    { return false; }
+/*@
+
+If the function doesn't expect a rest vector, extraneous arguments are
+erroneous, and this is noted by the [[fail_rest]] callback.
+
+==fail_rest*/
+static bool fail_rest(void *ptr, rsymbol_t *name, void *val)
+{
+    ir_call_ctx_t *ctx = ptr;
+
+    if(name)
+        c_error("unknown argument `%s`.", r_symstr(name));
+    else
+        c_error("too many arguments.");
+    *ctx->pres = FAILED;
+    return false;
+}
+/*@
+
+A [[node]] is transformed in-place from [[CALL]] to [[CALL_FAST]] by
+[[call_become_fast]]. The original [[.args]] array is redundant (as is
+[[.names]]), replaced with the normalised [[args]] array (and
+[[argbits]]). Note that the former and latter must contain the same
+elements (albeit in different order, and with more or fewer [[NULL]]s),
+because their [[.users]] are not updated.
+
+==call_become_fast*/
+static void call_become_fast(cnode_t *node, funsig_t *sig,
+                             cnode_array_t *args, argbits_t argbits)
+{
+    array_fini(&node->call.args);
+    array_fini(&node->call.names);
+    node->type = CN_CALL_FAST;
+    node->call.args = *args;
+    node->call.argbits = argbits;
+}
+/*@
+
+
+\section*{Miscellanea}
+
+==post includes*/
+#include "global.h"
+#include "ir.h"
+#include "opt.h"
+/*@
+
+==call includes*/
+#include "global.h"
+#include "ir.h"
+#include "opt.h"
+/*@
+
+%*/

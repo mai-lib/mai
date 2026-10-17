@@ -1,0 +1,1604 @@
+/*@
+\chapter{Analysis \& Optimisation}
+\label{opt}
+
+Optimising a program is the process of improving its efficiency while
+retaining its meaning. This subsystem performs data-flow analysis using
+the \textit{sparse conditional constant propagation} algorithm described
+in \citet{wegman91}, which enables type recovery, constant expression
+evaluation, and dead code elimination \citep[Section 9.3]{ahoullman}.
+
+==opt_sccp.c*/
+//sccp includes//
+//context//
+//sccp//
+//optimise//
+//cfunc_closure_pre//
+//cfunc_closure_post//
+//ir_optimise//
+/*@
+
+==opt_trans.c*/
+//trans includes//
+//builtins//
+//transfer//
+//transform//
+/*@
+
+Types and constant values are discovered and propagated through each
+function in the input. Some builtin operations can be computed ahead of
+time if the values of their arguments are known. [[CALL]]s to functions
+of known type can match named arguments and become [[_FAST]]; [[CALL]]s
+to known [[LAMBDA]]s can be expanded directly inline. Nodes annotated
+with recovered types admit the generation of specialised code (which
+executes faster, without the overhead of unboxing or type-directed
+dispatch.) Blocks which are not reachable on any execution path are
+detected and removed from the program.
+
+
+\section{Entry Point}
+\label{opt:opt}
+
+The subsystem entry point, [[ir_optimise]], repeatedly analyses and
+optimises the function [[fn]] until a fixed point is reached, before
+moving on to its lexical children.
+
+Before entering the loop, [[cfunc_closure_pre]] updates the types of
+closed variables with information from the function's [[.parent]].
+
+Each iteration first recovers type and constant information with
+[[cfunc_sccp]], then transforms the program accordingly with
+[[cfunc_optimise]], expanding invocations of known functions with
+[[inline_lambdas]].
+
+The result flags for the optimisation pass are set in [[ores]]; those
+for just the inlining phase in [[ires]]. If the IR was [[changed]], it's
+cleaned and renumbered.
+
+After inlining, some copied variables may no longer be captured by a
+lexical closure; [[cfunc_closure_post]] finds them and clears their
+[[.is_closed]] flags. Another call to [[cfunc_ssa_convert]]
+completes the integration of inlined code.
+
+==ir_optimise*/
+cresult ir_optimise(cfunction_t *fn)
+{
+    cresult res = SUCCESS, ores, ires;
+
+    if(fn->parent)
+        cfunc_closure_pre(fn);
+    do
+    {
+        if(fn->nnodes == 0 || fn->nblocks == 0)
+            break;
+
+        opt_init(fn);
+        cfunc_sccp(fn);
+        ores = cfunc_optimise(fn);
+        res |= ores |= ires = inline_lambdas(fn, &inlines);
+        opt_fini();
+        if(ores == CHANGED)
+        {
+            cfunc_cleanup(fn);
+            cfunc_rdfo(fn);
+        }
+        if(ires == CHANGED)
+        {
+            cfunc_closure_post(fn);
+            cfunc_ssa_convert(fn);
+        }
+    } while(ores == CHANGED);
+    return res | cfunc_map_children(fn, ir_optimise);
+}
+/*@
+
+Optimisation of closed variables is complicated by their representation
+-- after SSA conversion, other lexical variables are implicit in the
+value flow, whereas closed variables are still explicitly accessed
+through [[REF]] and [[SET]] nodes. A more uniform treatment would be
+desirable, perhaps via the ``lambda-lifting'' transformation described
+in \citet{clinger94}.
+
+%% [[SET]]s and [[BIND]]s are enforced in prepass, so if a closed const
+%% variable was given a [[.decl]] by the user, its value is going to be of
+%% some subtype.
+
+%% it might be a strict subtype, however, so we pass that down the fn tree
+%% via the [[.decl]] field. which is kind of ugly, because we don't have
+%% our own copy, we just stomp the shared [[cvar_t]] and rely on the
+%% recursive traversal order.
+
+%% For each variable that [[.is_const]] in the function [[fn]]'s
+%% [[.closure]], [[cfunc_closure_pre]] assigns it the type -- recovered or
+%% declared -- of the corresponding value captured by the function's
+%% [[LAMBDA]] node in its lexical parent (\autoref{ir_pre:closure}).
+
+[[cfunc_closure_pre]] assigns to each variable that [[.is_const]] in the
+function [[fn]]'s [[.closure]] the type -- recovered or declared -- of
+the corresponding value captured by the function's [[LAMBDA]] node in
+its lexical parent (\autoref{ir_pre:closure}).
+
+==cfunc_closure_pre*/
+static void cfunc_closure_pre(cfunction_t *fn)
+{
+    cvar_array_t *vars = &fn->closure;
+    cnode_array_t *vals = &fn->node->lambda.closure;
+    int i;
+
+    array_foreach(vars, i)
+    {
+        cvar_t *var = aref(vars, i);
+        cnode_t *val = aref(vals, i);
+
+        if(!val || !var->is_const)
+            continue;
+        var->decl = val->decl;
+    }
+}
+/*@
+
+%% Inlining (\autoref{opt_inline}) copies the IR objects of a callee into
+%% its caller, including its variables. Afterwards, the function [[fn]] may
+%% contain some variables which have [[.is_closed]] set but aren't used in
+%% any lexical children.
+
+[[cfunc_closure_post]] clears the [[.is_closed]] flags of the variables
+bound by the function [[fn]], then sets it for only those actually
+needed by its lexical [[child]] functions. Closed variables copied from
+inlined functions (\autoref{opt_inline}) can then participate in SSA
+conversion (\autoref{ir_ssa}) while avoiding unnecessary cell
+introduction (\autoref{opt_closure}).
+
+==cfunc_closure_post*/
+static void cfunc_closure_post(cfunction_t *fn)
+{
+    cfunction_t *child;
+    cvar_t *var;
+
+    list_foreach_entry(&fn->cvar_head, var, cvar_list)
+    {
+        if(cvar_is_global(var))
+            continue;
+        var->local.is_closed = false;
+    }
+    list_foreach_entry(&fn->cfunc_head, child, cfunc_list)
+    {
+        array_foreach_entry(&child->closure, var)
+            var->local.is_closed = true;
+    }
+}
+/*@
+
+
+\section{Context}
+
+==context*/
+//globals//
+//opt_init//
+//opt_fini//
+//cell_meet//
+//cell_changed//
+/*@
+
+Each node (\autoref{ir:node}) in the program has a corresponding
+LatticeCell in the [[cells]] array, representing compile-time knowledge
+about the constant value (and type of object) that it yields during
+execution \citep[Subsection 2.2]{wegman91}.
+
+==globals*/
+cell_t *cells;
+/*@
+
+Each block (\autoref{ir:block}) has a corresponding ExecutableFlag in
+[[flags]]. When this is [[true]], control flow from the function
+[[.entry]] can reach the block along an inedge from one of its
+predecessors.
+
+Since critical edges are not present in the control flow graph
+(\autoref{ir_pre:critedge}), a single flag can be unambiguously
+associated with each block \citep[Subsection 5.3]{wegman91}.
+
+==globals*/
+bool *flags;
+/*@
+
+These arrays are indexed by node or block [[.id]] via helper functions.
+
+==global helpers*/
+static inline cell_t *cell_for(cnode_t *node)
+    { return &cells[node->id]; }
+static inline bool flag_for(cblock_t *block)
+    { return flags[block->id]; }
+/*@
+
+The SCCP algorithm consumes items from two worklists. [[val_work]] holds
+pointers to nodes which need to be (re)analysed; it corresponds to the
+SSAWorkList of \citet[Subsection 3.4]{wegman91}. [[ctrl_work]] has
+pointers to blocks found executable but yet to be visited, and
+corresponds to FlowWorkList.
+
+==globals*/
+static WORKLIST(cnode_t *) val_work;
+static WORKLIST(cblock_t *) ctrl_work;
+/*@
+
+During optimisation, call sites which are suitable candidates for inlining
+are accumulated in the [[inlines]] array.
+
+==globals*/
+cnode_array_t inlines;
+/*@
+
+The global arrays are freshly initialised for each iteration of the
+analysis-optimisation loop.
+
+==opt_init*/
+static inline void opt_init(cfunction_t *fn)
+{
+    cells = xcalloc(fn->nnodes, sizeof(*cells));
+    flags = xcalloc(fn->nblocks, sizeof(*flags));
+    array_init(&inlines, 0);
+}
+/*@
+
+The function may change shape during [[cfunc_optimise]], so it's not
+safe to reuse [[cells]] or [[flags]].
+
+==opt_fini*/
+static inline void opt_fini()
+{
+    array_fini(&inlines);
+    xfree(cells);
+    xfree(flags);
+}
+/*@
+
+
+\subsection{LatticeCells}
+\label{opt:cell}
+
+The [[cell_t]] structure represents a LatticeCell. The [[.state]] field
+specifies its level in the lattice -- $[[BOTTOM]] \sqsubseteq [[TYPE]]
+\sqsubseteq [[CONST_OBJ]] = [[CONST_LAMBDA]] \sqsubseteq [[TOP]]$.
+
+Each cell starts at [[TOP]], meaning that it could, in future, take on a
+constant value. [[CONST_OBJ]] and [[CONST_LAMBDA]] occupy the level
+below, with [[.value]] pointing to the constant ([[robject_t]] or
+[[cfunction_t]] respectively,) and [[.type]] to its [[rtype_t]].
+[[TYPE]] is below these, with a known [[.type]] but no [[.value]]. At
+[[BOTTOM]], neither of these properties can be guaranteed.
+
+%% %% FIXME footnote?
+%% (these add no more than a constant factor to the algorithm's asymptotic
+%% complexity; the type hierarchy is fixed and type constructors are
+%% invariant under subtyping.)
+
+(the [[cellstate]] enumeration is reverse order so that [[calloc]] of
+the [[cells]] array initialises the [[.state]] fields to [[TOP]])
+
+==cell_t*/
+typedef enum { TOP, CONST_OBJ, CONST_LAMBDA, TYPE, BOTTOM } cellstate;
+typedef struct
+{
+    cellstate state;
+    rtype_t *type;
+    void *value;
+} cell_t;
+/*@
+
+A LatticeCell may be initialised to [[TOP]] or [[BOTTOM]] with
+[[cell_init]].
+
+==cell initialisers*/
+static inline void cell_init(cell_t *cell, cellstate state)
+    { cell->state = state; }
+/*@
+
+A constant value is assigned by [[cell_set_const_at]]. Note that [[obj]]
+could have a type which differs from [[type]], but it will always be the
+case that the former is a subtype of the latter.
+
+==cell initialisers*/
+static inline void cell_set_const_at(cell_t *cell, robject_t *obj, rtype_t *type)
+{
+    *cell = (cell_t) {
+        .state = CONST_OBJ,
+        .type = type,
+        .value = obj
+    };
+}
+/*@
+
+If that distinction is unnecessary, [[cell_set_const]] suffices.
+
+==cell initialisers*/
+static inline void cell_set_const(cell_t *cell, robject_t *obj)
+    { cell_set_const_at(cell, obj, r_typeof(obj)); }
+/*@
+
+The value of a [[LAMBDA]] node is assigned by [[cell_set_lambda]] --
+these are tracked separately since they exist only at compile time and
+are not represented by [[robject_t]]s. The [[.type]] of such a cell is
+determined by its [[fn]] (\autoref{ir:func}).
+
+==cell initialisers*/
+static inline void cell_set_lambda(cell_t *cell, cfunction_t *fn)
+{
+    *cell = (cell_t) {
+        .state = CONST_LAMBDA,
+        .type = fn->cl_type,
+        .value = fn
+    };
+}
+/*@
+
+If all that's known about a [[cell]] is the [[type]] of value it's seen
+to hold, this can be assigned by [[cell_set_type]].
+
+==cell initialisers*/
+static inline void cell_set_type(cell_t *cell, rtype_t *type)
+{
+    *cell = (cell_t) {
+        .state = TYPE,
+        .type = type
+    };
+}
+/*@
+
+Accessors query the state of a LatticeCell and extract its properties.
+[[cell_type]] returns [[NULL]] if the cell has no valid [[.type]].
+
+==cell accessors*/
+static inline rtype_t *cell_type(cell_t *cell)
+    { return (cell->state == TOP || cell->state == BOTTOM)
+             ? NULL : cell->type; }
+/*@
+
+When one of the [[cell_const_obj]] and [[cell_const_lambda]] predicates
+is [[true]], a call to [[cell_const]] will return the cell's constant
+[[.value]].
+
+==cell accessors*/
+static inline bool cell_const_obj(cell_t *cell)
+    { return cell->state == CONST_OBJ; }
+static inline bool cell_const_lambda(cell_t *cell)
+    { return cell->state == CONST_LAMBDA; }
+static inline void *cell_const(cell_t *cell)
+    { return cell->value; }
+/*@
+
+
+\subsection{Meet}
+
+Cells are lowered in the lattice according to the rules for $\sqcap$
+described in \citet[Figure 2]{wegman91}, extended with the [[TYPE]]
+state. [[cell_meet]] returns the lattice-theoretic meet of [[this]] and
+the [[other]] LatticeCell.
+
+==cell_meet*/
+static inline cell_t cell_meet(cell_t *this, cell_t *other)
+{
+    //meet//
+}
+/*@
+
+Since it's a symmetric operator, sorting the inputs reduces the
+cases necessary to consider.
+
+==meet*/
+if(this->state > other->state)
+{
+    cell_t *tmp = this;
+    this = other;
+    other = tmp;
+}
+/*@
+
+When [[this]] is [[TOP]] or [[other]] is [[BOTTOM]], the result is
+[[other]].
+
+==meet*/
+if(this->state == TOP || other->state == BOTTOM)
+    return *other;
+/*@
+
+When both [[this]] and [[other]] are either [[CONST_OBJ]] or
+[[CONST_LAMBDA]], and have equal [[.value]]s, their [[.type]]s are
+compared -- if those are also equal, the cells are identical; the
+operation is reflexive, so it doesn't matter which is returned.
+Otherwise, the result will have the (possibly more general)
+[[r_common_type]] (\autoref{type:subtype}).
+
+==meet*/
+if(other->state < TYPE
+   && this->state == other->state
+   && this->value == other->value)
+{
+    if(this->type == other->type)
+        return *this;
+    return (cell_t) {
+        .state = this->state,
+        .value = this->value,
+        .type = r_common_type(this->type, other->type)
+    };
+}
+/*@
+
+In all other cases -- one or more [[TYPE]] inputs, or unequal
+[[.values]] -- the result is a [[TYPE]] at least as general (i.e. as low
+in the lattice) as the [[.type]]s of the inputs.
+
+==meet*/
+return (cell_t) {
+    .state = TYPE,
+    .type = r_common_type(this->type, other->type)
+};
+/*@
+
+[[cell_changed]] will return [[true]] when [[this]] cell differs from
+the [[other]].
+
+==cell_changed*/
+static inline bool cell_changed(cell_t *this, cell_t *other)
+{
+    if(this->state != other->state)
+        return true;
+    bool chg = false;
+    switch(this->state)
+    {
+    case CONST_OBJ:
+    case CONST_LAMBDA:
+        chg = (this->value != other->value);
+        /* fallthrough */
+    case TYPE:
+        return chg | (this->type != other->type);
+    default:
+        return false;
+    }
+}
+/*@
+
+
+\section{Analysis}
+\label{opt:analysis}
+
+The SCCP algorithm performs data-flow analysis, proceeding as detailed
+in \citet[Subsection 3.4]{wegman91}.
+
+==sccp*/
+//add_val_work//
+//add_ctrl_work//
+//add_cond_work//
+//add_update_work//
+//set_flag_for//
+//visit_phi//
+//visit_node//
+//cfunc_sccp//
+/*@
+
+Analysis begins with the control-flow worklist containing the [[.entry]]
+block of the function, and will [[run]] until both worklists are empty.
+
+==cfunc_sccp*/
+static void cfunc_sccp(cfunction_t *fn)
+{
+    bool run;
+
+    worklist_init(&ctrl_work, fn->nblocks);
+    worklist_init(&val_work, fn->nnodes);
+    add_ctrl_work(fn->entry);
+    do
+    {
+        run = false;
+        //block work//
+        //node work//
+    } while(run);
+    worklist_fini(&ctrl_work);
+    worklist_fini(&val_work);
+}
+/*@
+
+Blocks are taken from the control-flow worklist until it's drained. If a
+[[block]] hasn't already been visited, its corresponding [[flag]] is
+set, signifying that execution can reach that point in the program. Its
+non-[[PHI]] nodes are added to the value-flow worklist. If the block has
+only one successor, execution will reach it unconditionally, so it's
+added to the control-flow worklist by [[add_ctrl_work]].
+
+==block work*/
+for(cblock_t *block; worklist_take(&ctrl_work, &block, block->id); run = true)
+{
+    cnode_t *node;
+
+    if(set_flag_for(block))
+        continue;
+    list_foreach_entry(&block->cnode_head, node, cnode_list)
+        if(node->type != CN_PHI && cnode_yields_value(node))
+            add_val_work(node);
+    if(alen(&block->succ) == 1)
+        add_ctrl_work(aref(&block->succ, 0));
+}
+/*@
+
+Nodes are taken from the value-flow worklist so that their LatticeCells
+may be updated. For a [[PHI]], this is done by [[visit_phi]]; for any
+other [[node]], [[visit_node]] is only invoked if its block has been
+flagged as reachable along some execution path. If the [[cell]]'s value
+changes as a result, the objects affected are added to the worklists by
+[[add_update_work]].
+
+==node work*/
+for(cnode_t *node; worklist_take(&val_work, &node, node->id); run = true)
+{
+    cell_t new, *cell = cell_for(node);
+
+    if(node->type == CN_PHI)
+        visit_phi(node, cell, &new);
+    else if(flag_for(node->block))
+        visit_node(fn, node, cell, &new);
+    else
+        continue;
+    if(cell_changed(&new, cell))
+    {
+        *cell = new;
+        add_update_work(node);
+    }
+}
+/*@
+
+A [[node]] is visited by evaluating its transfer function on the
+LatticeCells of its operands. By default, the [[new]] value is, at
+[[BOTTOM]], lacking constant or type information.
+
+==visit_node*/
+static void visit_node(cfunction_t *fn, cnode_t *node, cell_t *cell, cell_t *new)
+{
+    cell_init(new, BOTTOM);
+    opt_transfer(fn, node, new);
+}
+/*@
+
+[[visit_phi]] computes the LatticeCell for the given [[PHI]] [[node]].
+The [[new]] value is initialised to [[TOP]], since [[cell_meet]] lowers
+its inputs. For each argument, if the corresponding predecessor block
+has its [[flag]] set, execution can traverse the edge between them, so
+the [[arg]]'s LatticeCell is included in the meet.
+
+==visit_phi*/
+static void visit_phi(cnode_t *node, cell_t *cell, cell_t *new)
+{
+    int i;
+
+    cell_init(new, TOP);
+    array_foreach(&node->phi.args, i)
+    {
+        if(flag_for(aref(&node->block->pred, i)))
+        {
+            cnode_t *arg = aref(&node->phi.args, i);
+
+            *new = cell_meet(new, cell_for(arg));
+        }
+    }
+}
+/*@
+
+
+\subsection{Worklists}
+
+A [[node]] is added to the value-flow worklist by the [[add_val_work]]
+helper.
+
+==add_val_work*/
+static inline void add_val_work(cnode_t *node)
+    { worklist_push(&val_work, node, node->id); }
+/*@
+
+This is also invoked on each [[PHI]] in a [[block]] when the latter is
+added to the control-flow worklist by the [[add_ctrl_work]] helper.
+
+==add_ctrl_work*/
+static inline void add_ctrl_work(cblock_t *dest)
+{
+    cnode_t *node;
+
+    list_foreach_entry(&dest->cnode_head, node, cnode_list)
+        if(node->type == CN_PHI)
+            add_val_work(node);
+        else
+            break;
+    worklist_push(&ctrl_work, dest, dest->id);
+}
+/*@
+
+[[add_update_work]] is called when a [[node]]'s LatticeCell is updated.
+Each [[.user]] of its value is added to the value-flow worklist;
+[[add_cond_work]] is invoked instead if the node is the conditional
+which controls an [[IF]].
+
+==add_update_work*/
+static inline void add_update_work(cnode_t *node)
+{
+    cnode_t *user;
+
+    array_foreach_entry(&node->users, user)
+    {
+        if(user->type == CN_IF)
+            add_cond_work(node, user);
+        else if(cnode_yields_value(user))
+            add_val_work(user);
+    }
+}
+/*@
+
+In this case, only one successor of the [[IF]]'s block may need adding
+to the control-flow worklist -- [[tb]] if the conditional has the
+constant [[boolean]] value [[true]], [[fb]] if it's [[false]]. Otherwise
+its execution isn't statically predictable, so both successors are
+added.
+
+==add_cond_work*/
+static void add_cond_work(cnode_t *node, cnode_t *user)
+{
+    cell_t *cell = cell_for(node);
+    cblock_t *block = user->block;
+    cblock_t *tb = aref(&block->succ, 0),
+             *fb = aref(&block->succ, 1);
+
+    if(cell_const_obj(cell)
+       && r_typeof(cell_const(cell)) == r_type_boolean)
+    {
+        rboolean_t val = UNBOX(rboolean_t, cell_const(cell));
+        if(val == true)
+        {
+            add_ctrl_work(tb);
+            return;
+        }
+        else if(val == false)
+        {
+            add_ctrl_work(fb);
+            return;
+        }
+    }
+    add_ctrl_work(tb);
+    add_ctrl_work(fb);
+}
+/*@
+
+The [[set_flag_for]] helper unconditionally sets the corresponding
+[[flag]] for the given [[block]] to [[true]] and returns the previous
+value.
+
+==set_flag_for*/
+static inline bool set_flag_for(cblock_t *block)
+{
+    bool visited = flags[block->id];
+    flags[block->id] = true;
+    return visited;
+}
+/*@
+
+
+\subsection{Transfer Function}
+\label{opt:transfer}
+
+The semantics of the language with respect to the constant and type
+properties of LatticeCells are given by the \textit{transfer function}.
+
+==transfer*/
+//constant_convert//
+//set_const_global//
+//set_const_value//
+//set_const_closed//
+//transfer_ref//
+//transfer_copy//
+//transfer_call//
+//opt_transfer//
+/*@
+
+[[opt_transfer]] assigns to [[cell]] the LatticeCell representing the
+value yielded by the [[node]], given the LatticeCells of its inputs.
+
+==opt_transfer*/
+void opt_transfer(cfunction_t *fn, cnode_t *node, cell_t *cell)
+{
+    switch(node->type)
+    {
+        //transfer switch//
+    default:
+        break; /* NOTREACHED */
+    }
+}
+/*@
+
+The cell for a [[LAMBDA]] has the constant value of its
+[[.lambda.function]].
+
+==transfer switch*/
+case CN_LAMBDA:
+    cell_set_lambda(cell, node->lambda.function);
+    break;
+/*@
+
+The cell for a [[CONST]] holds the [[.constant]] value itself. The
+[[.decl]] of the node can differ from [[r_typeof(.constant)]] when e.g.
+boxing scalars or checking references.
+
+==transfer switch*/
+case CN_CONST:
+    cell_set_const_at(cell, node->constant, node->decl);
+    break;
+/*@
+
+An argument-introducing [[BIND]] without a declared type should stay
+untyped (so it can be specialised later, after being inlined.)
+
+==transfer switch*/
+case CN_BIND:
+    if(!node->set.value && node->decl)
+        cell_set_type(cell, node->decl);
+    break;
+/*@
+
+The other node types are handled out-of-line.
+
+==transfer switch*/
+case CN_CALL_FAST:
+case CN_CALL:
+    transfer_call(node, cell);
+    break;
+case CN_REF:
+    transfer_ref(cell, node->ref.var, fn);
+    break;
+case CN_COPY:
+    transfer_copy(cell, node->copy.value, node->decl);
+    break;
+case CN_BUILTIN:
+    trans_builtin(TRANSFER, node, cell, node->builtin.bi,
+                  &node->builtin.args);
+    break;
+/*@
+
+When the [[target]] of a [[CALL]]/[[CALL_FAST]] node has a callable
+[[type]] (\autoref{callable:sig}), the LatticeCell for the [[CALL]] is
+set to the type that the target returns. When the [[cell]] refers to a
+known builtin, the [[maybe_trans_builtin]] helper will invoke its
+transfer function (if it provides one.)
+
+==transfer_call*/
+static void transfer_call(cnode_t *node, cell_t *cell)
+{
+    cell_t *target = cell_for(node->call.target);
+    rtype_t *type = cell_type(target);
+
+    if(!type || !rtype_is_callable(type))
+        return;
+    cell_set_type(cell, type->sig->ret_type);
+    maybe_trans_builtin(TRANSFER, node, cell, target);
+}
+/*@
+
+Since SSA conversion (\autoref{ir_ssa}) has lowered most [[LEXICAL]]
+variables to value flow, the [[REF]] transfer function need only concern
+itself with the remaining cases.
+
+If [[var]] isn't constant, its declared type (if any) is assigned to its
+LatticeCell. Otherwise, if it's a [[GLOBAL_INT]], its initialising node
+[[.intl.set]] provides the [[cell]]'s constant value. A [[GLOBAL_EXT]]
+also has a constant value available, and this is extracted by
+[[set_const_global]]. A [[LEXICAL]] variable, at this point, must be
+captured by the function's [[LAMBDA]] from an enclosing lexical
+ancestor, and its initial value is assigned by [[set_const_closed]] to
+the LatticeCell.
+
+==transfer_ref*/
+static void transfer_ref(cell_t *cell, cvar_t *var, cfunction_t *fn)
+{
+    if(!var->is_const)
+    {
+        if(var->decl)
+            cell_set_type(cell, var->decl);
+        return;
+    }
+    switch(var->type)
+    {
+    case GLOBAL_INT:
+        set_const_value(cell, var->intl.set->set.value);
+        return;
+    case GLOBAL_EXT:
+        set_const_global(cell, var->extl.global);
+        return;
+    case LEXICAL:
+        set_const_closed(cell, var, fn);
+        break;
+    }
+}
+/*@
+
+The [[.val]] union of a [[global]] can hold a scalar or an object; in
+the former case, it must be boxed to form a suitable constant value for
+the [[cell]].
+
+==set_const_global*/
+static inline void set_const_global(cell_t *cell, rglobal_t *global)
+{
+    rtype_t *type = global->decl;
+    robject_t *obj = rtype_is_scalar(type)
+        ? c_intern(r_box(type, &global->val))
+        : global->val.object;
+
+    cell_set_const(cell, obj);
+}
+/*@
+
+The [[var]] at index [[i]] in the function's [[.closure]] is
+initialised, via capture, with the value of the node at the
+corresponding index in the [[LAMBDA]]'s [[.closure]], so this node also
+provides the value of the [[cell]].
+
+==set_const_closed*/
+static inline void set_const_closed(cell_t *cell, cvar_t *var, cfunction_t *fn)
+{
+    int i = index_of_var(&fn->closure, var);
+    set_const_value(cell, aref(&fn->node->lambda.closure, i));
+}
+/*@
+
+If the [[node]] that yields the initial value for a variable is outside
+the function being analysed, [[cell_for]] can't be used and
+[[set_const_value]] must fall back to direct examination. [[CONST]] and
+[[LAMBDA]] provide appropriate constant values, but anything else
+(conservatively) gives just a type.
+
+==set_const_value*/
+static inline void set_const_value(cell_t *cell, cnode_t *node)
+{
+    switch(node->type)
+    {
+    case CN_CONST:
+        cell_set_const_at(cell, node->constant, node->decl);
+        break;
+    case CN_LAMBDA:
+        cell_set_lambda(cell, node->lambda.function);
+        break;
+    default:
+        cell_set_type(cell, decl_type(node->decl));
+        break;
+    }
+}
+/*@
+
+The transfer function for a [[COPY]] node models the semantics of type
+conversion.
+
+==transfer_copy*/
+static inline void transfer_copy(cell_t *cell, cnode_t *src, rtype_t *type)
+{
+    cell_t *scell = cell_for(src);
+    rtype_t *styp = cell_type(scell);
+
+    if(cell_const_obj(scell))
+    {
+        //copy object//
+    }
+    else if(cell_const_lambda(scell))
+    {
+        //copy lambda//
+    }
+    //copy type//
+}
+/*@
+
+If the source node is known to have a constant value, and it can be
+converted to the requested [[type]], the [[cell]] can be assigned the
+converted value.
+
+==copy object*/
+robject_t *val = cell_const(scell);
+bool valid;
+
+val = constant_convert(val, type, &valid);
+if(valid)
+{
+    cell_set_const(cell, val);
+    return;
+}
+/*@
+
+If the source is known to yield a [[LAMBDA]], and its signature is
+compatible with the requested [[type]], the [[cell]] can be assigned its
+value.
+
+==copy lambda*/
+cfunction_t *fn = cell_const(scell);
+
+if(r_subtypep(fn->cl_type, type))
+{
+    cell_set_lambda(cell, fn);
+    return;
+}
+/*@
+
+In case the type [[styp]] of the source is a subtype of the [[type]]
+requested, the [[cell]] can be assigned the former, as the more precise
+information can improve optimisation. Otherwise it's assigned the
+latter; if incompatible, the error will be noted during a later pass.
+
+==copy type*/
+if(styp && r_subtypep(styp, type))
+    cell_set_type(cell, styp);
+else
+    cell_set_type(cell, type);
+/*@
+
+[[constant_convert]] takes a source value [[sval]] and a destination
+type [[dtype]], returning either the converted object with [[pvalid]]
+[[true]], or [[NULL]] with [[pvalid]] [[false]].
+
+==constant_convert*/
+robject_t *constant_convert(robject_t *sval, rtype_t *dtype, bool *pvalid)
+{
+    rtype_t *stype = r_typeof(sval);
+
+    *pvalid = false;
+    //identity//
+    if(rtype_is_scalar(dtype))
+    {
+        //to scalar//
+    }
+    else if(rtype_is_scalar(stype))
+    {
+        //from scalar//
+    }
+    else if(r_subtypep(stype, dtype))
+    {
+        //widening//
+    }
+    return NULL;
+}
+/*@
+
+Conversion between the same type is a no-op.
+
+==identity*/
+if(stype == dtype)
+{
+    *pvalid = true;
+    return sval;
+}
+/*@
+
+If the value is a scalar, it can be converted to any other scalar type.
+
+==to scalar*/
+if(rtype_is_scalar(stype))
+{
+    rvalue_union_t val;
+
+    *pvalid = true;
+    scalar_convert(&val, sval, dtype, stype);
+    return c_intern(r_box(dtype, &val));
+}
+/*@
+
+Converting a scalar value to an [[object]] requests that it be boxed by
+the VM, but constants in the compiler are boxed already, so this is also
+a no-op.
+
+==from scalar*/
+if(dtype == r_type_object)
+{
+    *pvalid = true;
+    return sval;
+}
+/*@
+
+A value of reference type is also a value of one of its supertypes.
+
+==widening*/
+*pvalid = true;
+return sval;
+/*@
+
+
+\section{Optimisation}
+
+Given the LatticeCells and ExecutableFlags discovered by analysis, the
+program is optimised by transforming its nodes and blocks into a more
+efficient configuration while maintaining the equivalence of its output.
+
+==optimise*/
+//prune_block//
+//prune_dead_blocks//
+//cfunc_optimise//
+/*@
+
+==transform*/
+//call_become_builtin//
+//call_become_copy//
+//node_become_constant//
+//transform_call//
+//transform_phi//
+//transform_if//
+//transform_set//
+//shuffle_phi//
+//fold_constant//
+//update_decl//
+//opt_transform//
+/*@
+
+Each block in the function is visited by [[cfunc_optimise]]. Those
+without a [[flag]] set can't be reached by any path of execution through
+the program, and may be [[pruned]] from the control-flow graph.
+
+The nodes in each executable block may be modified by [[opt_transform]],
+up to and including relocation or removal, so the [[list_]] traversal
+must be [[_safe]].
+
+==cfunc_optimise*/
+static cresult cfunc_optimise(cfunction_t *fn)
+{
+    cblock_array_t pruned;
+    cresult res = SUCCESS;
+    cblock_t *block;
+
+    array_init(&pruned, 0);
+    list_foreach_entry(&fn->cblock_head, block, cblock_list)
+    {
+        cnode_t *node, *tmp;
+
+        if(!flag_for(block))
+        {
+            array_push(&pruned, block);
+            continue;
+        }
+        list_foreach_entry_safe(&block->cnode_head, node, tmp, cnode_list)
+            res |= opt_transform(fn, node, cell_for(node));
+    }
+    res |= prune_dead_blocks(&pruned);
+    array_fini(&pruned);
+    return res;
+}
+/*@
+
+The blocks found to be unreachable are removed by [[prune_dead_blocks]].
+[[prune_block]] is invoked on each; it unconditionally examines the
+[[.id]]s of predecessors and successors, so we must defer the calls to
+[[cblock_free]].
+
+==prune_dead_blocks*/
+static cresult prune_dead_blocks(cblock_array_t *arr)
+{
+    cblock_t *block;
+
+    if(!opt.opt_dce || alen(arr) == 0)
+        return SUCCESS;
+    array_foreach_entry(arr, block)
+        prune_block(block);
+    array_foreach_entry(arr, block)
+        cblock_free(block);
+    return CHANGED;
+}
+/*@
+
+Pruning the unreachable [[block]] involves breaking the links between
+itself and each of its reachable predecessors and successors (since
+unreachable ones will also be removed, they can be ignored here.) All
+its nodes must cease using any others, as [[cblock_free]] calls
+[[cnode_free]], not [[cnode_remove]].
+
+==prune_block*/
+static void prune_block(cblock_t *block)
+{
+    cblock_t *other;
+    cnode_t *node;
+
+    array_foreach_entry(&block->pred, other)
+        if(flag_for(other))
+            remove_link(&other->succ, block);
+    array_foreach_entry(&block->succ, other)
+        if(flag_for(other))
+            remove_link(&other->pred, block);
+    list_foreach_entry(&block->cnode_head, node, cnode_list)
+        cnode_unuse_all(node);
+}
+/*@
+
+
+\subsection{Transformation}
+\label{opt:transform}
+
+By analogy with [[opt_transfer]], the transformation function
+[[opt_transform]] modifies the [[node]] in light of the (potentially
+new) information given by the [[cell]]. If anything is [[CHANGED]] as a
+result, the outer analysis-optimisation loop will run again on the
+updated IR.
+
+==opt_transform*/
+cresult opt_transform(cfunction_t *fn, cnode_t *node, cell_t *cell)
+{
+    cresult res = update_decl(node, cell);
+
+    switch(node->type)
+    {
+        //transform switch//
+    default:
+        break;
+    }
+    return res;
+}
+/*@
+
+[[REF]], [[COPY]] and [[BUILTIN]] nodes have no specific transformations
+but, since they yield values, they may become [[CONST]]s via
+[[fold_constant]].
+
+==transform switch*/
+case CN_REF:
+case CN_COPY:
+case CN_BUILTIN:
+    if(fold_constant(node, cell))
+        res |= CHANGED;
+    break;
+/*@
+
+[[CALL]]/[[CALL_FAST]] nodes may also be folded as constants but, if
+that isn't possible, may undergo further transformation via
+[[transform_call]].
+
+==transform switch*/
+case CN_CALL:
+case CN_CALL_FAST:
+    if(fold_constant(node, cell))
+        res |= CHANGED;
+    else
+        res |= transform_call(node, cell);
+    break;
+/*@
+
+In a similar manner, [[PHI]] nodes may be folded, or transformed by
+[[transform_phi]].
+
+==transform switch*/
+case CN_PHI:
+    if(fold_constant(node, cell))
+        res |= CHANGED;
+    else
+        res |= transform_phi(node);
+    break;
+/*@
+
+[[SET]] and [[IF]] nodes don't yield values, but have transformation
+functions of their own.
+
+==transform switch*/
+case CN_SET:
+    res |= transform_set(node, cell);
+    break;
+case CN_IF:
+    res |= transform_if(node);
+    break;
+/*@
+
+If the analysis has computed a different type for the [[node]] (assuming
+it yields a value,) its [[.decl]] field is updated from its
+corresponding [[cell]], and the appropriate result flag raised.
+
+==update_decl*/
+static cresult update_decl(cnode_t *node, cell_t *cell)
+{
+    if(cnode_yields_value(node))
+    {
+        rtype_t *type = cell_type(cell);
+
+        if(type && node->decl != type)
+        {
+            node->decl = type;
+            return CHANGED;
+        }
+    }
+    return SUCCESS;
+}
+/*@
+
+When the [[target]] of a [[CALL]] or [[CALL_FAST]] node is known to be a
+[[LAMBDA]], the [[node]] is added to the set of potential [[inlines]].
+When it's known to be a builtin, [[maybe_trans_builtin]] will invoke the
+builtin's transformation function, returning the result flags.
+
+==transform_call*/
+static cresult transform_call(cnode_t *node, cell_t *cell)
+{
+    cell_t *target = cell_for(node->call.target);
+
+    if(opt.opt_inline && cell_const_lambda(target))
+    {
+        array_push(&inlines, node);
+        return SUCCESS;
+    }
+    return maybe_trans_builtin(TRANSFORM, node, cell, target);
+}
+/*@
+
+A [[PHI]] node's arguments correspond to inedges from predecessors of
+the [[block]] in which it resides. If any of the latter will be removed
+by [[prune_dead_blocks]], the former must be as well. The node
+unregisters itself from using them; the others are copied to the scratch
+buffer [[buf]].
+
+Should this leave the [[node]] with only one argument, it's redundant --
+the argument takes the place of the [[PHI]], which can then be
+[[cnode_remove]]d.
+
+Otherwise, if the number of arguments has changed, the node's
+[[.phi.args]] array is emptied and refilled with the non-[[NULL]]
+elements from the scratch buffer.
+
+==transform_phi*/
+static cresult transform_phi(cnode_t *node)
+{
+    cblock_t *block = node->block;
+    cnode_t *buf[alen(&block->pred)];
+    bool purge = true;
+    int i, j = 0;
+
+    if(!opt.opt_dce)
+        return SUCCESS;
+    array_foreach(&block->pred, i)
+    {
+        cblock_t *pred = aref(&block->pred, i);
+        cnode_t *arg = aref(&node->phi.args, i);
+
+        if(flag_for(pred))
+        {
+            if(j > 0 && arg != buf[j-1])
+                purge = false;
+            buf[j++] = arg;
+        }
+        else
+            cnode_remove_user(node, arg);
+    }
+    if(purge)
+    {
+        cnode_replace_in_users(node, buf[0]);
+        cnode_remove(node);
+        return CHANGED;
+    }
+    else if(j == alen(&block->pred))
+        return SUCCESS;
+
+    array_clear(&node->phi.args);
+    for(i=0; i<j; i++)
+        array_push(&node->phi.args, buf[i]);
+    return CHANGED;
+}
+/*@
+
+When one or both successors of an [[IF]] node's [[block]] are going to
+be removed, the [[node]] is redundant and may be removed also.
+
+==transform_if*/
+static cresult transform_if(cnode_t *node)
+{
+    cblock_t *block = node->block;
+    cblock_t *succ;
+
+    if(!opt.opt_dce)
+        return SUCCESS;
+    array_foreach_entry(&block->succ, succ)
+    {
+        if(!flag_for(succ))
+        {
+            cnode_remove(node);
+            return CHANGED;
+        }
+    }
+    return SUCCESS;
+}
+/*@
+
+As a convenience, a constant [[GLOBAL_INT]] variable takes on the
+recovered type of the value assigned by its initialising [[SET]] node.
+
+==transform_set*/
+static cresult transform_set(cnode_t *node, cell_t *cell)
+{
+    cvar_t *var = node->set.var;
+
+    if(var->type == GLOBAL_INT && var->is_const)
+    {
+        cell_t *value = cell_for(node->set.value);
+        rtype_t *type = cell_type(value);
+
+        if(type && var->decl != type)
+        {
+            var->decl = type;
+            return CHANGED;
+        }
+    }
+    return SUCCESS;
+}
+/*@
+
+If its corresponding [[cell]] is determined to have constant value,
+[[fold_constant]] transforms the [[node]] into a [[CONST]].
+
+==fold_constant*/
+static bool fold_constant(cnode_t *node, cell_t *cell)
+{
+    if(opt.opt_constfold && cell_const_obj(cell))
+    {
+        robject_t *val = cell_const(cell);
+
+        if(node->type == CN_PHI)
+            shuffle_phi(node);
+        node_become_constant(node, val);
+        return true;
+    }
+    return false;
+}
+/*@
+
+Since [[PHI]] nodes appear before the others in a block, the [[node]]
+being folded is shuffled forward, beyond its former fellows (it'll be
+encountered again during the list-order traversal in [[cfunc_optimise]],
+but this has no effect since [[CONST]]s are ignored by
+[[opt_transform]].)
+
+==shuffle_phi*/
+static inline void shuffle_phi(cnode_t *node)
+{
+    list_t *link;
+
+    for(link = node->cnode_list.next;
+        link != &node->block->cnode_head;
+        link = link->next)
+    {
+        cnode_t *next = list_entry(link, node, cnode_list);
+
+        if(next->type != CN_PHI)
+            break;
+    }
+    list_remove(&node->cnode_list);
+    list_add_before(link, &node->cnode_list);
+}
+/*@
+
+[[node_become_constant]] invokes [[cnode_reset]] before [[node]] takes
+on its new guise as a [[CONST]] with the given [[val]]ue. As noted, its
+[[type]] may be different to the [[r_typeof]] the latter.
+
+==node_become_constant*/
+void node_become_constant(cnode_t *node, robject_t *val)
+{
+    rtype_t *type = node->decl;
+
+    cnode_reset(node);
+    node->type = CN_CONST;
+    node->decl = type;
+    node->constant = val;
+}
+/*@
+
+
+\section{Builtins}
+\label{opt:builtin}
+
+Builtin functions may supply optional callbacks which the compiler will
+invoke during analysis and optimisation to enact their unique semantics.
+
+==builtins*/
+//builtin predicates//
+//trans_builtin//
+//maybe_trans_builtin//
+/*@
+
+These are specified by the [[builtin_ops_t]] structure referenced by the
+[[cbuiltin_t]] associated with the function (\autoref{callable:builtin}).
+
+The [[.trans_fn]] callback is invoked first as a [[TRANSFER]] function
+to provide a value for the [[cell]]; then to [[TRANSFORM]] the node from
+a [[CALL]] to a [[BUILTIN]] if possible. The optional [[.enforce_fn]]
+will be called during postpass (\autoref{opt_post}) to convert the
+node's inputs to an appropriate type; [[.generate_fn]] is responsible
+for emitting the appropriate bytecode instruction during code
+generation (\autoref{gen_code:node}).
+
+[[.is_pure]] and [[.is_void]] are wrapped by predicates, since
+[[builtin_ops_t]] is private to this subsystem.
+
+==builtin_ops_t*/
+typedef enum { TRANSFER, TRANSFORM } opt_phase;
+typedef struct builtin_ops
+{
+    cresult (*trans_fn)(opt_phase, cnode_t *, cell_t *,
+                        const cbuiltin_t *, cnode_array_t *);
+    cresult (*enforce_fn)(cnode_t *);
+    void (*generate_fn)(cnode_t *);
+    bool (*is_pure)(cnode_t *, bool);
+    bool is_void;
+} builtin_ops_t;
+/*@
+
+[[builtin_is_void]] when the builtin returns no meaningful value; in
+this case it won't require a location to be allocated for its result.
+%ref gen_loc
+
+[[builtin_is_pure]] if the call to builtin [[bi]] at [[node]], given
+[[may_alias]], can be considered to be functionally pure
+(\autoref{ir:nodefn}, [[cnode_is_pure]]).
+
+==builtin predicates*/
+bool builtin_is_pure(const cbuiltin_t *bi, cnode_t *node, bool may_alias)
+    { return bi->ops && bi->ops->is_pure
+             && bi->ops->is_pure(node, may_alias); }
+bool builtin_is_void(const cbuiltin_t *bi, cnode_t *node)
+    { return bi->ops && bi->ops->is_void; }
+/*@
+
+[[trans_builtin]] is responsible for invoking the [[.trans_fn]] callback
+when the builtin [[bi]] provides one. It's passed the [[CALL]] or
+[[BUILTIN]] [[node]], its [[cell]], and the array [[args]] containing
+its arguments.
+
+==trans_builtin*/
+static cresult trans_builtin(opt_phase phase, cnode_t *node, cell_t *cell,
+                             const cbuiltin_t *bi, cnode_array_t *args)
+{
+    if(bi && bi->ops && bi->ops->trans_fn)
+        return bi->ops->trans_fn(phase, node, cell, bi, args);
+    return SUCCESS;
+}
+/*@
+
+The [[maybe_trans_builtin]] function calls [[trans_builtin]] when the
+[[node]] is a [[CALL]] of a constant builtin [[target]]. Since this
+examines the [[.call.args]] array given by the user, it isn't applicable
+to [[CALL_FAST]] nodes.
+%ref call normalisation??
+
+==maybe_trans_builtin*/
+static cresult maybe_trans_builtin(opt_phase phase, cnode_t *node,
+                                  cell_t *cell, cell_t *target)
+{
+    if(opt.opt_builtin && cell_const_obj(target)
+       && node->type == CN_CALL)
+    {
+        robject_t *obj = cell_const(target);
+        if(rtype_is_callable(r_typeof(obj)))
+        {
+            rcallable_t *cl = (rcallable_t *)obj;
+            if(rcall_is_builtin(cl))
+            {
+                rbuiltin_t *rbi = (rbuiltin_t *)obj;
+                return trans_builtin(phase, node, cell, rbi->cbi,
+                                     &node->call.args);
+            }
+        }
+    }
+    return SUCCESS;
+}
+/*@
+
+During the [[TRANSFORM]] phase, [[.trans_fn]] may decide the
+functionality of the [[node]] in question is best implemented by a
+bytecode instruction. [[call_become_builtin]] will be invoked to change
+the node's [[.type]] and initialise the [[.builtin.bi]] and
+[[.builtin.optype]] fields (the array of [[args]] is taken before
+[[cnode_reset]] to avoid needing to undo the effects of its call to
+[[cnode_unuse_all]]).
+
+==call_become_builtin*/
+void call_become_builtin(cnode_t *node, const cbuiltin_t *bi,
+                         rtype_t *optype, rtype_t *type)
+{
+    cnode_array_t args = node->call.args;
+
+    node->call.args = (cnode_array_t) ARRAY_INIT;
+    cnode_reset(node);
+    node->type = CN_BUILTIN;
+    node->decl = type;
+    node->builtin.bi = bi;
+    node->builtin.args = args;
+    node->builtin.optype = optype;
+}
+/*@
+
+\subsection{Argument Helpers}
+
+[[arg_type]] returns the recovered type of the argument with index [[n]]
+in the [[args]] array. Omitted arguments have the [[nil]] type, which
+may be inappropriate; caveat user.
+
+==arg_type*/
+static inline rtype_t *arg_type(cnode_array_t *args, int n)
+{
+    cnode_t *arg = aref(args, n);
+    return arg ? cell_type(cell_for(arg)) : r_type_nil;
+}
+/*@
+
+[[check_arg_names]] returns [[true]] when a [[CALL]] node does not have
+any named arguments.
+
+==check_arg_names*/
+static inline bool check_arg_names(cnode_t *node)
+{
+    if(node->type == CN_CALL && alen(&node->call.names) > 0)
+        return false;
+    return true;
+}
+/*@
+
+[[check_args]] returns [[true]] when there are no missing arguments and,
+if the node is a [[CALL]], no argument names are present.
+
+==check_args*/
+static inline bool check_args(cnode_t *node, cnode_array_t *args)
+{
+    cnode_t *arg;
+    array_foreach_entry(args, arg)
+        if(!arg)
+            return false;
+    return check_arg_names(node);
+}
+/*@
+
+[[check_nargs]] additionally ensures that the call has the specified
+[[arity]].
+
+==check_nargs*/
+static inline bool check_nargs(int arity, cnode_t *node, cnode_array_t *args)
+{
+    if(alen(args) != arity)
+        return false;
+    return check_args(node, args);
+}
+/*@
+
+
+\section{Miscellanea}
+
+==opt.h*/
+//cell_t//
+//cell accessors//
+//cell initialisers//
+extern cell_t *cells;
+extern bool *flags;
+//global helpers//
+extern cnode_array_t inlines;
+//builtin_ops_t//
+// for arith/opt.c
+void call_become_builtin(cnode_t *node, const cbuiltin_t *bi,
+                         rtype_t *optype, rtype_t *type);
+void call_become_copy(cnode_t *node, rtype_t *type);
+// for opt_post.c
+robject_t *constant_convert(robject_t *sval, rtype_t *dtype, bool *pvalid);
+void node_become_constant(cnode_t *node, robject_t *val);
+// for opt_sccp.c (entry points)
+void opt_transfer(cfunction_t *fn, cnode_t *node, cell_t *cell);
+cresult opt_transform(cfunction_t *fn, cnode_t *node, cell_t *cell);
+// opt_post.c
+cresult call_normalise(cnode_t *node, funsig_t *sig);
+// opt_inline.c
+cresult inline_lambdas(cfunction_t *outer, cnode_array_t *nodes);
+//arg_type//
+//check_arg_names//
+//check_args//
+//check_nargs//
+/*@
+
+==sccp includes*/
+#include "global.h"
+#include "worklist.h"
+#include "ir.h"
+#include "opt.h"
+/*@
+
+==trans includes*/
+#include "global.h"
+#include "ir.h"
+#include "opt.h"
+bool scalar_convert(void *dest, robject_t *obj, rtype_t *to, rtype_t *from);
+/*@
+
+% */

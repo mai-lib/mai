@@ -1,0 +1,923 @@
+/*@
+\chapter{Runtime}
+\label{rt}
+
+The runtime subsystem offers a set of data types and objects to user
+code, and mediates with the operating system. It defines the behaviour
+of these types and objects (Chapters \ref{type}--\ref{vector}), manages
+the global environments, and handles memory allocation and garbage
+collection (\autoref{gc}).
+
+==rt/runtime.c*/
+//includes//
+//ops//
+//runtime_root//
+//nil//
+//symbols//
+//strings//
+//cells//
+//global variables//
+//runtime_init//
+//runtime_fini//
+/*@
+
+%% XXX necessary?
+%% XXX point out who uses what?
+The runtime module orchestrates initialisation and finalisation of the
+subsystem, manages global variables, interfaces with the garbage
+collector, and defines the primitive types and values not belonging to
+other modules -- objects, symbols, strings, cells, and [[nil]].
+
+
+\section{Objects}
+\label{rt:obj}
+
+Values manipulated by user code are pointers to [[robject_t]]. Every
+type of object includes one of these structures as its first member. Its
+[[.type]] field points to the unique [[rtype_t]] which describes the set
+of instances to which the object belongs (\autoref{type}).
+
+==robject_t*/
+typedef struct rtype rtype_t;
+typedef struct
+{
+    rtype_t *type;
+} robject_t;
+typedef ARRAY(robject_t *) robject_array_t;
+/*@
+
+%% XXX misplaced?
+The compiler may decide that a value can be instead be represented as a
+\textit{scalar} of some type handled by the underlying processor.
+
+We use these [[typedef]]s to remind ourselves (and \texttt{gcc}) that
+runtime scalars are not C scalars, as each of the former has a
+designated [[NA]] value.
+
+%% XXX misplaced?
+When a scalar is handled by code which has not been specialised by the
+compiler, it's placed in a \textit{box}, and the pointer to it is
+treated like any other object (\autoref{scalar:box}).
+
+==scalar types*/
+typedef double rdouble_t;
+typedef int rint_t;
+typedef uint8_t rboolean_t;
+/*@
+
+%% XXX misplaced?
+Templated code in the VM is generically applicable to scalars and
+objects. This [[typedef]] allows the type name ``ptr'' to be used in
+such contexts.
+
+==pointer type*/
+typedef robject_t *rptr_t;
+#define rptr_na NULL
+/*@
+
+Some fundamental functions may be called on objects of any type. These
+are mostly used by the compiler and runtime (but may, via builtins, be
+called from user code.)
+
+To implement type-specific behaviour, these functions rely on the
+callbacks specified in the [[.ops]] field of an object's [[.type]].
+
+==typeops_t*/
+typedef struct
+{
+    uint32_t (*hash)(const void *);
+    bool (*equal)(const void *, const void *);
+    void (*print)(FILE *, const void *);
+    void (*gc)(void *);
+    void (*free)(void *);
+} typeops_t;
+/*@
+
+The arguments are typed as [[void *]] so they can be invoked on
+specialised objects (which contain, but are not themselves,
+[[robject_t]]) without being obliged to insert casts.
+
+Given an object, [[r_typeof]] returns its type. The [[nil]] object is
+represented as a C [[NULL]] pointer, and has all bits zero. (not strictly
+standards compliant.) %cite C99 I guess?
+Its type is distinct, [[r_type_nil]].
+
+==r_typeof*/
+static inline rtype_t *r_typeof(const void *ptr)
+    { return ptr ? ((robject_t *)ptr)->type : r_type_nil; }
+/*@ %def r_typeof
+
+
+\subsection{Primitive Operations}
+
+==ops*/
+//r_hash//
+//r_equal//
+//r_print//
+//r_gc//
+//r_free//
+/*@
+
+[[r_hash]] computes the 32-bit hash of the object. This value differs
+(with high probability) for objects which are not equal. Since the
+notion of equality differs depending on the object's type, we invoke its
+[[ops.hash]] callback. All concrete types (i.e. those which might be
+returned by [[r_typeof]] called on some object) are expected to populate
+this field.
+
+==r_hash*/
+uint32_t r_hash(const void *ptr)
+{
+    rtype_t *typ = r_typeof(ptr);
+    assert(typ->ops->hash);
+    return typ->ops->hash(ptr);
+}
+/*@ %def r_hash
+
+[[hash_roll]] is used to mix two hashes together. The hash of a
+composite object can be computed by ``accumulating'' the value
+[[hash = hash_roll(hash, r_hash(element))]] for each element.
+
+==hash_roll*/
+static inline uint32_t hash_roll(uint32_t hash, uint32_t val)
+    { return hash_code_seed(&val, sizeof(val), hash); }
+/*@
+
+Since objects are represented by pointers, and an object is always equal
+to itself, we can short-circuit the [[ops.equal]] call if the pointers
+are identical. Equality is symmetric -- [[equal(a,b) == equal(b,a)]] --
+and objects of different types are never [[equal]]. As a convenience,
+omitting the callback denotes that every object of that type is unique.
+
+==r_equal*/
+bool r_equal(const void *xp, const void *yp)
+{
+    const robject_t *x = xp, *y = yp;
+    rtype_t *xt = r_typeof(x), *yt = r_typeof(y);
+
+    if(x == y)
+        return true;
+    if(xt != yt)
+        return false;
+    if(xt->ops->equal)
+        return xt->ops->equal(xp, yp);
+    return false;
+}
+/*@ %def r_equal
+
+Output from [[r_print]] is intended for human interpretation. The
+[[FILE *]] argument is usually [[stdout]], but explicitly allows for
+programmatic redirection to a file or memory stream. If the object's
+type doesn't provide an [[ops.print]] callback, some indication of
+object identity is output instead, in the form ``[[<type pointer>]]''.
+
+No special care is taken, when printing objects, to recognise and avoid
+cycles in the reference graph. An infinite loop will result from
+printing an object that directly or indirectly contains a pointer to
+itself.
+
+==r_print*/
+void r_print(FILE *fp, const void *ptr)
+{
+    rtype_t *typ = r_typeof(ptr);
+
+    if(typ->ops->print)
+        typ->ops->print(fp, ptr);
+    else
+    {
+        fprintf(fp, "<");
+        r_print(fp, typ);
+        fprintf(fp, " %p>", ptr);
+    }
+}
+/*@ %def r_print
+
+The garbage collector (\autoref{gc}) may call [[r_gc]] on an object. It is responsible
+for calling [[gc_mark]] on any objects it holds references to -- so, at
+least its [[.type]]. If it has any others, they will be marked by [[ops.gc]].
+
+==r_gc*/
+void r_gc(void *ptr)
+{
+    rtype_t *typ = r_typeof(ptr);
+
+    gc_mark(typ);
+    if(typ->ops->gc)
+        typ->ops->gc(ptr);
+}
+/*@ %def r_gc
+
+If an object is not marked during collection, it will never be used
+again, and will be swept as garbage when the collector calls [[r_free]].
+Some types of objects contain pointers to unmanaged memory (i.e. not
+[[robject_t]]s,) and these will be deallocated by [[ops.free]].
+
+==r_free*/
+void r_free(void *ptr)
+{
+    rtype_t *typ = r_typeof(ptr);
+    if(typ->ops->free)
+        typ->ops->free(ptr);
+}
+/*@ %def r_free
+
+Some objects may not be referred to by other objects but are accessible
+nevertheless, and so are not garbage. The collector keeps a list of
+[[gc_root_t]]s, and invokes each [[.fn]] to mark these objects.
+
+==runtime_root*/
+//mark_global//
+//mark_type//
+//runtime_gc//
+static gc_root_t runtime_root = { .fn = runtime_gc };
+/*@ %
+
+The runtime marks the variables and types in the global environments, as
+well as some implementation details which are not exposed to the user
+(the mutable cell and compiled function types, and the [[...]] symbol)
+
+==runtime_gc*/
+static void runtime_gc(gc_root_t *root)
+{
+    hashmap_map(r_globals, mark_global, NULL);
+    hashmap_map(r_global_types, mark_type, NULL);
+    gc_mark(r_type_cell);
+    gc_mark(r_type_function);
+    gc_mark(r_sym_rest);
+}
+/*@ %
+
+Each global variable has its name and declared type marked. Its value is
+also marked if it's an object and not an unboxed scalar.
+
+==mark_global*/
+static void mark_global(const void *key, void *value, void *data)
+{
+    rglobal_t *global = value;
+
+    gc_mark((void *)key);
+    gc_mark(global->decl);
+    if(!global->decl || !rtype_is_scalar(global->decl))
+        gc_mark(global->val.object);
+}
+/*@ %
+
+Each type in the global environment is marked, as is its name.
+
+==mark_type*/
+static void mark_type(const void *key, void *value, void *data)
+{
+    gc_mark((void *)key);
+    gc_mark(value);
+}
+/*@ %
+
+
+\subsection{nil}
+
+[[r_type_nil]] has its own [[ops.print]] and [[ops.hash]] callbacks.
+
+==nil*/
+static uint32_t nil_hash(const void *ptr)
+{
+    return 0;
+}
+
+static void nil_print(FILE *fp, const void *ptr)
+{
+    fprintf(fp, "<nil>");
+}
+
+static const typeops_t nil_ops = {
+    .hash = nil_hash,
+    .print = nil_print
+};
+/*@
+
+
+\section{Symbols}
+\label{rt:symbol}
+
+A symbol is an immutable unique string, as in LISP \citep{mccarthy60}.
+Only one symbol with a given string is stored in the symbol table, so
+(except in [[r_intern]]) two symbols may be compared with pointer
+equality in constant time.
+
+==symbols*/
+//r_symtab//
+//sym_init//
+//sym_equal//
+//rsym_hash//
+//r_intern//
+//sym_free//
+//sym_print//
+//sym_ops//
+/*@ %
+
+The [[.string]] field points to [[libc]] heap memory owned by the
+object.
+
+==rsymbol_t*/
+typedef struct rsymbol
+{
+    robject_t base;
+    char *string;
+    uint32_t hash;
+} rsymbol_t;
+/*@ %def rsymbol_t
+
+The [[.hash]] of the string is precomputed and passed in during
+initialisation.
+
+==sym_init*/
+static void sym_init(rsymbol_t *sym, char *string, uint32_t hash)
+{
+    sym->string = string;
+    sym->hash = hash;
+}
+/*@ %
+
+When their [[.string]]s are equal, two symbols are equal.
+
+==sym_equal*/
+static bool sym_equal(const void *xp, const void *yp)
+{
+    const rsymbol_t *x = xp, *y = yp;
+    return string_equal(x->string, y->string);
+}
+/*@ %
+
+The [[.hash]] of a symbol can be extracted.
+
+==rsym_hash*/
+uint32_t rsym_hash(const void *ptr)
+{
+    return ((rsymbol_t *)ptr)->hash;
+}
+/*@ %
+
+[[nil]] is a member of [[r_type_symbol]], and has a distinguished
+representation.
+
+==r_symstr*/
+static inline char *r_symstr(const rsymbol_t *sym)
+    { return sym ? sym->string : "(nil)"; }
+/*@ %
+
+All symbols are stored in the symbol table, a hash set whose elements
+are compared with [[sym_equal]] and hashed with [[rsym_hash]].
+
+==r_symtab*/
+hashset_t *r_symtab;
+/*@ %def r_symtab
+
+A symbol is created by ``internalising'' a string. The string is hashed,
+and the symbol table is probed with a temporary [[rsymbol_t]]. If some
+symbol is found, it is returned. Otherwise a new symbol is allocated,
+initialised, and returned. The [[string]] argument is duplicated, so the
+caller may reuse its copy.
+
+==r_intern*/
+rsymbol_t *r_intern(const char *string)
+{
+    assert(string);
+    rsymbol_t *sym, tmp;
+    uint32_t hash = string_hash(string);
+
+    sym_init(&tmp, (char *)string, hash);
+    sym = hashset_get(r_symtab, &tmp);
+    if(sym)
+        return sym;
+    sym = gc_alloc(r_type_symbol, sizeof(rsymbol_t));
+    sym_init(sym, strdup(string), hash);
+    hashset_insert(r_symtab, sym);
+    return sym;
+}
+/*@ %
+
+Creating symbols is only possible via [[r_intern]], so [[r_symtab]]
+contains all currently live symbols. When a symbol is not reachable from
+any root, and is collected as garbage, it may be safely removed from the
+table.
+
+==sym_free*/
+static void sym_free(void *ptr)
+{
+    rsymbol_t *sym = ptr;
+
+    hashset_remove(r_symtab, sym);
+    xfree(sym->string);
+}
+/*@ %
+
+A symbol is printed as its [[.string]] (or [[nil]],) without decoration.
+
+==sym_print*/
+static void sym_print(FILE *fp, const void *ptr)
+{
+    fprintf(fp, "%s", r_symstr(ptr));
+}
+/*@ %
+
+The [[.equal]] callback defaults to pointer equality. The only user of
+[[sym_equal]] is the interning mechanism.
+
+==sym_ops*/
+static const typeops_t sym_ops = {
+    .free = sym_free,
+    .hash = rsym_hash,
+    .equal = NULL,
+    .print = sym_print
+};
+/*@ %
+
+
+\section{Strings}
+\label{rt:string}
+
+A string is a sequence of characters. It is immutable, but not unique.
+Strings are very simple, and only really suitable for filenames, error
+messages or fixed output. An enhancement would be to replace this type
+with one more fully-featured, possibly a vector (\autoref{vector}) of
+Unicode code points.
+
+==strings*/
+//rstr_create//
+//rstr_free//
+//rstr_equal//
+//rstr_hash//
+//rstr_print//
+//str_ops//
+/*@ %
+
+As with [[r_type_symbol]], the heap memory pointed to by the [[.string]]
+field is owned by the object.
+
+==rstring_t*/
+typedef struct
+{
+    robject_t base;
+    char *string;
+} rstring_t;
+/*@
+
+Creation is straightforward. The [[string]] argument is duplicated.
+
+==rstr_create*/
+rstring_t *rstr_create(const char *string)
+{
+    rstring_t *str = gc_alloc(r_type_string, sizeof(rstring_t));
+    str->string = strdup(string);
+    return str;
+}
+/*@ %
+
+Destruction is likewise trivial.
+
+==rstr_free*/
+static void rstr_free(void *ptr)
+{
+    rstring_t *str = ptr;
+    xfree(str->string);
+}
+/*@ %
+
+[[rstr_equal]] is (mutatis mutandis) identical to [[rsym_equal]].
+
+==rstr_equal*/
+static bool rstr_equal(const void *xp, const void *yp)
+{
+    const rstring_t *x = xp, *y = yp;
+    return string_equal(x->string, y->string);
+}
+/*@ %
+
+Unlike symbols, strings are not expected to be hashed often, so they do
+not store a [[.hash]] field but compute it each time.
+
+==rstr_hash*/
+static uint32_t rstr_hash(const void *ptr)
+{
+    const rstring_t *str = ptr;
+    return string_hash(str->string);
+}
+/*@ %
+
+A string is printed inside [["double quotes"]].
+
+==rstr_print*/
+static void rstr_print(FILE *fp, const void *ptr)
+{
+    const rstring_t *str = ptr;
+    fprintf(fp, "\"%s\"", str->string);
+}
+/*@ %
+
+Note the [[.equal]] callback is initialised -- unlike symbols, two
+strings with the same contents are not necessarily the same object.
+
+==str_ops*/
+static const typeops_t str_ops = {
+    .free = rstr_free,
+    .hash = rstr_hash,
+    .equal = rstr_equal,
+    .print = rstr_print
+};
+/*@ %
+
+
+\section{Cells}
+\label{rt:cell}
+%% XXX this belongs in type.nw, on account of being a type constructor
+%% and those are first introduced there?
+
+The values of mutable variables captured by a function are not stored
+directly in its closure. \textit{Cells} are introduced by the compiler
+to hold their values (\autoref{opt_closure}). Many closures may refer to
+the same cell.
+
+==cells*/
+//rcell_create//
+//rcell_gc//
+//cell_ops//
+//cell_cons//
+//rcell_type_create//
+/*@ %
+
+A cell, like a box, contains a single value of its element type, stored
+immediately following the [[robject_t]] header.
+
+==rcell_create*/
+robject_t *rcell_create(rtype_t *typ)
+{
+    assert(rtype_is_cell(typ));
+    return gc_alloc(typ, sizeof(robject_t) + rtype_eltsz(typ->elt));
+}
+/*@ %
+
+If its element isn't an unboxed scalar, it's a reference to an object,
+and must be marked during garbage collection.
+
+==rcell_gc*/
+static void rcell_gc(void *ptr)
+{
+    robject_t *cell = ptr;
+    rtype_t *etyp = r_typeof(cell)->elt;
+
+    if(!rtype_is_scalar(etyp))
+        gc_mark(UNBOX(robject_t *, cell));
+}
+/*@ %
+
+Cells aren't visible to the user and allocate no unmanaged memory, so
+need no other [[.ops]] callbacks.
+
+==cell_ops*/
+static const typeops_t cell_ops = {
+    .gc = rcell_gc,
+};
+/*@ %
+
+[[r_type_cell]] is a type constructor, but it can't be invoked by the
+user so [[.from_spec]] need not be provided.
+
+==cell_cons*/
+static consdesc_t cell_cons = {
+    .kind = RT_CELL
+};
+/*@ %
+
+The compiler calls [[rcell_type_create]] to create the type instance of
+a cell holding an element of type [[etype]].
+
+==rcell_type_create*/
+rtype_t *rcell_type_create(rtype_t *etyp)
+{
+    return rtype_create(RT_CELL, etyp, &cell_ops, NULL);
+}
+/*@ %
+
+
+\section{Globals}
+\label{rt:global}
+
+The runtime defines variables in the global environment to provide
+objects to the user code (which may define variables of its own.)
+
+==global variables*/
+//r_globals//
+//r_get_global//
+//r_create_global//
+//r_unset//
+//r_definitial//
+/*@ %
+
+A global variable is represented by an [[rglobal_t]] binding structure.
+If [[.decl]] is [[NULL]], the global was not explicitly declared by the
+user. Otherwise it points to an object which bounds the variable's type
+-- it will always be the case that [[r_subtypep(.val, .decl)]].
+[[.is_const]] is set if the global was declared constant -- its [[.val]]
+will never change (note that this is not a property of the object to
+which it refers, e.g. the elements of a vector or array may still be
+modified.)
+
+==rglobal_t*/
+typedef struct
+{
+    rvalue_union_t val;
+    rtype_t *decl;
+    bool is_const;
+} rglobal_t;
+/*@
+
+The value of a global variable is stored in an [[rvalue_union_t]]. When
+specified by [[.decl]], this may contain a scalar so a box doesn't need
+to be allocated. Otherwise (or when the global is undeclared), the value
+is referred to by the [[.object]] field.
+
+==rvalue_union_t*/
+typedef union {
+    rboolean_t boolean;
+    rint_t integer;
+    rdouble_t dfloat;
+    robject_t *object;
+} rvalue_union_t;
+/*@
+
+The global environment is a hash table mapping [[rsymbol_t]] names to
+[[rglobal_t]] bindings.
+
+==r_globals*/
+hashmap_t *r_globals;
+/*@ %
+
+If no global exists with the given name, [[r_get_global]] returns
+[[NULL]].
+
+==r_get_global*/
+rglobal_t *r_get_global(rsymbol_t *name)
+{
+    return hashmap_get(r_globals, name, NULL);
+}
+/*@ %
+
+A global is added to the environment on creation. Checking for an
+existing variable with the same name is the caller's responsibility (as,
+in some cases, its absence can be assumed.)
+
+==r_create_global*/
+rglobal_t *r_create_global(rsymbol_t *name, rtype_t *decl, bool is_const)
+{
+    rglobal_t *global = xcalloc(1, sizeof(rglobal_t));
+
+    assert(!r_get_global(name));
+    *global = (rglobal_t) {
+        .decl = decl,
+        .is_const = is_const
+    };
+    hashmap_set(r_globals, name, global);
+    return global;
+}
+/*@ %
+
+Declaration of a global guarantees its existence with unchanging
+[[.decl]], [[.is_const]] and, if the latter, [[.val]]. The compiler can
+then safely take advantage of these properties when generating code.
+
+Only globals which have not been explicitly declared may be removed from
+the environment.
+
+==r_unset*/
+bool r_unset(rsymbol_t *name)
+{
+    rglobal_t *global = r_get_global(name);
+
+    if(global && !global->decl)
+    {
+        hashmap_remove(r_globals, name);
+        xfree(global);
+        return true;
+    }
+    return false;
+}
+/*@ %
+
+Runtime modules use [[r_definitial]] to create a global constant with an
+initial value. [[pval]] points to an object of the type [[decl]].
+
+==r_definitial*/
+void r_definitial(rsymbol_t *name, rtype_t *decl, void *pval)
+{
+    assert(decl);
+    rglobal_t *global = r_create_global(name, decl, true);
+    memcpy(&global->val, pval, rtype_eltsz(decl));
+}
+/*@ %
+
+Convenience wrappers initialise global constants with values of
+reference types\ldots
+
+==r_defbuiltin*/
+static inline void r_defbuiltin(char *str, void *value)
+    { r_definitial(r_intern(str), r_typeof(value), &value); }
+/*@ %
+
+\ldots and scalar types, respectively.
+
+==r_defscalar*/
+static inline void r_defscalar(char *str, rtype_t *decl,
+                               rvalue_union_t value)
+    { r_definitial(r_intern(str), decl, &value); }
+/*@ %
+
+
+\section{Initialisation and Finalisation}
+\label{rt:init}
+
+The runtime environment has process lifetime. It is the first module to
+be brought up, and the last to be shut down.
+
+==runtime_init*/
+rtype_t *r_type_nil, *r_type_symbol, *r_type_string;
+rtype_t *r_type_cell, *r_type_object;
+rsymbol_t *r_sym_rest;
+const extern builtin_init_t runtime_builtins[];
+const extern builtin_init_t arith_builtins[];
+void runtime_init()
+{
+    //create tables//
+    //init gc//
+    //init vm//
+    //bootstrap type//
+    //install runtime types//
+    //install types and builtins//
+}
+/*@ %
+
+The global environment and symbol table are allocated first (global
+bindings are unique, so [[ptr_eq]] suffices as equality predicate.)
+
+==create tables*/
+r_globals = hashmap_create(rsym_hash, ptr_eq);
+r_symtab = hashset_create(rsym_hash, sym_equal);
+/*@ %
+
+The managed heap must be initialised before any managed objects are
+created. [[runtime_root]] is registered with the collector, but garbage
+collection is not enabled until we specify otherwise -- we need not
+worry about unrooted or partially initialised objects being collected
+out from under us.
+
+==init gc*/
+gc_init();
+gc_register(&runtime_root);
+/*@ %
+
+The VM must export its direct-threading jump table before any bytecode
+can be generated by the compiler (\autoref{vm:exec}).
+
+==init vm*/
+vm_execute(NULL, NULL);
+/*@
+
+[[r_type_type]] is created (carefully) by [[rt_bootstrap]]. Once that
+exists, we can create new types in the usual manner. However, before we
+can install them in the global type environment, we must initialise
+[[r_type_symbol]], lest we confuse [[r_intern]].
+
+==bootstrap type*/
+rt_bootstrap();
+r_type_symbol = rtype_create(RT_OBJECT, NULL, &sym_ops, "symbol");
+rtype_install(r_type_type, "type");
+rtype_install(r_type_symbol, "symbol");
+/*@ %
+
+[[r_type_object]] is ``abstract'', in the sense that no objects exist
+with it as their [[.type]]. Its [[.ops]] will never be invoked, so may
+be [[NULL]].
+
+The rest of the runtime types are created and, except for
+[[r_type_cell]], installed (the latter is an implementation detail of
+closures, and may only appear in compiled code.)
+
+The [[nil]] constant is defined here -- as is the symbol [[...]], as
+builtins defined later may use it as an argument name.
+%% /*
+%%     "Since objects do not exist through their own nature,
+%%     they are established as existing through the force of convention."
+%% */
+
+==install runtime types*/
+r_type_object = rtype_init(RT_OBJECT, NULL, "object");
+r_type_nil = rtype_init(RT_OBJECT, &nil_ops, "nil");
+r_type_string = rtype_init(RT_OBJECT, &str_ops, "string");
+r_type_cell = rtype_cons_create(&cell_cons, "cell");
+r_defbuiltin("nil", NULL);
+r_sym_rest = r_intern("...");
+/*@ %
+
+Other modules may then proceed to define types, objects and builtin
+functions in the global environment(s).
+
+==install types and builtins*/
+rt_install_call_types();
+rt_install_scalar_types();
+rt_install_vec_types();
+rbuiltin_install(arith_builtins);
+rbuiltin_install(runtime_builtins);
+rt_init_options();
+/*@ %
+
+Finalisation is simpler: since most objects are managed, shutting down
+the heap will destroy them. Global variable bindings aren't (neither are
+the global tables), so they must be explicitly freed.
+
+==runtime_fini*/
+static void free_global(const void *key, void *value, void *data)
+{
+    xfree(value);
+}
+
+void runtime_fini()
+{
+    gc_fini();
+    hashmap_map(r_globals, free_global, NULL);
+    hashmap_free(r_globals);
+    hashset_free(r_symtab);
+    hashset_free(r_typetab);
+    hashmap_free(r_global_types);
+}
+/*@ %
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+#include "builtin.h"
+/*@ %
+
+==rt/runtime.h*/
+//scalar types//
+//robject_t//
+//pointer type//
+//typeops_t//
+//rsymbol_t//
+//rstring_t//
+//rvalue_union_t//
+//rglobal_t//
+//externs//
+//prototypes//
+//RTYPE//
+//hash_roll//
+//r_symstr//
+//r_typeof//
+//r_defbuiltin//
+//r_defscalar//
+//subincludes//
+/*@
+
+==RTYPE*/
+#define RTYPE(type) PASTE2(r_type_, type)
+/*@
+
+==externs*/
+extern hashmap_t *r_globals;
+extern hashset_t *r_symtab;
+extern rsymbol_t *r_sym_rest;
+extern rtype_t *r_type_object, *r_type_symbol, *r_type_string;
+extern rtype_t *r_type_nil, *r_type_cell;
+/*@
+
+==prototypes*/
+uint32_t rsym_hash(const void *sym);
+rsymbol_t *r_intern(const char *string);
+rstring_t *rstr_create(const char *string);
+void r_free(void *ptr);
+void r_gc(void *ptr);
+uint32_t r_hash(const void *ptr);
+bool r_equal(const void *px, const void *py);
+void r_print(FILE *fp, const void *ptr);
+rglobal_t *r_get_global(rsymbol_t *name);
+rglobal_t *r_create_global(rsymbol_t *name, rtype_t *decl, bool is_const);
+bool r_unset(rsymbol_t *name);
+void r_definitial(rsymbol_t *name, rtype_t *decl, void *pval);
+rtype_t *rcell_type_create(rtype_t *etyp);
+robject_t *rcell_create(rtype_t *etyp);
+void runtime_init();
+void runtime_fini();
+/*@
+
+==subincludes*/
+#include "rt/type.h"
+#include "rt/scalar.h"
+#include "rt/callable.h"
+#include "rt/call.h"
+#include "rt/vector.h"
+#include "rt/gc.h"
+#include "rt/math.h"
+#include "rt/options.h"
+#include "vm/vm.h"
+/*@
+
+%*/

@@ -1,0 +1,98 @@
+const retypeof = function(function f) ret_type(typeof(f))
+const eltypeof = function(object v) elt_type(typeof(v))
+time = function(function fn) {
+    var a = rt_time(), v = fn(), b = rt_time()
+    b - a
+}
+const replicate = function(int n, function fn, type etyp = retypeof(fn)) {
+    let val = vector(etyp, n)
+    for(i=1; i<=n; i=i+1)
+        val[i] = fn()
+    return val
+}
+const mean = function(vector x) sum(x) / length(x)
+const square = function(x) x * x
+const mapcols = function(array x, function fn, type etyp = retypeof(fn)) {
+    var n = shape(x)[2], res = vector(etyp, n)
+    for(i = 1; i <= n; i = i + 1)
+        res[i] = fn(x[,i])
+    res
+}
+const map = function(vector x, function fn, type etyp = retypeof(fn)) {
+    var n = length(x), res = vector(etyp, n)
+    for(i = 1; i <= n; i = i + 1)
+        res[i] = fn(x[i])
+    res
+}
+const which.min = function(vector xs) : int {
+    var n = length(xs), m = 1, v = xs[1]
+    for(i = 2; i <= n; i = i + 1) {
+        var x = xs[i]
+        if(x < v) {
+            v = x
+            m = i
+        }
+    }
+    m
+}
+const colsum = function(x) mapcols(x, sum, eltypeof(x))
+const eucl.dist = function(x, y) : double
+    sqrt(sum(square(x - y)))
+const closest.map.list = function(vector(numeric) xs,
+                                  vector(numeric) ys) : integer
+    map(xs, function(x) : int
+                which.min(map(ys, function(y) : double
+                                      eucl.dist(x, y))))
+const eucl.dist.vec = function(x, ys) : vector(double)
+    sqrt(colsum(square(x - ys)))
+const closest.map.array = function(array(double) xs,
+                                   array(double) ys) : integer
+    mapcols(xs, function(x) : int
+                    which.min(eucl.dist.vec(x, ys)))
+const closest.loop.list = function(vector(numeric) xs,
+                                   vector(numeric) ys) : integer
+{
+    var lx = length(xs), ly = length(ys), res = int(lx)
+    for(i = 1; i <= lx; i = i + 1) {
+        let idx = -1, d = Inf, x = xs[i]
+        for(j = 1; j <= ly; j = j + 1) {
+            let r = eucl.dist(x, ys[j])
+            if(r < d) { idx = j; d = r; }
+        }
+        res[i] = idx
+    }
+    res
+}
+const closest.loop.array = function(array(double) xs,
+                                    array(double) ys) : integer
+{
+    var lx = shape(xs)[2], ly = shape(ys)[2], res = int(lx)
+    for(i = 1; i <= lx; i = i + 1) {
+        let idx = -1, d = Inf, x = xs[,i]
+        for(j = 1; j <= ly; j = j + 1) {
+            let r = eucl.dist(x, ys[,j])
+            if(r < d) { idx = j; d = r; }
+        }
+        res[i] = idx
+    }
+    res
+}
+const d = 100, r = 10
+global xs, ys, xa, ya
+const mklist = function(n) : vector(numeric)
+    replicate(n, function():numeric rnorm(d))
+const mkarr = function(n) : array(double) {
+    let res = array(type(double), vec(d, n))
+    res[] = rnorm(n*d)
+    res
+}
+const test = function(fn)
+    print(mean(replicate(r, function():double time(fn)[1])))
+for(n = 1000; n <= 3000; n = n + 1000) {
+    print(n)
+    xs = mklist(n); ys = mklist(n); xa = mkarr(n); ya = mkarr(n)
+    test(function() closest.map.list(xs, ys))
+    test(function() closest.loop.list(xs, ys))
+    test(function() closest.map.array(xa, ya))
+    test(function() closest.loop.array(xa, ya))
+}

@@ -1,0 +1,728 @@
+/*@
+\chapter{Utilities}
+\label{util}
+
+This appendix contains utility code used internally by the system.
+
+
+\section*{Lists}
+
+==list.h*/
+/*
+  untyped doubly-linked list abstraction
+
+  _heavily_ inspired by include/linux/list.h,
+  which is licensed under the
+
+  GNU GENERAL PUBLIC LICENSE
+     Version 2, June 1991
+*/
+
+typedef struct list
+{
+    struct list *next;
+    struct list *prev;
+} list_t;
+
+#define LIST_INIT(_self) { &(_self), &(_self) }
+
+static inline bool list_isempty(list_t *list)
+{
+    return list->next == list && list->prev == list;
+}
+
+static inline void list_init(list_t *list)
+{
+    list->next = list;
+    list->prev = list;
+}
+
+static inline bool list_isfirst(list_t *head, list_t *list)
+{
+    return list->prev == head;
+}
+static inline bool list_islast(list_t *head, list_t *list)
+{
+    return list->next == head;
+}
+
+static inline void _list_set(list_t *prev, list_t *list, list_t *next)
+{
+    list->next = next;
+    list->prev = prev;
+    next->prev = list;
+    prev->next = list;
+}
+
+static inline void list_add(list_t *prev, list_t *list)
+{
+    _list_set(prev, list, prev->next);
+}
+
+static inline void list_add_before(list_t *next, list_t *list)
+{
+    _list_set(next->prev, list, next);
+}
+
+static inline void list_remove(list_t *list)
+{
+    list->next->prev = list->prev;
+    list->prev->next = list->next;
+    list_init(list);
+}
+
+// splice constraint: from must be a head. to may be a link.
+static inline void list_splice_before(list_t *to, list_t *from)
+{
+    if(list_isempty(from))
+        return;
+    from->prev->next = to;
+    from->next->prev = to->prev;
+    to->prev->next = from->next;
+    to->prev = from->prev;
+    list_init(from);
+}
+
+static inline void list_splice_after(list_t *to, list_t *from)
+{
+    if(list_isempty(from))
+        return;
+    from->prev->next = to->next;
+    from->next->prev = to;
+    to->next->prev = from->prev;
+    to->next = from->next;
+    list_init(from);
+}
+
+#define list_foreach(_head, _ptr)               \
+    for(_ptr = (_head)->next;                   \
+        _ptr != _head;                          \
+        _ptr = _ptr->next)
+
+#define list_foreach_from(_head, _ptr)          \
+    for(;                                       \
+        _ptr != _head;                          \
+        _ptr = _ptr->next)
+
+#define list_foreach_safe(_head, _ptr, _tmp)            \
+    for(_ptr = (_head)->next, _tmp = _ptr->next;        \
+        _ptr != _head;                                  \
+        _ptr = _tmp, _tmp = _ptr->next)
+
+#define list_foreach_reverse(_head, _ptr)       \
+    for(_ptr = (_head)->prev;                   \
+        _ptr != _head;                          \
+        _ptr = _ptr->prev)
+
+static inline size_t list_length(list_t *list)
+{
+    list_t *ptr;
+    size_t count = 0;
+    list_foreach(list, ptr)
+        count++;
+    return count;
+}
+
+/*
+   slightly more convenient (albeit less standards-safe) interface
+   inspired by mesa's gallium/auxiliary/util/u_double_list.h
+
+   hic sunt demons nasal, if _obj is not initialised
+*/
+#define list_entry(_link, _obj, _mem)           \
+    (void *)((char *)(_link)                    \
+             - ((char *)&(_obj)->_mem           \
+                - (char *)(_obj)))              \
+
+#define list_foreach_entry(_head, _ptr, _mem)                           \
+    for(_ptr = NULL, _ptr = list_entry((_head)->next, _ptr, _mem);      \
+        &_ptr->_mem != (_head);                                         \
+        _ptr = list_entry(_ptr->_mem.next, _ptr, _mem))
+
+#define list_foreach_entry_reverse(_head, _ptr, _mem)                   \
+    for(_ptr = NULL, _ptr = list_entry((_head)->prev, _ptr, _mem);      \
+        &_ptr->_mem != (_head);                                         \
+        _ptr = list_entry(_ptr->_mem.prev, _ptr, _mem))
+
+#define list_foreach_entry_from(_head, _ptr, _mem)                      \
+    for(; _ptr && &_ptr->_mem != (_head);                               \
+        _ptr = list_entry(_ptr->_mem.next, _ptr, _mem))
+
+#define list_foreach_entry_safe(_head, _ptr, _tmp, _mem)        \
+    for(_ptr = NULL,                                            \
+            _ptr = list_entry((_head)->next, _ptr, _mem),       \
+            _tmp = list_entry(_ptr->_mem.next, _ptr, _mem);     \
+        &_ptr->_mem != (_head);                                 \
+        _ptr = _tmp,                                            \
+            _tmp = list_entry(_ptr->_mem.next, _ptr, _mem))
+
+#define list_while_entry(_head, _ptr, _mem)                             \
+    for(_ptr = NULL, _ptr = list_entry((_head)->next, _ptr, _mem);      \
+        &_ptr->_mem != (_head);                                         \
+        _ptr = list_entry((_head)->next, _ptr, _mem))
+
+/*
+  simple singly-linked list abstraction
+*/
+
+#define SLIST(typ) typ *
+#define slist_push(head, elt, link)             \
+    ((elt)->link = (head), (head) = (elt))
+#define slist_pop(head, link)                                   \
+    ((head) ? _take_ptr((void **)&(head), (head)->link) : NULL)
+#define slist_while_pop(head, ptr, link)        \
+    while((ptr = slist_pop(head, link)))
+#define slist_remove_head(head, link)           \
+    ((head) = (head)->link)
+#define slist_insert(before, after, link)                       \
+    ((after)->link = (before)->link, (before)->link = (after))
+#define slist_foreach(head, ptr, link)          \
+    for(ptr = (head); ptr; ptr = ptr->link)
+#define slist_foreach_safe(head, ptr, tmp, link)                \
+    for(ptr = (head); ptr && (tmp = ptr->link, true); ptr = tmp)
+#define slist_nreverse(head, link) do {                 \
+        for(void *tmp = NULL, *ptr = (head); ptr; )     \
+        {                                               \
+            head = ptr;                                 \
+            ptr = head->link;                           \
+            head->link = tmp;                           \
+            tmp = head;                                 \
+        }                                               \
+    } while(0)
+/*@
+
+
+\section*{Arrays}
+
+==array.h*/
+#define ARRAY(_typ)                              \
+    struct                                       \
+    {                                            \
+        size_t length;                           \
+        size_t size;                             \
+        _typ *ptr;                               \
+    }
+
+#define ARRAY_INIT { 0, 0, NULL }
+
+static inline void *
+_adjust_array(void *ptr, size_t elt, size_t size)
+{
+    if(size == 0)
+    {
+        if(ptr)
+            xfree(ptr);
+        return NULL;
+    }
+    if(ptr)
+        return xrealloc(ptr, elt * size);
+    return xmalloc(elt * size);
+}
+
+static inline void *
+_extend_array(size_t *plength, size_t *psize, unsigned n,
+              void *ptr, size_t elt)
+{
+    *plength += n;
+    if(*plength > *psize)
+    {
+        *psize = max(*psize, 1);
+        while(*plength > *psize)
+            *psize *= 2;
+        return _adjust_array(ptr, elt, *psize);
+    }
+    return ptr;
+}
+
+static inline void *
+_init_array(size_t *plength, size_t *psize, size_t elt, size_t init)
+{
+    *psize = init;
+    *plength = 0;
+    if(init != 0)
+        return _adjust_array(NULL, elt, init);
+    return NULL;
+}
+
+#define _size_elt(_arr) (sizeof(*((_arr)->ptr)))
+
+#define array_init(_arr, _init)                                         \
+    ((_arr)->ptr = _init_array(&(_arr)->length,                         \
+                               &(_arr)->size,                           \
+                               _size_elt(_arr),                         \
+                               _init))
+
+#define array_alloc(_arr, _init)                                \
+    (*_arr = xmalloc(sizeof(*(*_arr))),                         \
+     array_init(*_arr, _init))
+
+#define array_fini(_arr) do                     \
+    {                                           \
+        assert(_arr);                           \
+        if((_arr)->ptr)                         \
+            free((_arr)->ptr);                  \
+        (_arr)->ptr = NULL;                     \
+    } while (0)
+
+#define array_free(_arr) do                     \
+    {                                           \
+        array_fini(_arr);                       \
+        free(_arr);                             \
+    } while (0)
+
+// resize the array exactly
+#define array_shrink(_arr)                              \
+    ((_arr)->ptr = _adjust_array((_arr)->ptr,           \
+                                 _size_elt(_arr),       \
+                                 alen(_arr)))
+
+// resize the array exactly, clear the array, return the contents pointer
+#define array_cede(_arr)                        \
+    (array_shrink(_arr),                        \
+     array_clear(_arr),                         \
+     _take_ptr((void **)&(_arr)->ptr, NULL))
+
+#define array_clear(_arr) ((_arr)->length = 0)
+
+#define array_isempty(_arr) ((_arr)->length == 0)
+
+#define atail(_arr) ((_arr)->length - 1)
+
+// XXX does not zero the additional storage
+#define array_extend(_arr, _n)                                          \
+    ((_arr)->ptr = _extend_array(&(_arr)->length,                       \
+                                 &(_arr)->size, _n,                     \
+                                 (_arr)->ptr,                           \
+                                 _size_elt(_arr)))
+
+#define array_push(_arr, _val)                                          \
+    (array_extend(_arr, 1),                                             \
+     (_arr)->ptr[atail(_arr)] = (_val))
+
+#define array_pop(_arr)                                 \
+    (assert(!array_isempty(_arr)),                      \
+     (_arr)->ptr[--(_arr)->length])
+
+#define array_drop(_arr, _n) ((_arr)->length -= _n)
+
+#define array_take(_arr, _ptr)                                          \
+    (!array_isempty(_arr) ?                                             \
+     (*(_ptr) = (_arr)->ptr[--(_arr)->length],                          \
+      true) :                                                           \
+     false)
+
+#define array_remove(_arr, _i) do                                       \
+    {                                                                   \
+        assert(_i < (_arr)->length);                                    \
+        memmove((_arr)->ptr + (_i), (_arr)->ptr + (_i) + 1,             \
+                ((_arr)->length - (_i) - 1) * _size_elt(_arr));         \
+        (_arr)->length--;                                               \
+    } while (0)
+
+// insert val before i
+#define array_insert(_arr, _i, _val) do                                 \
+    {                                                                   \
+        assert((_i) <= (_arr)->length);                                 \
+        array_extend(_arr, 1);                                          \
+        if((_i) < atail(_arr))                                          \
+           memmove((_arr)->ptr + (_i) + 1, (_arr)->ptr + (_i),          \
+                   ((_arr)->length - (_i) - 1) * _size_elt(_arr));      \
+        (_arr)->ptr[_i] = _val;                                         \
+    } while (0)
+
+// length = size = new
+#define array_resize(_arr, _new) do                                     \
+    {                                                                   \
+        (_arr)->ptr = _adjust_array((_arr)->ptr,                        \
+                                    _size_elt(_arr),                    \
+                                    _new);                              \
+        if((_new) > (_arr)->length)                                     \
+            memset((_arr)->ptr + (_arr)->length, 0,                     \
+                   ((_new) - (_arr)->length) * _size_elt(_arr));        \
+        (_arr)->length = (_arr)->size = _new;                           \
+    } while (0)
+
+// element sizes must match
+#define array_copy(_to, _from) do                                       \
+    {                                                                   \
+        assert(_size_elt(_from) == _size_elt(_to));                     \
+        (_to)->length = (_from)->length;                                \
+        (_to)->ptr = _adjust_array((_to)->ptr,                          \
+                                   _size_elt(_to),                      \
+                                   (_to)->size = (_from)->length);      \
+        memcpy((_to)->ptr, (_from)->ptr,                                \
+               (_from)->length * _size_elt(_from));                     \
+    } while (0)
+
+// FIXME unused?
+#define array_concat(_to, _from) do                             \
+    {                                                           \
+        unsigned _total = (_to)->length + (_from)->length;      \
+        assert(_size_elt(_from) == _size_elt(_to));             \
+        if(_total > (_to)->size)                                \
+            (_to)->ptr = _adjust_array((_to)->ptr,              \
+                                       _size_elt(_to),          \
+                                       (_to)->size = _total);   \
+        memcpy((_to)->ptr + (_to)->length, (_from)->ptr,        \
+               (_from)->length * _size_elt(_from));             \
+        (_to)->length = _total;                                 \
+    } while (0)
+
+
+// trivial
+// indexed only
+#define array_foreach(_arr, _i)                 \
+    for(_i = 0;                                 \
+        _i < alen(_arr);                        \
+        ++_i)
+
+// pointer to element
+#define array_foreach_ptr(_arr, _ptr)                \
+    for(_ptr = (_arr)->ptr;                          \
+        _ptr < (_arr)->ptr + alen(_arr);             \
+        ++_ptr)
+
+// only set _entry in the test clause,
+// otherwise it will happily index off the end of the array
+#define array_foreach_entry(_arr, _entry)                       \
+    for(int _i = 0;                                             \
+        _i < alen(_arr) && (_entry = (_arr)->ptr[_i], true);    \
+        ++_i)
+
+#define array_map(_arr, _fn, _ptr) do           \
+    {                                           \
+        int _i;                                 \
+        for(_i=0; _i<(_arr)->length; _i++)      \
+            _fn((_arr)->ptr[_i], _i, _ptr);     \
+    } while(0)
+
+#define alen(_arr) ((_arr)->length)
+#define asize(_arr) ((_arr)->size)
+#define adata(_arr) ((_arr)->ptr)
+
+#ifdef NDEBUG
+#define aref(_arr, _i) ((_arr)->ptr[_i])
+#define aset(_arr, _i, _val) ((_arr)->ptr[_i] = (_val))
+#define aptr(_arr, _i) ((_arr)->ptr + _i)
+#else
+// FIXME: double evaluation makes these unsafe for side-effecting arguments
+#define aref(_arr, _i) (assert(_i < (_arr)->length), (_arr)->ptr[_i])
+#define aset(_arr, _i, _val) (assert(_i < (_arr)->length), (_arr)->ptr[_i] = (_val))
+#define aptr(_arr, _i) (assert(_i < (_arr)->length), (_arr)->ptr + _i)
+#endif
+/*@
+
+
+\section*{Worklist}
+
+==worklist.h*/
+// fixed-length ring buffer with presence bitmap
+// XXX stretchy buffer is a relatively simple extension (hah)
+// note that, since the maximum index is specified, and no item can be
+// present more than once, overflow can't occur
+#define WORKLIST(typ) struct {                          \
+        int len, count, idx;                            \
+        bitmap_t *map;                                  \
+        typ *ptr;                                       \
+    }
+
+static inline int _wrap(int v, int l)
+    { return (v >= l) ? v-l : v; }
+
+#define worklist_isempty(wl) ((wl)->count == 0)
+
+#define worklist_init(wl, n) do {                       \
+        assert(n > 0);                                  \
+        (wl)->len = n;                                  \
+        (wl)->count = 0;                                \
+        (wl)->idx = 0;                                  \
+        (wl)->map = bitmap_create(n);                   \
+        (wl)->ptr = xcalloc(n, sizeof(*((wl)->ptr)));   \
+    } while(0)
+
+#define worklist_fini(wl) do {                          \
+        xfree((wl)->ptr);                               \
+        xfree((wl)->map);                               \
+    } while(0)
+
+#define worklist_push(wl,v,id) do {                     \
+        if(!bitmap_get_bit((wl)->map, id))              \
+        {                                               \
+            (wl)->ptr[_wrap((wl)->idx + (wl)->count,    \
+                            (wl)->len)] = v;            \
+            (wl)->count++;                              \
+            bitmap_set_bit((wl)->map, id);              \
+        }                                               \
+    } while(0)
+
+#define worklist_take(wl,p,id)                          \
+    (!worklist_isempty(wl) ?                            \
+     (*p = (wl)->ptr[(wl)->idx],                        \
+      (wl)->count--,                                    \
+      (wl)->idx = _wrap((wl)->idx + 1, (wl)->len),      \
+      bitmap_clear_bit((wl)->map, id),                  \
+      true) :                                           \
+     false)
+/*@
+
+
+\section*{General}
+
+==util.c*/
+#include "global.h"
+#include <sys/mman.h>
+
+void _vfatal(const char *fn, const char *fmt, va_list va)
+{
+    fprintf(stderr, "%s: ", fn);
+    vfprintf(stderr, fmt, va);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    abort();
+}
+
+void _fatal(const char *fn, const char *fmt, ...)
+{
+    va_list va;
+    va_start(va, fmt);
+    _vfatal(fn, fmt, va);
+    va_end(va); /* NOTREACHED */
+}
+
+void *xrealloc(void *ptr, size_t size)
+{
+    if(size == 0)
+        fatal("allocation size 0.");
+    void *ret = realloc(ptr, size);
+    if(!ret)
+        fatal("allocation failed.");
+    return ret;
+}
+
+// FIXME: attribute malloc for these
+void *xmalloc(size_t size)
+{
+    if(size == 0)
+        fatal("allocation size 0.");
+    void *ret = malloc(size);
+    if(!ret)
+        fatal("allocation failed.");
+    return ret;
+}
+
+void *xcalloc(size_t num, size_t size)
+{
+    if(size == 0)
+        fatal("allocation size 0.");
+    void *ret = calloc(num, size);
+    if(!ret)
+        fatal("allocation failed.");
+    return ret;
+}
+
+void xfree(void *ptr)
+{
+    if(!ptr)
+        fatal("freeing NULL.");
+    free(ptr);
+}
+
+void *xmap(size_t sz)
+{
+    void *ret = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, 0, 0);
+    if(ret == MAP_FAILED)
+    {
+        perror("mmap failed");
+        exit(1);
+    }
+    return ret;
+}
+
+bool string_equal(const void *x, const void *y)
+{
+    return !strcmp((char *)x, (char *)y);
+}
+uint32_t string_hash(const void *ptr)
+{
+    const char *string = ptr;
+    return hash_code(string, strlen(string));
+}
+bool ptr_eq(const void *x, const void *y)
+{
+    return x == y;
+}
+uint32_t ptr_hash(const void *ptr)
+{
+    return hash_code(&ptr, sizeof(ptr));
+}
+
+void hexdump(FILE *fp, uint8_t *mem, ptrdiff_t len, unsigned width)
+{
+    do
+    {
+        for(int i=0; (!width || i<width) && len>0; i++, len--)
+            fprintf(fp, "%02X ", *mem++);
+        if(width)
+            fprintf(fp, "\n");
+    } while (len > 0);
+}
+
+void mem_dump(uint8_t *mem, ptrdiff_t len)
+{
+    printf("%p: ", mem);
+    hexdump(stdout, mem, len, sizeof(intptr_t));
+}
+
+// static return buffer, caveat caller
+char *mem_string(uint8_t *mem, ptrdiff_t len)
+{
+    static char buf[32];
+    char *ptr = buf;
+
+    while(len-- > 0)
+    {
+        ptr += snprintf(ptr, sizeof(buf) - (ptr-buf), "%02X ", *mem++);
+    }
+
+    return buf;
+}
+/*@
+
+==util.h*/
+/*
+  double expansion - stringification or token-pasting
+  disables argument expansion in function-like macros.
+  so, wrap the operation in another macro to get the
+  desired (expanded and then stringified/pasted) result.
+*/
+#define STRINGIFY(a) #a
+#define PASTE2(a, b) a##b
+#define PASTE3(a, b, c) a##b##c
+#define PASTE4(a, b, c, d) a##b##c##d
+#define PASTE5(a, b, c, d, e) a##b##c##d##e
+#define PASTE6(a, b, c, d, e, f) a##b##c##d##e##f
+/*
+  (triple expansion - for token-pasting parameterised by an
+  object-like macro)
+*/
+#define PPASTE2(a, b) PASTE2(a, b)
+#define PPASTE3(a, b, c) PASTE3(a, b, c)
+
+// caveat: double evaluation!
+#ifndef max
+#define max(a,b) ((a) > (b) ? (a) : (b))
+#endif
+#ifndef min
+#define min(a,b) ((a) < (b) ? (a) : (b))
+#endif
+
+#define lengthof(a) (sizeof(a) / sizeof(*a))
+
+// reasonably standards-safe; thanks stddef.h
+#define container_of(ptr, typ, field)           \
+    ((typ *)((char *)(ptr) - offsetof(typ, field)))
+
+// caveat: assumes all pointers are the same size!
+static inline void *_take_ptr(void **ptr, void *next)
+{
+    void *tmp = *ptr;
+    *ptr = next;
+    return tmp;
+}
+
+// define NOSPAM per-file: dbg output suppressed for that file.
+// define DBG_SUPPRESS in config.mk: no dbg output.
+// define NDEBUG: no asserts, no dbg output
+#if !defined(NDEBUG) && !defined(NOSPAM) && !defined(DBG_SUPPRESS)
+#define DBG(args...) fprintf(stderr, args)
+#define DBGPRINT(val) r_print(stderr, val)
+#define DBG_OUTPUT
+#else
+#define DBG(args...) do { } while(0)
+#define DBGPRINT(val) do { } while(0)
+#endif
+
+// NOTE: gcc-ism
+#define fatal(fmt, args...) _fatal(__func__, fmt , ##args)
+#define vfatal(fmt, va) _vfatal(__func__, fmt, va)
+void _vfatal(const char *fn, const char *fmt, va_list va);
+void _fatal(const char *fn, const char *fmt, ...);
+
+void *xrealloc(void *ptr, size_t size);
+void *xmalloc(size_t size);
+void *xcalloc(size_t num, size_t size);
+void xfree(void *ptr);
+void *xmap(size_t sz);
+
+// bit vector
+typedef uint8_t bitmap_t;
+static inline size_t size_for_bits(unsigned n)
+    { return (n+7)>>3; }
+static inline bool bitmap_get_bit(bitmap_t *bits, unsigned n)
+    { return (bits[n>>3] & (1<<(n&7))) != 0; }
+static inline uint8_t bitmap_get_byte(bitmap_t *bits, unsigned n)
+    { return bits[n>>3]; }
+static inline void bitmap_set_bit(bitmap_t *bits, unsigned n)
+    { bits[n>>3] |= 1<<(n&7); }
+static inline void bitmap_clear_bit(bitmap_t *bits, unsigned n)
+    { bits[n>>3] &= ~(1<<(n&7)); }
+static inline void bitmap_free(bitmap_t *bits)
+    { xfree(bits); }
+static inline void bitmap_reset(bitmap_t *bits, unsigned n)
+    { memset(bits, 0, size_for_bits(n)); }
+static inline bitmap_t *bitmap_create(unsigned n)
+    { return xcalloc(1, size_for_bits(n)); }
+
+// XXX int __builtin_popcount(unsigned int)
+static inline unsigned bitmap_count_bits(bitmap_t *bits, unsigned n)
+{
+    unsigned r = 0;
+    for(int i=0; i<size_for_bits(n); i++)
+    {
+        uint8_t byte = bits[i];
+        for(int j=0; j<8; j++, byte >>= 1)
+        {
+            if(byte & 1)
+                r++;
+        }
+    }
+    return r;
+}
+
+void hexdump(FILE *fp, uint8_t *mem, ptrdiff_t len, unsigned width);
+void mem_dump(uint8_t *mem, ptrdiff_t len);
+char *mem_string(uint8_t *mem, ptrdiff_t len);
+
+bool string_equal(const void *x, const void *y);
+uint32_t string_hash(const void *ptr);
+bool ptr_eq(const void *x, const void *y);
+uint32_t ptr_hash(const void *ptr);
+/*@
+
+==global.h*/
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <alloca.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <limits.h>
+#include <float.h>
+#include <math.h>
+#include <setjmp.h>
+#include <unistd.h>
+// debuggery
+#include <mcheck.h>
+#include <assert.h>
+
+#include "util.h"
+#include "hash.h"
+#include "array.h"
+#include "list.h"
+#include "rt/runtime.h"
+#include "compiler.h"
+/*@
+
+%*/

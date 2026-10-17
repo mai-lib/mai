@@ -1,0 +1,1631 @@
+/*@
+\chapter{Intermediate Representation}
+\label{ir}
+
+%% XXX kind of waffly?
+The abstract syntax tree has the shape of the program as written by the
+user. To enable further analysis, it is converted to an
+\textit{intermediate representation} having the shape of the program as
+it will execute (although it's translated into bytecode -- a more
+concise and efficient format -- before actually being run.)
+
+==ir.h*/
+//preliminaries//
+//cfunction_t//
+//cvartype//
+//cvar_t//
+//cblock_t//
+//cnodetype//
+//cnode_t//
+//prototypes//
+//inlines//
+/*@
+
+
+\section{Structures}
+
+A program in intermediate representation consists of a tree of
+\textit{functions}. Each function contains a directed graph of basic
+\textit{blocks}; each block, a list of \textit{nodes}.
+
+Control flow within a function follows the edges between blocks; the
+flow of computed values, edges between nodes.
+
+\textit{Variables} stand in for values supplied by actual arguments, or
+the global or lexical environment.
+
+These structures have compilation lifetime -- they do not persist beyond
+a single invocation of the compiler, and it explicitly manages their
+storage. The runtime does not interact with them.
+
+
+\subsection{Functions}
+\label{ir:func}
+
+One [[cfunction_t]] is created for each ``[[function]]'' expression in the
+program source. Neither control nor value flow cross function
+boundaries.
+
+==cfunction_t*/
+typedef struct cfunction
+{
+    //function//
+} cfunction_t;
+/*@
+
+A backpointer to the ([[cnode_t]] created from the) expression is kept
+in the [[.node]] field. [[.parent]] points from enclosed to enclosing
+function in the tree induced by lexical inclusion.
+
+An expression outside any function is at \textit{top level}; a
+distinguished [[cfunction_t]] is created to contain these. It is at the
+root of the function tree, with [[.parent]] and [[.node]] both [[NULL]].
+
+==function*/
+cfunction_t *parent;
+cnode_t *node;
+/*@
+
+When a function expression is evaluated, a closure (callable object) is
+created. The number, order, and declared types of the function's formal
+arguments, as well as its return type, determine the type of these
+closures, held in the [[.cl_type]] field (\autoref{callable}).
+
+==function*/
+rtype_t *cl_type;
+/*@
+
+Enclosed functions are kept on a list headed by [[.cfunc_head]] in the
+parent and threaded through the [[.cfunc_list]] of each child. Variables
+which are bound by the function -- locals and arguments; and globals at
+the top level -- are on the list headed by [[.cfunc_head]]. The basic
+blocks comprising the function's body are on the list headed by
+[[.cblock_head]]. [[.entry]] points to the block which begins the
+function body.
+
+==function*/
+list_t cfunc_list, cfunc_head;
+list_t cvar_head, cblock_head;
+cblock_t *entry;
+/*@
+
+Each function has an [[.id]] number different from its siblings; and has
+[[.nfuncs]] child functions, [[.nblocks]] blocks, and [[.nnodes]] nodes
+in its body. When functions are inlined into this one, their nodes are
+counted in [[.ninlined]].
+
+==function*/
+unsigned id, nfuncs, nblocks, nnodes;
+unsigned ninlined;
+/*@
+
+Closure analysis discovers which variables free in the function body are
+bound by lexical ancestors. Pointers to them are stored in the
+[[.closure]] array.
+%% XXX further detail?
+
+==function*/
+cvar_array_t closure;
+/*@
+
+
+\subsection{Variables}
+\label{ir:var}
+
+A variable denotes a named quantity. They can be local to a function,
+defined at top level in the input program, or read from the global
+environment -- a map of names to values, managed by the runtime
+(\autoref{rt:global}).
+
+==cvartype*/
+typedef enum
+{
+    LEXICAL, GLOBAL_INT, GLOBAL_EXT,
+} cvartype;
+/*@
+
+When a variable is first introduced, a [[cvar_t]] is created.
+
+==cvar_t*/
+typedef struct cvar
+{
+    //var//
+} cvar_t;
+/*@
+
+If local, [[.cvar_list]] links the variable into its binding function's
+list; otherwise, the top-level function takes possession.
+
+==var*/
+list_t cvar_list;
+/*@
+
+[[.name]] holds the symbol which names the variable. [[.decl]] holds the
+type present at its declaration, or [[NULL]] if none was supplied.
+
+==var*/
+rsymbol_t *name;
+rtype_t *decl;
+/*@
+
+A local variable may be inferred \textit{constant} if it is never
+assigned to after being initialised (and a global variable declared
+constant with a ``[[const]]'' expression.) The [[.is_const]] will be set
+in this case.
+
+==var*/
+bool is_const;
+/*@
+
+Variables are assigned an [[.id]] number, unique for all those bound by
+the same function. A pass may compare [[.mark]] with a global clock to
+determine if it's encountered a variable before.
+
+==var*/
+unsigned id, mark;
+/*@
+
+The compiler may have more or less information about a variable,
+depending on how it comes to be known. The former is stored in a union,
+tagged with a [[.type]] representing the latter.
+
+==var*/
+cvartype type;
+union
+{
+    //var union//
+};
+/*@
+
+\subsubsection*{[[LEXICAL]] variables are local to a function.}
+
+They're either formal arguments, or introduced in its body with
+``[[let]]'' or ``[[var]]'' forms. Their scope is completely visible to
+the compiler.
+
+[[.binder]] holds a backpointer to the function, and [[.cvar_list]] is
+linked into its variable list.
+
+A formal argument has the [[.is_arg]] flag set. It can also be specified
+with a default expression; [[.is_optional]] is set if this is the case.
+When the corresponding actual argument is omitted from a call, the
+variable takes its value from the default expression instead
+(\autoref{ir_convert:lambda}).
+
+If the variable occurs free in the body of a descendent function, it
+will be need to be captured by at least one closure, and [[.is_closed]]
+will be set.
+
+==var union*/
+struct
+{
+    cfunction_t *binder;
+    bool is_arg;
+    bool is_optional;
+    bool is_closed;
+} local;
+/*@
+
+\subsubsection*{[[GLOBAL_INT]] variables are declared by the input program.}
+
+They are introduced with ``[[global]]'' or ``[[const]]'' forms. An
+internal global's initialising expression [[.set]] is visible to the
+compiler.
+
+==var union*/
+struct
+{
+    cnode_t *set;
+} intl;
+/*@
+
+\subsubsection*{[[GLOBAL_EXT]] variables are part of the runtime global
+  environment.}
+
+The compiler may not necessarily rely on any of their properties (or
+even their existence, in some cases.)
+
+Such a variable may have been declared by code executed beforehand; if
+so, [[.global]] points to its binding. If it wasn't found at compile
+time, this field is [[NULL]]; it may be implicitly created by an
+assignment later on.
+
+==var union*/
+struct
+{
+    rglobal_t *global;
+} extl;
+/*@
+
+
+\subsection{Blocks}
+\label{ir:block}
+
+The unit of control flow within a function is the [[cblock_t]]: an
+extended basic block \citep[Section 8.4]{ahoullman}.
+
+==cblock_t*/
+typedef struct cblock
+{
+    //block//
+} cblock_t;
+/*@
+
+[[.cblock_list]] links into the list of its containing function. In
+later passes, this is sorted in reverse-depth-first order.
+
+==block*/
+list_t cblock_list;
+/*@
+
+Each block contains a list of nodes, in control-flow order from
+[[.cnode_head]].
+
+==block*/
+list_t cnode_head;
+/*@
+
+Control flow within a function begins with the first node in its
+[[.entry]] block. Every other block has one or more predecessors,
+pointers to which are stored in the [[.pred]] array.
+
+==block*/
+cblock_array_t pred;
+/*@
+
+The final node in a block may return from the function. Execution may
+continue to another block, or branch to one of two alternatives
+depending on a boolean condition. In the latter cases, pointers to the
+successor blocks are stored in the [[.succ]] array.
+
+==block*/
+cblock_array_t succ;
+/*@
+
+Blocks are also assigned [[.id]] numbers (as per the list, in
+reverse-depth-first order.) After numbering, [[.start]] and [[.end]]
+will contain the [[.id]]s of the first and last nodes in the block. The
+[[.mark]] field serves the same purpose as [[cvar_t]]'s.
+
+==block*/
+unsigned id, start, end, mark;
+/*@
+
+
+\subsection{Nodes}
+\label{ir:node}
+
+Nodes represent computations, the various kinds of which are enumerated
+by [[cnodetype]].
+
+==cnodetype*/
+typedef enum
+{
+    CN_LAMBDA, CN_CALL, CN_CALL_FAST, CN_BUILTIN,
+    CN_SET, CN_BIND, CN_REF, CN_IF, CN_RETURN,
+    CN_CONST, CN_COPY, CN_PHI
+} cnodetype;
+/*@
+
+Most expressions in a program create one or more [[cnode_t]]s. A node
+may produce a value that following nodes can use as input.
+
+==cnode_t*/
+typedef struct cnode
+{
+    //node//
+} cnode_t;
+/*@
+
+Each node is linked into its containing [[.block]]'s list via
+the [[.cnode_list]] field.
+
+==node*/
+list_t cnode_list;
+cblock_t *block;
+/*@
+
+The type of value a node produces might be known ahead of time. Some
+nodes will be assigned a type by user declaration; as analysis proceeds,
+others can have theirs recovered. If [[.decl]] is non-[[NULL]], the
+compiler has determined that [[r_subtypep(]]$value$[[, .decl)]] is a
+tautology.
+
+==node*/
+rtype_t *decl;
+/*@
+
+The [[.users]] array contains pointers to the nodes which depend on the
+value of this one. It's populated early in compilation, and kept
+up-to-date thereafter.
+
+==node*/
+cnode_array_t users;
+/*@
+
+Nodes are numbered along with blocks. [[.id]] is unique within the
+function, increases in reverse-depth-first order between blocks and
+control-flow (i.e. list) order within them. The [[.mark]] field is the
+same as for [[cblock_t]] and [[cvar_t]].
+
+==node*/
+unsigned id, mark;
+rsymbol_t *file;
+/*@
+
+A node's [[.type]] determines its behaviour, and tags a branch of the
+union.
+
+==node*/
+cnodetype type;
+union
+{
+    //node union//
+};
+/*@
+
+\subsubsection*{[[LAMBDA]] defines a function.}
+
+Every function expression in the input program is converted to a
+[[LAMBDA]] node and associated [[cfunction_t]].
+
+Every [[LAMBDA]] has its own [[.lambda.function]], which is a child of
+the function containing the node. Each element of the
+[[.lambda.closure]] array will supply the value of the corresponding
+variable in [[.lambda.function.closure]].
+
+The value which the node produces is a closure, the only kind of
+user-defined callable object (\autoref{callable:closure}).
+
+==node union*/
+struct
+{
+    cfunction_t *function;
+    cnode_array_t closure;
+} lambda;
+/*@
+
+\subsubsection*{[[CALL]]/[[CALL_FAST]] invokes a function.}
+
+The node attempts to invoke the value [[.call.target]] with actual arguments
+[[.args]], yielding the value returned.
+
+[[CALL]] denotes a ``universal'' call (\autoref{call:uni}) -- the
+matching of actual to formal arguments will be performed at run-time.
+[[.call.args]] may contain [[NULL]]s, marking omitted arguments. If
+[[.call.names]] has nonzero length, each element is either [[NULL]], or
+supplies the name of the formal argument to which the corresponding
+element in [[.call.args]] should be assigned.
+
+When this argument matching and type checking has been performed by the
+compiler, a [[CALL_FAST]] node stores the result (\autoref{call:fast}).
+Each bit in [[.call.argbits]] is set when the corresponding argument is
+present.
+
+==node union*/
+struct
+{
+    cnode_t *target;
+    cnode_array_t args;
+    union
+    {
+        rsymbol_array_t names;
+        argbits_t argbits;
+    };
+} call;
+/*@
+
+\subsubsection*{[[BUILTIN]] generates specialised bytecode.}
+
+Some builtin functions (\autoref{callable:builtin}) can be compiled to
+bytecode instead of being invoked in the usual manner. Semantics and
+compile-time behaviour are described by the static structure referred to
+by [[.builtin.bi]]; its [[.ops]] callbacks (\autoref{opt:builtin}) will
+create a [[BUILTIN]] node from a [[CALL]] if they deem it desirable. If
+the instruction has multiple variants, [[.builtin.optype]] will be used
+to inform code generation of the types involved in the operation.
+
+==node union*/
+struct
+{
+    const cbuiltin_t *bi;
+    rtype_t *optype;
+    cnode_array_t args;
+} builtin;
+/*@
+
+\subsubsection*{[[SET]]/[[BIND]] assigns a value to a variable.}
+
+An ordinary assignment of [[.set.value]] to the variable
+[[.set.var]] is denoted by a [[SET]] node.
+
+Introduction of a local variable is performed with a [[BIND]] to the
+[[.set.value]] of its initialising expression. A formal argument is
+introduced by a [[BIND]] with [[NULL]] [[.set.value]], in the [[.entry]]
+block of the function. The implicit [[argbits]] argument
+(\autoref{call}) is denoted by a [[BIND]] with both fields [[NULL]].
+
+==node union*/
+struct
+{
+    cvar_t *var;
+    cnode_t *value;
+} set;
+/*@
+
+\subsubsection*{[[REF]] retrieves a variable's value.}
+
+The current value of [[.var]] is denoted by a [[REF]] node.
+
+==node union*/
+struct
+{
+    cvar_t *var;
+} ref;
+/*@
+
+\subsubsection*{[[IF]] branches conditional on a value.}
+
+Control flow will branch to the first element of
+[[.block.succ]] when the value of [[.ifelse.cond]] is [[true]],
+and to the second otherwise. [[IF]] only occurs as the last
+node in a block.
+
+==node union*/
+struct
+{
+    cnode_t *cond;
+} ifelse;
+/*@
+
+\subsubsection*{[[RETURN]] ends a function.}
+
+Control flow within a function is ended, returning to its
+caller with [[.ret.value]] as the result of the call. [[RETURN]] also
+only occurs last in a block.
+
+==node union*/
+struct
+{
+    cnode_t *value;
+} ret;
+/*@
+
+\subsubsection*{[[COPY]] converts a value to another type.}
+
+When the compiler needs to ensure a [[.value]] has some
+specific type, it will insert a [[COPY]] node with its [[.decl]] set
+appropriately.
+
+This could convert, box, or unbox a scalar. If a reference object is
+supplied, its type will be checked. Its contents will not be copied or
+converted.
+
+==node union*/
+struct
+{
+    cnode_t *value;
+} copy;
+/*@
+
+\subsubsection*{[[CONST]] yields a constant value.}
+
+The [[.constant]] object is made available as a value for use by other
+nodes.
+
+==node union*/
+robject_t *constant;
+/*@
+
+\subsubsection*{[[PHI]] selects a value conditional on control flow.}
+
+The $\phi$-function of static single assignment form \citep{cytron91}.
+At the beginning of a block with more than one predecessor, a contiguous
+sequence of [[PHI]] nodes may occur. When control flow enters the block
+from the [[i]]th predecessor in [[.block.pred]], each [[PHI]] node
+yields the [[i]]th element of its [[.phi.args]].
+
+==node union*/
+struct
+{
+    cnode_array_t args;
+} phi;
+/*@
+
+
+\section{Utilities}
+
+Other modules in the compiler use the functions this module provides to
+manage and manipulate IR structures.
+
+==ir.c*/
+//includes//
+//functions//
+//blocks//
+//nodes//
+//use tracking//
+//declarations//
+//variables//
+/*@
+
+
+\subsection{Functions}
+
+A [[cfunction_t]] maps fairly transparently to an [[rfunction_t]] and,
+once created created, needs little further modification.
+
+==functions*/
+//cfunc_create//
+//cfunc_free//
+//cfunc_type//
+//cfunc_map_children//
+//cfunc_mapc_children//
+/*@
+
+If the function has a [[parent]], it's added to the latter's list of
+children.
+
+==cfunc_create*/
+cfunction_t *cfunc_create(cfunction_t *parent)
+{
+    cfunction_t *fn = xcalloc(1, sizeof(*fn));
+
+    fn->parent = parent;
+    list_init(&fn->cvar_head);
+    list_init(&fn->cfunc_head);
+    list_init(&fn->cblock_head);
+    array_init(&fn->closure, 0);
+    if(parent)
+        list_add(&parent->cfunc_head, &fn->cfunc_list);
+    else
+        list_init(&fn->cfunc_list);
+    return fn;
+}
+/*@
+
+The function owns, so must free, blocks and bound variables; but not
+child functions (directly, at least.)
+
+==cfunc_free*/
+void cfunc_free(cfunction_t *fn)
+{
+    cblock_t *block, *btmp;
+    cvar_t *var, *vtmp;
+
+    if(fn->parent)
+        list_remove(&fn->cfunc_list);
+    list_foreach_entry_safe(&fn->cblock_head, block, btmp, cblock_list)
+        cblock_free(block);
+    list_foreach_entry_safe(&fn->cvar_head, var, vtmp, cvar_list)
+        cvar_free(var);
+    array_fini(&fn->closure);
+    xfree(fn);
+}
+/*@
+
+The type of object created by a function expression is determined by its
+return type and the types of its arguments (\autoref{callable:type}).
+These are not recovered during analysis (\autoref{opt:analysis}), and
+are assumed to be [[object]]s unless declared otherwise by the user.
+
+[[LEXICAL]] variables with [[.is_arg]] set count as arguments (though
+the latter implies the former, since only the top-level function will
+have global variables on its [[.cvar_head]] list.)
+
+==cfunc_type*/
+rtype_t *cfunc_type(cfunction_t *fn, rtype_t *ret_type)
+{
+    int i = 0;
+    cvar_t *var;
+
+    list_foreach_entry(&fn->cvar_head, var, cvar_list)
+        if(!cvar_is_global(var) && var->local.is_arg)
+            i++;
+
+    argdesc_t *args = alloca(sizeof(argdesc_t) * i);
+
+    i = 0;
+    list_foreach_entry(&fn->cvar_head, var, cvar_list)
+    {
+        if(cvar_is_global(var) || !var->local.is_arg)
+            continue;
+        args[i++] = argdesc_init(var->name, decl_type(var->decl),
+                                 var->local.is_optional);
+    }
+    return rcall_type_create(decl_type(ret_type), i, args);
+}
+/*@
+
+Closure analysis (\autoref{ir_pre:closure}) will add free variables to a
+function's [[.closure]]. If it doesn't find any, the function won't need
+a closure allocated at run-time, and may be amenable to further
+optimisation.
+
+==cfunc_has_closure*/
+static inline bool cfunc_has_closure(cfunction_t *fn)
+    { return alen(&fn->closure) > 0; }
+/*@
+
+Since the program is a tree of [[cfunction_t]]s, to visit it in its
+entirety a compilation pass [[func]] will recursively descend to the
+children of function [[fn]]. To simplify this invocation pattern,
+[[cfunc_map_children]] accumulates and returns the [[cresult]]
+flags (\autoref{compiler:int})\ldots
+
+==cfunc_map_children*/
+cresult cfunc_map_children(cfunction_t *fn, cresult (*func)(cfunction_t *))
+{
+    cfunction_t *child;
+    cresult res = SUCCESS;
+
+    list_foreach_entry(&fn->cfunc_head, child, cfunc_list)
+        res |= func(child);
+    return res;
+}
+/*@
+
+\ldots and [[cfunc_mapc_children]] does not.
+
+==cfunc_mapc_children*/
+void cfunc_mapc_children(cfunction_t *fn, void (*func)(cfunction_t *))
+{
+    cfunction_t *child;
+
+    list_foreach_entry(&fn->cfunc_head, child, cfunc_list)
+        func(child);
+}
+/*@
+
+
+\subsection{Variables}
+\label{ir:varfn}
+
+Only certain types of variables remain relevant beyond SSA conversion;
+most code dealing with them is specialised, and resides in other
+modules.
+
+==variables*/
+//cvar_create//
+//cvar_free//
+//index_of_var//
+/*@
+
+It's the caller's responsibility to add the variable to its binder's
+list, and initialise the correct branch of the union depending on
+[[type]].
+
+==cvar_create*/
+cvar_t *cvar_create(rsymbol_t *name, cvartype type, rtype_t *decl)
+{
+    cvar_t *var = xcalloc(1, sizeof(*var));
+
+    *var = (cvar_t) {
+        .name = name,
+        .decl = decl,
+        .type = type,
+    };
+    list_init(&var->cvar_list);
+    return var;
+}
+/*@
+
+Variables own no unmanaged memory. They don't keep backpointers, so it's
+not safe to [[cvar_free]] one should anything still refer to it.
+
+==cvar_free*/
+void cvar_free(cvar_t *var)
+{
+    list_remove(&var->cvar_list);
+    xfree(var);
+}
+/*@
+
+[[index_of_var]] returns the index at which the element [[var]] is found
+in [[arr]] (or [[-1]] if it isn't -- caveat caller.)
+
+==index_of_var*/
+int index_of_var(cvar_array_t *arr, cvar_t *var)
+{
+    int i;
+
+    array_foreach(arr, i)
+    {
+        cvar_t *chk = aref(arr, i);
+        if(chk == var)
+            return i;
+    }
+    return -1;
+}
+/*@
+
+Global variables behave quite differently in some circumstances (they
+can't be closed over by a [[LAMBDA]], for example,) and may be
+distinguished with the [[cvar_is_global]] convenience predicate.
+
+==cvar_is_global*/
+static inline bool cvar_is_global(cvar_t *var)
+    { return var->type != LEXICAL; }
+/*@
+
+A closed variable which may be assigned to (i.e. is not constant) can't
+be stored as-is in a closure, since we use ``flat'' closures. The
+predicate [[cvar_is_celled]] returns [[true]] for these; they'll be
+treated by a cell introduction pass (\autoref{opt_closure}).
+
+==cvar_is_celled*/
+static inline bool cvar_is_celled(cvar_t *var)
+    { return !cvar_is_global(var) && !var->is_const && var->local.is_closed; }
+/*@
+
+
+\subsection{Blocks}
+\label{ir:blockfn}
+
+Blocks contain (arrays of) mutual pointers to other blocks, which must
+be kept synchronised for safe traversal.
+
+==blocks*/
+//cblock_create//
+//cblock_free//
+//index_of_block//
+//link_blocks//
+//replace_link//
+//remove_link//
+//split_block//
+/*@
+
+After creation, the caller will link the [[cblock_t]] into the
+control-flow graph at the appropriate point with [[link_blocks]].
+
+==cblock_create*/
+cblock_t *cblock_create()
+{
+    cblock_t *block = xcalloc(1, sizeof(*block));
+
+    array_init(&block->pred, 0);
+    array_init(&block->succ, 0);
+    list_init(&block->cnode_head);
+    return block;
+}
+/*@
+
+In general, [[_free]] functions are not sufficient to safely remove
+objects. The [[.succ]] and [[.pred]] arrays of others which may contain
+[[block]] are not updated by [[cblock_free]].
+
+==cblock_free*/
+void cblock_free(cblock_t *block)
+{
+    cnode_t *node, *tmp;
+
+    list_remove(&block->cblock_list);
+    list_foreach_entry_safe(&block->cnode_head, node, tmp, cnode_list)
+        cnode_free(node);
+    array_fini(&block->pred);
+    array_fini(&block->succ);
+    xfree(block);
+}
+/*@
+
+[[link_blocks]] adds the edge [[from]] $\rightarrow$ [[to]] to the graph.
+
+==link_blocks*/
+void link_blocks(cblock_t *to, cblock_t *from)
+{
+    array_push(&from->succ, to);
+    array_push(&to->pred, from);
+}
+/*@
+
+[[index_of]] for arrays of blocks -- useful during [[PHI]] argument
+manipulation.
+
+==index_of_block*/
+int index_of_block(cblock_array_t *arr, cblock_t *block)
+{
+    int i;
+    array_foreach(arr, i)
+    {
+        cblock_t *chk = aref(arr, i);
+        if(chk == block)
+            return i;
+    }
+    return -1;
+}
+/*@
+
+[[remove_link]] removes the first element matching [[from]] from
+[[arr]]\ldots
+
+==remove_link*/
+void remove_link(cblock_array_t *arr, cblock_t *from)
+{
+    int i = index_of_block(arr, from);
+    assert(i != -1);
+    array_remove(arr, i);
+}
+/*@
+
+\ldots and [[replace_link]] replaces it with [[to]].
+
+==replace_link*/
+void replace_link(cblock_array_t *arr, cblock_t *from, cblock_t *to)
+{
+    int i = index_of_block(arr, from);
+    assert(i != -1);
+    aset(arr, i, to);
+}
+/*@
+
+[[split_block]] splits the block in-place just above [[site]], returning
+the upper part (splitting on a [[PHI]] shouldn't be done, as it will
+break an invariant.)
+
+A new block is created for this. It replaces [[site.block]] in the
+[[.succ]] arrays of the former's predecessors, and is given its
+[[.pred]] array and all its nodes prior to the split point.
+
+If it happens to be [[fn]]'s entry block that's being split, [[.entry]]
+is updated appropriately.
+
+==split_block*/
+cblock_t *split_block(cfunction_t *fn, cnode_t *site)
+{
+    cblock_t *pred, *block = site->block, *above = cblock_create();
+    cnode_t *node, *tmp;
+
+    assert(site->type != CN_PHI);
+    array_foreach_entry(&block->pred, pred)
+        replace_link(&pred->succ, block, above);
+    above->pred = block->pred;
+    array_init(&block->pred, 0);
+    list_foreach_entry_safe(&block->cnode_head, node, tmp, cnode_list)
+    {
+        if(node == site)
+            break;
+        list_remove(&node->cnode_list);
+        node->block = above;
+        list_add_before(&above->cnode_head, &node->cnode_list);
+    }
+    list_add_before(&fn->cblock_head, &above->cblock_list);
+    if(fn->entry == block)
+        fn->entry = above;
+    return above;
+}
+/*@
+
+
+\subsection{Nodes}
+\label{ir:nodefn}
+
+Nodes are the most complex kind of IR object, and nearly all passes
+interact with them in some way. They also contain mutual pointers, which
+must be managed carefully.
+
+==nodes*/
+//cnode_create//
+//cnode_append//
+//cnode_prepend//
+//cnode_insert_before//
+//cnode_insert_after//
+//cnode_fini//
+//cnode_free//
+//cnode_reset//
+//cnode_remove//
+//call_is_pure//
+//cnode_is_pure//
+//index_of_node//
+/*@
+
+The caller of [[cnode_create]] invariably knows what [[type]] of node it
+requires, and the [[block]] to which it will be added.
+
+==cnode_create*/
+cnode_t *cnode_create(cblock_t *block, cnodetype type)
+{
+    cnode_t *node = xcalloc(1, sizeof(*node));
+
+    *node = (cnode_t) {
+        .block = block,
+        .type = type
+    };
+    list_init(&node->cnode_list);
+    array_init(&node->users, 0);
+    return node;
+}
+/*@
+
+The block's list of nodes is kept in control-flow order, and there are
+several possibilities when it comes to extending it with a freshly
+created [[node]]: append to the end of the [[block]], \ldots
+
+==cnode_append*/
+cnode_t *cnode_append(cblock_t *block, cnodetype type)
+{
+    cnode_t *node = cnode_create(block, type);
+    list_add_before(&block->cnode_head, &node->cnode_list);
+    return node;
+}
+/*@
+
+\ldots prepend to the beginning, \ldots
+
+==cnode_prepend*/
+cnode_t *cnode_prepend(cblock_t *block, cnodetype type)
+{
+    cnode_t *node = cnode_create(block, type);
+    list_add(&block->cnode_head, &node->cnode_list);
+    return node;
+}
+/*@
+
+\ldots insert it before some [[other]] node, \ldots
+
+==cnode_insert_before*/
+cnode_t *cnode_insert_before(cnode_t *other, cnodetype type)
+{
+    cnode_t *node = cnode_create(other->block, type);
+    list_add_before(&other->cnode_list, &node->cnode_list);
+    return node;
+}
+/*@
+
+\ldots or insert it after.
+
+==cnode_insert_after*/
+cnode_t *cnode_insert_after(cnode_t *other, cnodetype type)
+{
+    cnode_t *node = cnode_create(other->block, type);
+    list_add(&other->cnode_list, &node->cnode_list);
+    return node;
+}
+/*@
+
+The usual [[_free]] function has been decomposed. [[cnode_fini]] merely
+deallocates any memory owned by the [[node]].
+
+Since a [[LAMBDA]] owns its (unique) [[.function]], this is the only
+caller of [[cfunc_free]]. A [[CONST]]'s object is interned, and may be
+shared. Freeing it is left to the garbage collector.
+
+==cnode_fini*/
+void cnode_fini(cnode_t *node)
+{
+    switch(node->type)
+    {
+    case CN_CALL:
+        array_fini(&node->call.names);
+        /* fallthrough */
+    case CN_CALL_FAST:
+        array_fini(&node->call.args);
+        break;
+    case CN_PHI:
+        array_fini(&node->phi.args);
+        break;
+    case CN_LAMBDA:
+        cfunc_free(node->lambda.function);
+        array_fini(&node->lambda.closure);
+        break;
+    case CN_BUILTIN:
+        array_fini(&node->builtin.args);
+        break;
+    default:
+        break;
+    }
+}
+/*@
+
+[[cnode_free]], in addition, removes the node from its block's list,
+deallocates the array of [[.users]], and frees the structure itself.
+
+==cnode_free*/
+void cnode_free(cnode_t *node)
+{
+    cnode_fini(node);
+    list_remove(&node->cnode_list);
+    array_fini(&node->users);
+    xfree(node);
+}
+/*@
+
+Neither [[cnode_fini]] nor [[cnode_free]] should be called on a node
+which has registered itself as one of another node's [[.users]].
+
+[[cnode_reset]] may be called instead of the former, prior to reusing
+the [[node]] in question in-place as another [[.type]]\ldots
+
+==cnode_reset*/
+void cnode_reset(cnode_t *node)
+{
+    node->decl = NULL;
+    cnode_unuse_all(node);
+    cnode_fini(node);
+}
+/*@
+
+\ldots and [[cnode_remove]] instead of the latter, to remove it from
+other node's [[.users]], control flow, and memory.
+
+==cnode_remove*/
+void cnode_remove(cnode_t *node)
+{
+    assert(alen(&node->users) == 0);
+    cnode_unuse_all(node);
+    cnode_free(node);
+}
+/*@
+
+The [[index_of]] a node in an array is also useful when manipulating
+[[PHI]] arguments.
+
+==index_of_node*/
+int index_of_node(cnode_array_t *arr, cnode_t *node)
+{
+    int i;
+
+    array_foreach(arr, i)
+    {
+        cnode_t *chk = aref(arr, i);
+        if(chk == node)
+            return i;
+    }
+    return -1;
+}
+/*@
+
+A \textit{pure} [[node]] has no user-observable side effects and, given
+the same inputs, always produces the same output. [[cnode_is_pure]] is
+necessarily conservative, returning [[true]] only when it's certain to
+be the case.
+
+When [[may_alias]] is [[false]] it's guaranteed that no aliases of the
+node's result value will be created as a consequence of the call to the
+predicate; so the latter constraint is relaxed.
+
+==cnode_is_pure*/
+bool cnode_is_pure(cnode_t *node, bool may_alias)
+{
+    switch(node->type)
+    {
+    case CN_LAMBDA:
+    case CN_CONST:
+    case CN_REF:
+    case CN_PHI:
+    case CN_COPY:
+        return true;
+    case CN_CALL:
+    case CN_CALL_FAST:
+        return call_is_pure(node, may_alias);
+    case CN_BUILTIN:
+        return builtin_is_pure(node->builtin.bi, node, may_alias);
+    default:
+        return false;
+    }
+}
+/*@
+
+A builtin (\autoref{callable:builtin}) can provide a more detailed
+account of its functional purity at a particular [[node]] -- either a
+[[BUILTIN]], or a [[CALL]] of the [[CONST]] builtin itself. In the
+latter case, the predicate is called on the extracted value by the
+[[call_is_pure]] helper.
+
+==call_is_pure*/
+static inline bool call_is_pure(cnode_t *node, bool may_alias)
+{
+    if(node->call.target->type == CN_CONST)
+    {
+        robject_t *val = node->call.target->constant;
+
+        if(rtype_is_callable(r_typeof(val))
+           && rcall_is_builtin((rcallable_t *)val))
+        {
+            const cbuiltin_t *bi = ((rbuiltin_t *)val)->cbi;
+
+            return bi && builtin_is_pure(bi, node, may_alias);
+        }
+    }
+    return false;
+}
+/*@
+
+[[IF]], [[RETURN]] and [[SET]] nodes do not yield values, and should be
+referred to by no other nodes. Some [[BUILTIN]]s don't, either,
+depending on their semantics as described by [[.bi]] (assuming it's
+present -- when IR is being built, it may not be.)
+
+==cnode_yields_value*/
+static inline bool cnode_yields_value(cnode_t *node)
+{
+    switch(node->type)
+    {
+    case CN_IF:
+    case CN_RETURN:
+    case CN_SET:
+        return false;
+    case CN_BUILTIN:
+        if(node->builtin.bi)
+            return !builtin_is_void(node->builtin.bi, node);
+        /* fallthrough */
+    default:
+        return true;
+    }
+}
+/*@
+
+When a [[CALL]] has named actual arguments, they're added to its
+[[.names]] array.
+
+==call_has_names*/
+static inline bool call_has_names(cnode_t *node)
+    { return alen(&node->call.names) > 0; }
+/*@
+
+
+\subsection{Use Tracking}
+\label{ir:use}
+
+A node's union fields contain, according to its [[.type]], pointers to
+the nodes that it uses to determine its value. Each of the latter also
+keeps a backpointer to the former, so we can efficiently follow value
+flow in the other direction.
+%% XXX rename add/remove\_user to use/unuse.
+%% XXX and swap the args, to go with map\_used's func at least
+
+==use tracking*/
+//cnode_map_used//
+//cnode_add_user//
+//cnode_remove_user//
+//add_one//
+//cfunc_node_users//
+//remove_one//
+//cnode_unuse_all//
+//replace_ctx_t//
+//replace_one//
+//cnode_replace_in_users//
+/*@
+
+[[cnode_map_used]] invokes the callback [[func]] on (a pointer to) each
+input used by the given node. An optional pointer to context [[data]] is
+also passed along.
+
+[[NULL]]s can be present in a [[CALL]]/[[CALL_FAST]]/[[BUILTIN]]
+argument list or a [[LAMBDA]] closure, and are ignored if found.
+
+==cnode_map_used*/
+#define NODE(f) func(&node->f, data)
+#define NODES(f)                                \
+    array_foreach_ptr(&node->f, ptr) {          \
+        if(*ptr)                                \
+            func(ptr, data);                    \
+    }
+void cnode_map_used(cnode_t *node, void (*func)(cnode_t **, void *),
+                    void *data)
+{
+    cnode_t **ptr;
+
+    switch(node->type)
+    {
+    case CN_IF: NODE(ifelse.cond); break;
+    case CN_RETURN: NODE(ret.value); break;
+    case CN_COPY: NODE(copy.value); break;
+    case CN_CALL:
+    case CN_CALL_FAST:
+        NODE(call.target);
+        NODES(call.args);
+        break;
+    case CN_BIND:
+        if(!node->set.value)
+            break;
+        /* fallthrough */
+    case CN_SET: NODE(set.value); break;
+    case CN_PHI: NODES(phi.args); break;
+    case CN_BUILTIN: NODES(builtin.args); break;
+    case CN_LAMBDA: NODES(lambda.closure); break;
+    default: break;
+    }
+}
+/*@
+
+A backpointer to [[user]] can be added to the [[.users]] array of
+[[node]] with [[cnode_add_user]]. Duplicate uses are not treated
+specially.
+
+==cnode_add_user*/
+void cnode_add_user(cnode_t *user, cnode_t *node)
+{
+    array_push(&node->users, user);
+}
+/*@
+
+[[cnode_remove_user]] is the inverse, removing one use.
+
+==cnode_remove_user*/
+void cnode_remove_user(cnode_t *user, cnode_t *node)
+{
+    int i;
+
+    array_foreach(&node->users, i)
+    {
+        if(aref(&node->users, i) == user)
+        {
+            array_remove(&node->users, i);
+            return;
+        }
+    }
+}
+/*@
+
+[[cnode_is_used]] returns [[true]] if [[node]]'s value is used by any
+other\ldots
+
+==cnode_is_used*/
+static inline bool cnode_is_used(cnode_t *node)
+    { return !array_isempty(&node->users); }
+/*@
+
+\ldots and [[cnode_only_used_by]] returns [[true]] if [[node]] is only
+used by [[user]].
+
+==cnode_only_used_by*/
+static inline bool cnode_only_used_by(cnode_t *node, cnode_t *user)
+{
+    cnode_t *chk;
+
+    if(!cnode_is_used(node))
+        return false;
+    array_foreach_entry(&node->users, chk)
+        if(chk != user)
+            return false;
+    return true;
+}
+/*@
+
+[[cfunc_node_users]] initialises the [[.users]] array, which is fairly
+simple with the machinery in place. Visiting each [[node]] in each
+[[block]] in the function, the [[add_one]] callback\ldots
+
+==cfunc_node_users*/
+void cfunc_node_users(cfunction_t *fn)
+{
+    cblock_t *block;
+    cnode_t *node;
+
+    list_foreach_entry(&fn->cblock_head, block, cblock_list)
+        list_foreach_entry(&block->cnode_head, node, cnode_list)
+            cnode_map_used(node, add_one, node);
+}
+/*@
+
+\ldots registers the [[node]] as a user of each of its inputs.
+
+==add_one*/
+static void add_one(cnode_t **ptr, void *data)
+    { cnode_add_user(data, *ptr); }
+/*@
+
+And [[cnode_unuse_all]], called on [[_remove]] or [[_reset]],
+unregisters the [[node]]\ldots
+
+==cnode_unuse_all*/
+void cnode_unuse_all(cnode_t *node)
+    { cnode_map_used(node, remove_one, node); }
+/*@
+
+\ldots with the [[remove_one]] callback.
+
+==remove_one*/
+static void remove_one(cnode_t **ptr, void *data)
+    { cnode_remove_user(data, *ptr); }
+/*@
+
+
+\subsection{Replacement}
+
+%% XXX kind of sketchy?
+[[cnode_map_used]] also lets us replace one node with another (that
+computes an equivalent value.)
+
+==replace_ctx_t*/
+typedef struct
+{
+    cnode_t *from, *to, *node;
+} replace_ctx_t;
+/*@
+
+[[cnode_replace_in_users]] implements this functionality. It calls
+[[replace_one]] for each input of each [[node]] that uses [[from]]; then
+the array of [[.users]] is emptied. It's now safe for the caller to call
+[[cnode_remove]].
+
+==cnode_replace_in_users*/
+void cnode_replace_in_users(cnode_t *from, cnode_t *to)
+{
+    replace_ctx_t ctx = { from, to };
+    cnode_t *node;
+
+    array_foreach_entry(&from->users, node)
+    {
+        ctx.node = node;
+        cnode_map_used(node, replace_one, &ctx);
+    }
+    array_resize(&from->users, 0);
+}
+/*@
+
+If the input pointer matches [[.from]], it's replaced with [[.to]], and
+the fact noted in the latter's [[.users]].
+
+==replace_one*/
+static void replace_one(cnode_t **ptr, void *data)
+{
+    replace_ctx_t *ctx = data;
+
+    if(*ptr == ctx->from)
+    {
+        cnode_add_user(ctx->node, ctx->to);
+        *ptr = ctx->to;
+    }
+}
+/*@
+
+
+\subsection{Type Declarations}
+\label{ir:decl}
+
+The language is not statically typed. However, the compiler can use the
+optionally declared types of variables to determine upper bounds for the
+types of some values, then propagate these bounds through the input
+program to recover the types of others.
+
+==declarations*/
+//nil_init//
+//guard_decl//
+//guard_val//
+//enforce_decl//
+//enforce_val//
+/*@ %
+
+An undeclared variable can contain values of any type. Its [[.decl]] is
+[[NULL]], and its type is considered to be [[object]].
+
+==decl_type*/
+static inline rtype_t *decl_type(rtype_t *decl)
+    { return decl ? decl : r_type_object; }
+/*@
+
+[[decl_name]] is convenient when formatting diagnostic messages which
+mention declarations.
+
+==decl_name*/
+static inline const char *decl_name(rtype_t *decl)
+    { return rtype_name(decl_type(decl)); }
+/*@
+
+According to these conventions, [[cnode_compat]] tests if [[node]]'s
+currently declared or recovered type [[.decl]] is compatible
+(\autoref{type:subtype}) with the given type [[decl]].
+
+==cnode_compat*/
+static inline compat cnode_compat(cnode_t *node, rtype_t *decl)
+    { return r_type_compat(decl_type(node->decl), decl_type(decl), true); }
+/*@
+
+A variable which isn't explicitly initialised is given a zero value. The
+type of the latter must agree with the declared type of the former, if
+any.
+
+==nil_init*/
+robject_t *nil_init(rtype_t *decl)
+{
+    robject_t *obj = NULL;
+
+    if(decl && rtype_is_scalar(decl))
+    {
+        rvalue_union_t val = { 0 };
+        obj = r_box(decl, &val);
+    }
+    return obj;
+}
+/*@
+
+Declarations are treated as \textit{assertions} \citep{cmucl92}, so
+checks or conversions must be inserted where the types of values
+provided could differ from those which are expected.
+
+A [[COPY]] node may be used to \textit{guard} another node's value. The
+resulting bytecode will convert or check [[val]] against the type
+[[decl]]. If control flow continues past the guard, its value will be of
+the correct type.
+
+To guard a node's input value, the [[node]] no longer uses [[val]]
+directly; it uses the [[guard]] instead, which uses the value on its
+behalf.
+
+==guard_decl*/
+cnode_t *guard_decl(cnode_t *guard, cnode_t *node, rtype_t *decl,
+                    cnode_t *val)
+{
+    guard->copy.value = val;
+    guard->decl = decl_type(decl);
+    guard->file = val->file;
+    cnode_remove_user(node, val);
+    cnode_add_user(node, guard);
+    cnode_add_user(guard, val);
+    return guard;
+}
+/*@
+
+The result value of a node can be guarded similarly. All users of the
+[[node]] are made to use the [[guard]] instead.
+
+==guard_val*/
+static cnode_t *guard_val(cnode_t *guard, cnode_t *node, rtype_t *decl)
+{
+    guard->copy.value = node;
+    guard->decl = decl_type(decl);
+    guard->file = node->file;
+    cnode_replace_in_users(node, guard);
+    cnode_add_user(guard, node);
+    return guard;
+}
+/*@
+
+[[enforce_decl]] ensures that the input value [[*pval]] of the [[node]]
+is of the specific type [[decl]].
+
+If the type of the value is a subtype of the last, it's already correct.
+If not, any run-time check at this point would always fail, so the error
+is signalled.
+
+If it can't be statically determined (perhaps the input is only known to
+be an [[object]],) a guard is inserted before the node.
+
+[[boxing]] is [[false]] when it's safe to ignore the scalar calling
+convention (which requires that scalars are boxed when passed to
+functions expecting reference objects.)
+
+==enforce_decl*/
+cresult enforce_decl(cnode_t *node, rtype_t *decl, cnode_t **pval,
+                     bool boxing)
+{
+    switch(cnode_compat(*pval, decl))
+    {
+    case YES:
+        break;
+    case NO:
+        c_error("value of type `%s` found where type `%s` expected.",
+                decl_name((*pval)->decl), decl_name(decl));
+        return FAILED;
+    case MAYBE:
+        if(!boxing && decl_type(decl) == r_type_object)
+            break;
+        *pval = guard_decl(cnode_insert_before(node, CN_COPY),
+                           node, decl, *pval);
+        return CHANGED;
+    }
+    return SUCCESS;
+}
+/*@
+
+Through recovery, the compiler may discover the precise return type of a
+[[CALL]] to a builtin given the types of its arguments and, if it does,
+will set its [[.decl]] accordingly.
+
+However, the runtime will call it according to its signature, which is
+more general and specifies a return type of [[decl]] instead.
+[[enforce_val]] hides this (ugly) implementation detail from the users
+of [[node]] by guarding its result value if necessary.
+
+==enforce_val*/
+cresult enforce_val(cnode_t *node, rtype_t *decl)
+{
+    switch(cnode_compat(node, decl))
+    {
+    case YES:
+        break;
+    case NO:
+        c_error("value of type `%s` found where type `%s` expected.",
+                decl_name(node->decl), decl_name(decl));
+        return FAILED;
+    case MAYBE:
+        guard_val(cnode_insert_after(node, CN_COPY), node, node->decl);
+        node->decl = decl;
+        return CHANGED;
+    }
+    return SUCCESS;
+}
+/*@
+
+
+\section*{Miscellanea}
+
+==preliminaries*/
+typedef struct cnode cnode_t;
+typedef struct cblock cblock_t;
+typedef struct cfunction cfunction_t;
+typedef struct cvar cvar_t;
+typedef ARRAY(cfunction_t *) cfunction_array_t;
+typedef ARRAY(cblock_t *) cblock_array_t;
+typedef ARRAY(cnode_t *) cnode_array_t;
+typedef ARRAY(cvar_t *) cvar_array_t;
+typedef ARRAY(rsymbol_t *) rsymbol_array_t;
+/*@
+
+==includes*/
+#include "global.h"
+#include "ir.h"
+/*@
+
+==prototypes*/
+cfunction_t *cfunc_create(cfunction_t *parent);
+void cfunc_free(cfunction_t *fn);
+rtype_t *cfunc_type(cfunction_t *fn, rtype_t *ret_type);
+cresult cfunc_map_children(cfunction_t *fn, cresult (*func)(cfunction_t *));
+void cfunc_mapc_children(cfunction_t *fn, void (*func)(cfunction_t *));
+
+cblock_t *cblock_create();
+void cblock_free(cblock_t *block);
+int index_of_block(cblock_array_t *arr, cblock_t *block);
+void link_blocks(cblock_t *to, cblock_t *from);
+void replace_link(cblock_array_t *arr, cblock_t *from, cblock_t *to);
+void remove_link(cblock_array_t *arr, cblock_t *from);
+cblock_t *split_block(cfunction_t *fn, cnode_t *site);
+
+cnode_t *cnode_create(cblock_t *block, cnodetype type);
+cnode_t *cnode_prepend(cblock_t *block, cnodetype type);
+cnode_t *cnode_append(cblock_t *block, cnodetype type);
+cnode_t *cnode_insert_before(cnode_t *other, cnodetype type);
+cnode_t *cnode_insert_after(cnode_t *other, cnodetype type);
+int index_of_node(cnode_array_t *arr, cnode_t *node);
+void cnode_fini(cnode_t *node);
+void cnode_free(cnode_t *node);
+void cnode_reset(cnode_t *node);
+void cnode_remove(cnode_t *node);
+
+void cnode_unuse_all(cnode_t *node);
+void cnode_replace_in_users(cnode_t *from, cnode_t *to);
+void cnode_add_user(cnode_t *user, cnode_t *node);
+void cnode_remove_user(cnode_t *user, cnode_t *node);
+void cnode_map_used(cnode_t *node, void (*func)(cnode_t **, void *), void *data);
+void cfunc_node_users(cfunction_t *fn);
+
+bool cnode_is_pure(cnode_t *node, bool may_alias);
+
+cnode_t *guard_decl(cnode_t *guard, cnode_t *node, rtype_t *decl, cnode_t *val);
+cresult enforce_decl(cnode_t *node, rtype_t *decl, cnode_t **pval, bool boxing);
+cresult enforce_val(cnode_t *node, rtype_t *decl);
+robject_t *nil_init(rtype_t *decl);
+
+cvar_t *cvar_create(rsymbol_t *name, cvartype type, rtype_t *decl);
+void cvar_free(cvar_t *var);
+int index_of_var(cvar_array_t *arr, cvar_t *block);
+
+cresult cfunc_crit_edges(cfunction_t *fn); // FIXME can remove from here when we stop asserting with it
+void cfunc_rdfo(cfunction_t *fn);
+void cfunc_cleanup(cfunction_t *fn);
+void cfunc_init_closure(cfunction_t *fn);
+void cfunc_ssa_convert(cfunction_t *fn);
+
+#include "ir_dom.h"
+
+// XXX really somewhere in opt, because builtin_ops_t is private
+bool builtin_is_void(const cbuiltin_t *bi, cnode_t *node);
+bool builtin_is_pure(const cbuiltin_t *bi, cnode_t *node, bool may_alias);
+void ir_dump(cfunction_t *fn); // DEBUG
+/*@
+
+==inlines*/
+//cfunc_has_closure//
+//cnode_is_used//
+//cnode_yields_value//
+//call_has_names//
+//cnode_only_used_by//
+//decl_type//
+//decl_name//
+//cnode_compat//
+//cvar_is_global//
+//cvar_is_celled//
+/*@
+
+%*/

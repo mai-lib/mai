@@ -1,0 +1,6 @@
+build/vm/vm.o: src/vm/vm.c src/global.h src/util.h src/hash.h \
+ src/hash.h.inc src/array.h src/list.h src/rt/runtime.h src/rt/type.h \
+ src/rt/scalar.h src/rt/callable.h src/rt/call.h src/rt/vector.h \
+ src/rt/gc.h src/rt/math.h src/rt/options.h src/vm/vm.h src/compiler.h \
+ src/arith/scalar.h src/vm/vm_ops.h src/vm/op_data.c.inc \
+ src/vm/op_getelt.c.inc src/vm/op_scalar.c.inc src/vm/op_arith.c.inc

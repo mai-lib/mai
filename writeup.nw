@@ -1,0 +1,122 @@
+/*@
+% configuration, apt to change
+\input{config.tex.inc}
+%
+\begin{document}
+\frontmatter
+%% title page
+\begin{titlepage}
+  \begin{center}
+
+    \vspace*{2.5cm}
+    \Huge
+    \textbf{A Compiled Language for\\Statistical Computing}
+
+    \vspace{6.5cm}
+    \LARGE
+    \textbf{Brendan McArdle}
+
+    \vfill
+    \Large
+    A thesis submitted in fulfilment of the requirements for the degree
+    of Doctor of Philosophy in Statistics, the University of Auckland,
+    2018.
+
+  \end{center}
+\end{titlepage}
+%% this page intentionally left blank
+\thispagestyle{plain}
+%% abstract
+\chapter{Abstract}
+\quotation
+
+The implementation of a statistical computing system is described,
+consisting of a language, an optimising compiler, a virtual machine, and
+its run-time environment. The language is dynamically typed with lexical
+scope, first-class functions, and optional type declarations. The
+compiler operates on a high-level intermediate representation in static
+single assignment form, and applies several optimisations from the
+literature. The virtual machine is a directly threaded interpreter with
+specialised arithmetic instructions for unboxed scalar values. The
+run-time support library supplies automatic memory management of
+vectors, arrays and closures.
+
+\endquotation
+%% this page intentionally left blank
+\clearpage
+\thispagestyle{plain}
+%% toc
+\tableofcontents
+%%
+\mainmatter
+% doublespace hack
+\ifdefined\doublespaced
+\let\Ochapter=\chapter
+\renewcommand\chapter[1]{\Ochapter{#1}\hack{1.5}}
+\fi
+% words words
+\include{intro}
+% main executable
+\include{main}
+%
+\part{Compiler}
+%% driver
+\include{compiler}
+%% parser
+\include{parser}
+%% ir
+\include{ir}
+\include{ir_convert}
+\include{ir_pre}
+\include{ir_dom}
+\include{ir_ssa}
+%% opt
+\include{opt}
+\include{opt_inline}
+\include{opt_closure}
+\include{opt_post}
+\include{opt_dvn}
+%% gen
+\include{gen_code}
+\include{gen_range}
+\include{gen_loc}
+\include{gen_unssa}
+% DEBUG not included
+%\include{debug}
+
+\part{Run-Time Environment}
+\include{runtime}
+\include{type}
+\include{callable}
+\include{call}
+\include{scalar}
+\include{vector}
+\include{gc}
+% vm
+\include{vm}
+
+%% XXX is this \part good practice? how else to set off appendices from the
+%% end of the previous part?
+\part{Appendices}
+\appendix
+%% runtime
+\include{rt}
+%% arith
+\include{arith}
+% utils
+\include{util}
+\include{hash}
+%include{build}
+
+% natbib wins again!
+\bibliographystyle{plainnat}
+% un-doublespace-hack the bibliography
+\ifdefined\doublespaced
+\renewcommand\chapter[1]{\Ochapter{#1}\hack{1}}
+\fi
+\renewcommand{\bibsection}{\chapter{Bibliography}}
+%
+\bibliography{writeup}
+%
+\end{document}
+%*/

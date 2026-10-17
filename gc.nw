@@ -1,0 +1,1499 @@
+/*@
+\chapter{Memory Management}
+\label{gc}
+
+Automatic memory management is nearly ubiquitous among high-level
+languages. The execution overhead is more than outweighed by the
+advantages it affords; in particular, simplification of user code
+\citep{jones12}.
+
+==rt/gc.c*/
+//includes//
+//bit constants//
+//size constants//
+//gc_stats//
+//interface globals//
+//chunk globals//
+//heap//
+//allocation//
+//collection//
+//interface//
+/*@
+
+Memory used by the runtime can be split into two classes.
+\textit{Unmanaged} buffers of arbitrary size are handled by the platform
+\texttt{libc}. Some will be owned by other objects, and some will be
+explicitly handled by the runtime. \textit{Managed} memory contains
+[[robject_t]]s \autoref{rt:obj}, which are the only referents directly
+visible to user code.
+
+The memory management subsystem, responsible for handling them, is
+composed of a segregated-fit allocator and a type-accurate mark-sweep
+garbage collector. This is of deliberately simple design -- generational
+or concurrent collection would improve latency at the cost of
+implementation complexity.
+
+
+\section{Managed Heap}
+
+The segregated-fit allocator has one \textit{pool} for each distinct
+size of object (this set is fixed at compile-time). A pool holds a list
+of \textit{pages} divided into objects of identical size. A page is
+itself contained in a larger \textit{chunk} of memory requested from the
+operating system. Objects on a page which are not currently in use are
+kept on the page's free list. Empty pages in a chunk are kept on the
+chunk's free list.
+
+==heap*/
+//free_obj_t//
+//page_t//
+//pool_t//
+//chunk_t//
+//chunks//
+//pages//
+//pools//
+/*@ %
+
+
+\subsection{Chunks}
+
+A chunk begins with a [[chunk_t]] header. After this (and possibly some
+unusable leftover space), the chunk is divided into pages of constant
+size.
+
+Each page is described by an entry in the [[.pages]] array. The
+[[.free_head]] field is a list of empty pages in the chunk; [[.nlive]]
+counts the number of live objects on all contained pages.
+
+==chunk_t*/
+typedef struct
+{
+    list_t chunk_list;
+    list_t free_head;
+    unsigned nlive;
+    page_t pages[NPAGES];
+} chunk_t;
+//assert size//
+/*@ %def chunk_t
+
+[[NPAGES]], the number of pages in a chunk, depends on the size of each
+page, the size of the chunk, and the size of the header. But the size of
+the header depends on the number of pages in a chunk. To break this
+circularity, we fix the amount of memory reserved for the header.
+
+The header is comprised mainly of pointers, so will differ in size
+between 32- and 64-bit x86 machines (ILP-32 vs LP-64). The data model is
+visible to the preprocessor via \texttt{unistd.h}.
+%% cite "Go Solo 2", chap. 14; or http://wwww.unix.org/version2/whatsnew/datasize.html
+
+==bit constants*/
+#if (defined(_XBS5_ILP32_OFF32) && _XBS5_ILP32_OFF32 != -1)
+#define WORDSHIFT 2
+#define NRESERVED 3
+#elif (defined(_XBS5_LP64_OFF64) && _XBS5_LP64_OFF64 != -1)
+#define WORDSHIFT 3
+#define NRESERVED 6
+#else
+#error "platform bitness undefined."
+#endif
+/*@ %def WORDSHIFT NRESERVED
+
+Ideally, chunks would be large enough to amortise syscall overhead but
+small enough to minimise requested-but-unused memory. In the absence of
+extensive practical experience, [[CHUNKSIZE]] is chosen to be 2MiB.
+[[PAGESIZE]] is 4KiB (which probably matches the underlying hardware.)
+% cite large pages in the intel manual?
+
+Each chunk then contains [[NPAGES]] pages available for allocation; with
+these values, this is 253 (250 on x86-64.)
+
+==size constants*/
+#define CHUNKBITS 21
+#define CHUNKSIZE (1<<CHUNKBITS)
+#define CHUNKMASK (CHUNKSIZE - 1)
+#define PAGEBITS  12
+#define PAGESIZE  (1<<PAGEBITS)
+#define PAGEMASK  (PAGESIZE - 1)
+#define NPAGES    ((1<<(CHUNKBITS - PAGEBITS)) - NRESERVED)
+/*@ %def CHUNKBITS CHUNKSIZE CHUNKMASK PAGEBITS PAGESIZE PAGEMASK NPAGES
+
+The chunk header must fit in the area reserved for it. Since its size is
+available to the compiler, this can be assured.
+
+==assert size*/
+static_assert(NRESERVED * PAGESIZE >= sizeof(chunk_t),
+              "chunk header too large, reserve more pages.");
+/*@
+
+Chunks are counted, and kept on a global list.
+
+==chunk globals*/
+static list_t chunk_head;
+static unsigned gc_nchunks = 0;
+/*@ %def chunk_head gc_nchunks
+
+==chunks*/
+//mmap_chunk//
+//munmap_chunk//
+//mmap_aligned_chunk//
+//chunk_create//
+//chunk_free//
+//chunk_get_page//
+//chunk_for_addr//
+/*@ %
+
+Every chunk is aligned so that, given an internal pointer, it is
+possible to compute the address of the [[chunk_t]] header by zeroing the
+low-order [[CHUNKBITS]].
+
+==chunk_for_addr*/
+static inline chunk_t *chunk_for_addr(void *obj)
+    { return (chunk_t *)((uintptr_t)obj & ~CHUNKMASK); }
+/*@ %def chunk_for_addr
+
+The allocator will create a chunk when it needs to grow the managed
+heap. A call to \texttt{mmap} requests that the operating system map a
+new region of memory into the process' address space. A simple wrapper
+function takes care of unvarying arguments, as well as error handling
+(such as it is.)
+
+==mmap_chunk*/
+static inline void *mmap_chunk(void *hint, size_t sz)
+{
+    void *r = mmap(hint, sz, PROT_READ|PROT_WRITE,
+                   MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+
+    if(r == MAP_FAILED)
+        fatal("can't allocate %.1fk for chunk: %s.",
+              sz / 1024.0, strerror(errno));
+    return r;
+}
+/*@ %def mmap_chunk
+
+(Likewise for \texttt{munmap}.)
+
+==munmap_chunk*/
+static inline void munmap_chunk(void *ptr, size_t sz)
+{
+    if(munmap(ptr, sz) == -1)
+        fatal("can't munmap chunk @ %p: %s.", ptr, strerror(errno));
+}
+/*@ %def munmap_chunk
+
+To ensure the required alignment, two mechanisms are used. If the
+address returned by \texttt{mmap} is found to be misaligned, it's
+immediately unmapped, and a mapping of twice the size is requested. An
+aligned address is computed within this, and the surplus space before
+and after the aligned chunk is unmapped.
+
+==mmap_aligned_chunk*/
+static chunk_t *mmap_aligned_chunk(void *hint)
+{
+    uint8_t *head, *ptr = mmap_chunk(hint, CHUNKSIZE);
+
+    if((uintptr_t)ptr & CHUNKMASK)
+    {
+        // throw it back
+        munmap_chunk(ptr, CHUNKSIZE);
+        // get one twice the size
+        head = mmap_chunk(hint, CHUNKSIZE<<1);
+        // align within that
+        ptr = (uint8_t *)(((uintptr_t)head + CHUNKMASK) & ~CHUNKMASK);
+        // give back the head
+        munmap_chunk(head, ptr - head);
+        // and tail
+        munmap_chunk(ptr + CHUNKSIZE,
+                     (head + (CHUNKSIZE<<1)) - (ptr + CHUNKSIZE));
+    }
+    return (chunk_t *)ptr;
+}
+/*@ %def mmap_aligned_chunk
+
+The next-highest aligned address is stored, to be passed as the
+\texttt{hint} argument to the next \texttt{mmap} call -- ideally
+avoiding further misalignment.
+
+All the [[page_t]] descriptors are initially linked into the chunk's
+free list, and the chunk is accounted for and linked into the global
+chunk list.
+
+==chunk_create*/
+static void *next_mmap = NULL;
+static chunk_t *chunk_create()
+{
+    chunk_t *chunk = mmap_aligned_chunk(next_mmap);
+
+    next_mmap = (uint8_t *)chunk + CHUNKSIZE;
+    list_init(&chunk->free_head);
+    chunk->nlive = 0;
+    for(page_t *page = chunk->pages; page < &chunk->pages[NPAGES]; page++)
+    {
+        list_init(&page->page_list);
+        list_add_before(&chunk->free_head, &page->page_list);
+    }
+    list_init(&chunk->chunk_list);
+    list_add(&chunk_head, &chunk->chunk_list);
+    gc_nchunks++;
+    gc_stats.nchunks++;
+    return chunk;
+}
+/*@ %def next_mmap chunk_create
+
+As a chunk can only be freed when its pages are all empty, they don't
+need special treatment during deallocation.
+
+==chunk_free*/
+static void chunk_free(chunk_t *chunk)
+{
+    list_remove(&chunk->chunk_list);
+    munmap_chunk(chunk, CHUNKSIZE);
+    gc_nchunks--;
+}
+/*@ %def chunk_free
+
+When the allocator needs an empty page, one can be taken from a chunk by
+removing the first page from its free list.
+
+==chunk_get_page*/
+static inline page_t *chunk_get_page(chunk_t *chunk)
+{
+    page_t *page = container_of(chunk->free_head.next, page_t, page_list);
+
+    list_remove(&page->page_list);
+    return page;
+}
+/*@ %def chunk_get_page
+
+(This assumes that [[!list_isempty(&chunk->free_head)]].)
+
+
+\subsection{Pages}
+
+A page is either empty, or subdivided into objects of identical size. In
+the latter case, a pool will record the object size in the [[.objsz]]
+field when adding the page.
+
+An empty page is on its chunk's free list. Otherwise it's on its pool's
+page list. The [[.page_list]] link suffices for both cases.
+
+[[.markbits]] points to an out-of-line buffer containing one bit per
+object on the page. Each bit is set when the corresponding object is
+marked; it's cleared after each collection.
+
+[[.marked]] is set when any object on the page is been marked. It's
+examined during sweeping to quickly determine whether the page is empty.
+
+The [[.free]] field points to the first unused object on the page. If
+this is [[NULL]], the page has no free objects left.
+
+==page_t*/
+typedef unsigned short objsz_t;
+typedef struct
+{
+    list_t page_list;
+    SLIST(free_obj_t) free;
+    bitmap_t *markbits;
+    objsz_t objsz;
+    bool marked;
+} page_t;
+/*@ %def objsz_t page_t
+
+==pages*/
+//page_storage//
+//page_for_object//
+//page_object_index//
+//object_is_free//
+//page_link_free_object//
+//page_free_object//
+//page_foreach_object//
+//page_init//
+//page_fini//
+/*@ %
+
+The address of some page's [[chunk->pages[idx]]] storage is located
+[[(idx + NRESERVED) * PAGESIZE]] bytes after the start of the chunk.
+Given a pointer to a [[page_t]], both [[chunk]] and [[idx]] can be
+determined -- since the [[page_t]] is contained in a chunk, its address
+is a valid argument to [[chunk_for_addr]].
+
+==page_storage*/
+static inline void *page_storage(page_t *page)
+{
+    chunk_t *chunk = chunk_for_addr(page);
+    ptrdiff_t idx = page - chunk->pages;
+
+    return (uint8_t *)chunk + ((idx + NRESERVED) << PAGEBITS);
+}
+/*@ %def page_storage
+
+Given a pointer [[obj]] to some object on a page, the appropriate
+[[page_t]] may be found \textit{vice versa}.
+
+==page_for_object*/
+static inline page_t *page_for_object(void *obj)
+{
+    chunk_t *chunk = chunk_for_addr(obj);
+    unsigned idx = ((uint8_t *)obj - (uint8_t *)chunk) >> PAGEBITS;
+    assert(idx >= NRESERVED);
+    return &chunk->pages[idx-NRESERVED];
+}
+/*@ %def page_for_object
+
+Mark bitmap manipulation will need the (zero-based) index of an object
+on its page (this assumes that [[obj]] is, in fact, on [[page]]).
+
+==page_object_index*/
+static inline unsigned page_object_index(page_t *page, void *obj)
+{
+    uintptr_t offset = (uintptr_t)obj - ((uintptr_t)obj & ~PAGEMASK);
+    assert(offset >= 0);
+    return offset / page->objsz;
+}
+/*@ %def page_object_index
+
+An object available for reuse is treated as a [[free_obj_t]], and linked
+into its containing page's free list via its [[.next]] field. The list
+is singly linked since objects are only added or removed at the head.
+
+==free_obj_t*/
+typedef struct free_obj
+{
+    robject_t hdr;
+    SLIST(struct free_obj) next;
+} free_obj_t;
+/*@ %def free_obj_t
+
+Such objects have the sentinel value [[r_type_freed]] for their
+[[.type]].
+
+==object_is_free*/
+static const rtype_t *r_type_freed = (rtype_t *)0xDEADBEEF;
+static inline bool object_is_free(free_obj_t *obj)
+    { return obj->hdr.type == r_type_freed; }
+/*@ %def r_type_freed object_is_free
+
+Some objects hold pointers to unmanaged memory, and these will need to
+be freed before the object can be reused. The destructor [[r_free]] will
+invoke the appropriate callback for the object's type.
+
+When debugging, storage is overwritten with a known bit pattern to aid
+in detecting object reuse bugs.
+
+==page_free_object*/
+static inline void page_free_object(page_t *page, free_obj_t *obj)
+{
+    r_free(obj);
+#ifndef NDEBUG
+    memset(obj, 0xFE, page->objsz);
+#endif
+    page_link_free_object(page, obj);
+}
+/*@ %def page_free_object
+
+Initialising a free object is a matter of setting its [[.type]] and
+linking it at the head of the page's free list.
+
+When debugging with Valgrind \citep{nethercote07}, storage is also
+marked to provoke an error if inadvertantly accessed (the type pointer
+must stay accessible, though, since it's read during the sweep phase to
+determine whether or not an unmarked object is fresh garbage.)
+
+==page_link_free_object*/
+static inline void page_link_free_object(page_t *page, free_obj_t *obj)
+{
+    obj->hdr.type = (rtype_t *)r_type_freed;
+    slist_push(page->free, obj, next);
+#ifdef HAS_VALGRIND
+    VALGRIND_MAKE_MEM_NOACCESS((uint8_t *)obj + sizeof(rtype_t *),
+                               page->objsz - sizeof(rtype_t *));
+#endif
+}
+/*@ %def page_link_free_object
+
+We use a convenient macro to iterate over all the objects on the page
+with descriptor [[page_t *pg]]. [[obj]] may be a pointer of any type.
+
+==page_foreach_object*/
+#define page_foreach_object(pg, obj)                                    \
+    for(void *_p = page_storage(pg);                                    \
+        _p <= (void *)((uint8_t *)page_storage(pg)+PAGESIZE-pg->objsz)  \
+            && (obj = _p);                                              \
+        _p = (uint8_t *)_p + pg->objsz)
+/*@ %def page_foreach_object
+
+When a page is added to a pool, all its objects are initially added to
+its free list (and their [[free_obj_t]] fields marked accessible, when
+debugging under Valgrind.)
+
+==page_init*/
+static page_t *page_init(page_t *page, objsz_t objsz, unsigned nobj)
+{
+    free_obj_t *obj;
+
+    *page = (page_t) {
+        .marked = false,
+        .objsz = objsz,
+        .markbits = bitmap_create(nobj),
+        .free = NULL
+    };
+    page_foreach_object(page, obj)
+    {
+#ifdef HAS_VALGRIND
+        VALGRIND_MAKE_MEM_DEFINED(obj, sizeof(free_obj_t));
+#endif
+        page_link_free_object(page, obj);
+    }
+    return page;
+}
+/*@ %def page_init
+
+An empty page may be removed from its pool and placed on its chunk's
+free list (when debugging under Valgrind, its memory is marked
+inaccessible.)
+
+==page_fini*/
+static void page_fini(page_t *page)
+{
+    chunk_t *chunk = chunk_for_addr(page);
+    bitmap_free(page->markbits);
+    list_add(&chunk->free_head, &page->page_list);
+#ifdef HAS_VALGRIND
+    VALGRIND_MAKE_MEM_NOACCESS(page_storage(page), PAGESIZE);
+#endif
+}
+/*@ %def page_fini
+
+
+\subsection{Pools}
+
+A pool satisfies allocation requests for a size class of objects.
+
+==pools*/
+//pool globals//
+//pool_for_size//
+//pool_add_page//
+//pool_remove_page//
+//pool_init//
+//pool_fini//
+/*@ %
+
+The list of [[page_t]]s in the [[.page_head]] field provides the storage
+from which to do so. The [[.nobj]] and [[.objsz]] fields record the
+number of objects per page and the size (in bytes) of the objects for
+which the pool is responsible.
+
+The [[.open]] field is set to the last page from which an object was
+allocated, in the assumption it is not yet full.
+
+The remaining fields are bookkeeping and may be of use to the heap
+sizing algorithm. [[.npages]] counts pages, the others count objects.
+
+==pool_t*/
+typedef struct
+{
+    list_t page_head;
+    page_t *open;
+    objsz_t objsz;
+    unsigned nobj;
+    unsigned npages, nalloc, nfree, nswept;
+} pool_t;
+/*@ %def pool_t
+
+There is a [[pool_t]] for each size class of object, measured in natural
+machine words, up to the maximum required by the runtime.
+
+There's a separate pool for types (\autoref{type}) -- the destructor
+callback invoked by [[r_free]] is a field of the type object. So the
+type must not be destroyed before the object, even if both became
+garbage during the same collection.
+
+==pool globals*/
+#define MAX_WORDS 9
+static const unsigned objwords[] = { 2, 3, 4, 5, 6, MAX_WORDS };
+static pool_t *sizepools[MAX_WORDS];
+#define NPOOLS ((unsigned) lengthof(objwords)+1)
+static pool_t pools[NPOOLS], *type_pool = &pools[NPOOLS-1];
+/*@ %def MAX_WORDS objwords sizepools NPOOLS pools type_pool
+
+Dividing bytes to words and indexing into [[sizepools]] returns the pool
+from which to allocate an object of the desired size.
+
+==pool_for_size*/
+static inline pool_t *pool_for_size(objsz_t sz)
+    { return sizepools[sz >> WORDSHIFT]; }
+/*@ %def pool_for_size
+
+A page added to a pool will always be empty, and it'll already have been
+removed from its chunk's list.
+
+==pool_add_page*/
+static void pool_add_page(pool_t *pool, page_t *page)
+{
+    page_init(page, pool->objsz, pool->nobj);
+    list_add(&pool->page_head, &page->page_list);
+    pool->nfree += pool->nobj;
+    pool->npages++;
+}
+/*@ %def pool_add_page
+
+Removing a page from a pool is a simple inverse. (Needless to say, this
+does not consider the case in which the page being removed contains live
+objects.)
+
+==pool_remove_page*/
+static void pool_remove_page(pool_t *pool, page_t *page)
+{
+    assert(pool->open != page);
+    pool->npages--;
+    pool->nfree -= pool->nobj;
+    list_remove(&page->page_list);
+    page_fini(page);
+}
+/*@ %def pool_remove_page
+
+Initialisation is straightforward\ldots
+
+==pool_init*/
+static void pool_init(objsz_t sz, pool_t *pool)
+{
+    *pool = (pool_t) {
+        .page_head = LIST_INIT(pool->page_head),
+        .objsz = sz,
+        .nobj = PAGESIZE / sz,
+    };
+}
+/*@ %def pool_init
+
+\ldots as is destruction. All live objects on each page are destroyed. As the
+page is being removed from the list being traversed, [[safe]]ty is
+required.
+
+==pool_fini*/
+static unsigned page_empty(page_t *page);
+static void pool_fini(pool_t *pool)
+{
+    page_t *page, *tmp;
+
+    list_foreach_entry_safe(&pool->page_head, page, tmp, page_list)
+    {
+        page_empty(page);
+        list_remove(&page->page_list);
+        page_fini(page);
+    }
+}
+/*@ %def pool_fini
+
+
+\section{Allocation}
+
+Given a particular pool, if we can find a page with at least one free
+object, we can use it to satisfy an allocation request.
+
+==allocation*/
+//alloc_from_page//
+//pool_get_page//
+//alloc_from_pool//
+//alloc_for_vec//
+/*@ %
+
+Allocating from such a page is trivial -- remove the object from the
+free list, and return.
+
+(Under Valgrind, the object's storage is marked as accessible.)
+
+==alloc_from_page*/
+static inline void *alloc_from_page(page_t *page)
+{
+    free_obj_t *obj = page->free;
+
+#ifdef HAS_VALGRIND
+    VALGRIND_MAKE_MEM_DEFINED(obj, page->objsz);
+#endif
+    slist_remove_head(page->free, next);
+    return obj;
+}
+/*@ %def alloc_from_page
+
+The fast-path is taken when the pool has an [[.open]] page with a [[.free]]
+object. Otherwise we search the pool's pages for one; if none is found,
+we request an empty page from a chunk, and add it to the pool.
+
+==pool_get_page*/
+static page_t *pool_get_page(pool_t *pool)
+{
+    page_t *page = pool->open;
+    chunk_t *chunk;
+
+    if(page && page->free)
+        return page;
+    list_foreach_entry(&pool->page_head, page, page_list)
+        if(page->free)
+            return page;
+    list_foreach_entry(&chunk_head, chunk, chunk_list)
+    {
+        if(!list_isempty(&chunk->free_head))
+        {
+            page = chunk_get_page(chunk);
+            pool_add_page(pool, page);
+            return page;
+        }
+    }
+    return NULL;
+}
+/*@ %def pool_get_page
+
+If there are none of those left, we have failed. [[NULL]] is returned to
+notify the caller, [[alloc_from_pool]].
+
+This makes up to two calls to [[pool_get_page]]. If the first call
+fails, a garbage collection is run and a second call is made. If this
+fails, a new chunk is requested, and an empty page from that is added to
+the pool.
+
+A garbage collection is also run if the total amount of unmanaged memory
+[[gc_vec_bytes]] exceeds the [[gc_vec_target]] threshold. Otherwise,
+repeated allocation of large short-lived vectors could consume all
+available memory before running out of free objects and triggering a
+collection.
+
+The pool's [[.open]] page and counters are updated, in any case, and the
+object returned.
+
+==alloc_from_pool*/
+static unsigned gc_nchunks_target = 1;
+static size_t gc_vec_target = 2*1024*1024;
+static size_t gc_vec_bytes, gc_vec_swept;
+static inline void *alloc_from_pool(pool_t *pool, size_t vecsz)
+{
+    page_t *page = pool_get_page(pool);
+    bool obj_gc = (gc_nchunks >= gc_nchunks_target);
+    bool vec_gc = (gc_vec_bytes + vecsz) > gc_vec_target;
+
+#ifdef STRESS_GC
+    if(true)
+#else
+    if(vec_gc || (obj_gc && !page))
+#endif
+    {
+        if(gc_enabled)
+        {
+            gc_collect();
+            page = pool_get_page(pool);
+        }
+        else
+            gc_request = true;
+    }
+    if(!page)
+    {
+        page = chunk_get_page(chunk_create());
+        pool_add_page(pool, page);
+    }
+    pool->open = page;
+    pool->nalloc++;
+    pool->nfree--;
+    assert(pool->nfree < UINT_MAX);
+    return alloc_from_page(page);
+}
+/*@ %def alloc_from_pool
+
+Unmanaged memory is allocated by the \texttt{libc}. [[gc_alloc_vec]]
+will call [[alloc_for_vec]] after [[alloc_from_pool]] if any unmanaged
+memory was requested. [[gc_vec_target]] is updated to prevent the
+[[vec_gc]] condition causing unnecessary collections during future
+allocations.
+
+Note that the returned memory is not zeroed, so if it is to contain
+object pointers visible to the collector it must be initialised prior to
+the next allocation.
+
+==alloc_for_vec*/
+static inline void *alloc_for_vec(size_t vecsz)
+{
+    if(vecsz == 0)
+        return NULL;
+    gc_vec_bytes += vecsz;
+    gc_vec_target = max(gc_vec_target, gc_vec_bytes);
+    gc_stats.vec_bytes += vecsz;
+    return xmalloc(vecsz);
+}
+/*@ %def alloc_for_vec
+
+
+\section{Collection}
+\label{gc:collect}
+
+The garbage collector is invoked when a free object can't be found to
+satisfy an allocation, or when the amount of unmanaged memory allocated
+grows beyond a threshold value.
+
+==collection*/
+//queue//
+//roots//
+//marking//
+//sweeping//
+//sizing//
+//gc_collect//
+/*@ %def gc_collect
+
+Collection proceeds in phases. A set of preregistered \textit{root} objects
+are \textit{marked}, then marked objects are \textit{scanned} in a loop. When
+an object is scanned, objects referenced by internal pointers are
+marked. When no more objects remain to be scanned, the collection is
+complete. Unmarked objects are considered garbage and reclaimed for
+later reuse.
+
+Empty pages are released to their chunks. Chunks surplus to requirements
+(and with all pages empty) are released to the operating system. The
+unmanaged memory threshold is also updated.
+
+==gc_collect*/
+void gc_collect()
+{
+    assert(gc_enabled);
+    gc_request = false;
+    collect_begin();
+    collect_mark();
+    collect_sweep();
+    collect_resize();
+    gc_stats.ncollect++;
+}
+/*@
+
+
+\subsection{Scan Queue}
+
+The scan queue contains objects which have been marked but not yet
+scanned.
+
+==queue*/
+//qfrag_t//
+//queue globals//
+//advance//
+//qfrag_init//
+/*@ %
+
+It comprises a singly-linked list of queue fragments, headed by the
+statically allocated fragment [[qhead]]; the following fragments, if
+any, are \texttt{malloc}ed. [[qtail]] points to the last one, or
+[[NULL]] if scanning hasn't started yet.
+
+==queue globals*/
+static qfrag_t qhead, *qtail;
+/*@ %def qhead qtail
+
+A queue fragment is [[qfrag_t]] structure, containing a ring buffer
+holding a constant number of object pointers, two indices, and a pointer
+to the next fragment (or [[NULL]].)
+
+==qfrag_t*/
+#define QFRAG_LEN 256
+#define QFRAG_MASK (QFRAG_LEN-1)
+typedef struct qfrag
+{
+    robject_t *objs[QFRAG_LEN];
+    unsigned s, m;
+    SLIST(struct qfrag) next;
+} qfrag_t;
+/*@ %def QFRAG_LEN qfrag_t
+
+==qfrag_init*/
+static inline void qfrag_init(qfrag_t *frag)
+{
+    *frag = (qfrag_t) {
+        .s = 0,
+        .m = 0,
+        .next = NULL
+    };
+}
+/*@ %def qfrag_init
+
+[[.s]] is the scan index and [[.m]] the mark index (into the [[.objs]]
+buffer.) Each is advanced modulo [[QFRAG_LEN]] as scanning proceeds and
+as more objects are added to the queue, respectively.
+
+==advance*/
+static inline unsigned advance(unsigned i)
+    { return (i + 1) & QFRAG_MASK; }
+/*@ %def advance
+
+
+\subsection{Roots}
+\label{gc:root}
+
+A module that holds references to objects across a collection must
+register one or more [[gc_root_t]]s. The callback [[.fn]] should then
+invoke [[gc_mark]] on the objects that ought to be considered live.
+
+(It's a [[struct]] so that, when embedded in a larger context structure,
+the callback can use [[container_of]] to compute the address of the
+latter from the former.)
+
+==gc_root_t*/
+typedef struct gc_root_s gc_root_t;
+typedef void (*gc_root_fn)(gc_root_t *);
+typedef struct gc_root_s
+{
+    list_t roots_list;
+    gc_root_fn fn;
+} gc_root_t;
+/*@ %
+
+Registered roots are linked into a global list.
+
+==roots*/
+static list_t roots_head = LIST_INIT(roots_head);
+void gc_register(gc_root_t *root)
+{
+    list_init(&root->roots_list);
+    list_add(&roots_head, &root->roots_list);
+}
+void gc_unregister(gc_root_t *root)
+{
+    list_remove(&root->roots_list);
+}
+//collect_begin//
+/*@ %def roots_head gc_register gc_unregister
+
+To start a collection, the scan queue is initialised, and the registered
+callbacks invoked to populate the root set.
+
+==collect_begin*/
+static void collect_begin()
+{
+    gc_root_t *root;
+
+    qfrag_init(&qhead);
+    qtail = NULL;
+    list_foreach_entry(&roots_head, root, roots_list)
+        root->fn(root);
+}
+/*@ %def collect_begin
+
+
+\subsection{Marking}
+\label{gc:mark}
+
+A marked object has been reached from the root set by following
+pointers, so can't be reclaimed as garbage. In \citet{dijkstra78}'s
+tri-colour abstraction, a marked object is \textit{grey} if it's on the
+queue and \textit{black} if not.
+
+==marking*/
+//mark_one_object//
+//enqueue_one_object//
+//gc_mark//
+//collect_mark//
+/*@ %
+
+When an object is added to the current queue fragment, the mark index is
+advanced. if it `catches up' to the scan index, the fragment is full and
+a new one must be allocated.
+
+This is detected when [[.m]] is equal to [[.s]] and it's not the first
+object marked in the collection (since both indices are equal to [[0]],
+in that case.)
+
+The intuition is, in `small' (narrow or shallow) parts of the object
+graph, marking doesn't get much ahead of scanning, so a smallish buffer
+will suffice. But burst capacity must be available, for parts of the
+graph which aren't.
+
+==enqueue_one_object*/
+static inline void enqueue_one_object(robject_t *obj)
+{
+    if(!qtail)
+        qtail = &qhead;
+    else if(qtail->m == qtail->s)
+    {
+        qfrag_t *next = xmalloc(sizeof(*next));
+
+        qfrag_init(next);
+        qtail->next = next;
+        qtail = next;
+    }
+    qtail->objs[qtail->m] = obj;
+    qtail->m = advance(qtail->m);
+}
+/*@ %def enqueue_one_object
+
+An object is marked when the corresponding bit in its page's
+[[.markbits]] bitmap is set. To (potentially) speed sweeping, the page
+itself is also marked. The previous mark state is returned.
+
+==mark_one_object*/
+static inline bool mark_one_object(robject_t *obj)
+{
+    page_t *page = page_for_object(obj);
+    unsigned idx = page_object_index(page, obj);
+
+    if(!bitmap_get_bit(page->markbits, idx))
+    {
+        page->marked = true;
+        bitmap_set_bit(page->markbits, idx);
+        return true;
+    }
+    return false;
+}
+/*@ %def mark_one_object
+
+%% [[gc_mark]] (mark and enqueue) -> [[r_gc]] (marks [[.type]]) -> [[ops.gc]] (scan children according to type)
+
+[[gc_mark]] is the entry point for the runtime marking of live objects.
+If the given pointer is non-[[NULL]] and hasn't already been marked in
+this collection, it is added to the scan queue.
+
+==gc_mark*/
+void gc_mark(void *ptr)
+{
+    if(ptr && mark_one_object(ptr))
+        enqueue_one_object(ptr);
+}
+/*@ %def gc_mark
+
+With the root set marked, marking (advancing [[scan.m]] and creating new
+fragments) and scanning (advancing [[scan.s]] and freeing completed
+ones) are interleaved until the queue is emptied.
+
+==collect_mark*/
+static void collect_mark()
+{
+    for(qfrag_t *next, *scan = &qhead; scan; scan = next)
+    {
+        do
+        {
+            r_gc(scan->objs[scan->s]);
+            scan->s = advance(scan->s);
+        }
+        while(scan->s != scan->m);
+        next = scan->next;
+        if(scan != &qhead)
+            xfree(scan);
+    }
+}
+/*@ %def collect_mark
+
+
+\subsection{Sweeping}
+
+The sweep phase links unmarked objects back into their pages' free
+lists, for later reuse.
+
+==sweeping*/
+//page_sweep//
+//page_empty//
+//pool_sweep//
+//collect_sweep//
+/*@ %
+
+Sweeping a page is a matter of iterating over the contained objects,
+freeing those which are unmarked and not already known to be free (i.e.
+that became garbage during this collection). The mark bitmap and flag
+are reset, and the count of objects swept is returned.
+
+==page_sweep*/
+static unsigned page_sweep(page_t *page)
+{
+    free_obj_t *obj;
+    unsigned idx = 0, nswept = 0;
+    chunk_t *chunk = chunk_for_addr(page);
+
+    page_foreach_object(page, obj)
+    {
+        if(!bitmap_get_bit(page->markbits, idx)
+           && !object_is_free(obj))
+        {
+            page_free_object(page, obj);
+            nswept++;
+        }
+        idx++;
+    }
+    bitmap_reset(page->markbits, idx);
+    page->marked = false;
+    chunk->nlive++;
+    return nswept;
+}
+/*@ %def page_sweep
+
+A page that has become empty will be returned to its chunk's free list.
+Linking its free objects isn't necessary; [[page_empty]] just runs the
+destructors of the contained objects.
+
+==page_empty*/
+static unsigned page_empty(page_t *page)
+{
+    free_obj_t *obj;
+    unsigned nswept = 0;
+
+    page_foreach_object(page, obj)
+    {
+        if(!object_is_free(obj))
+        {
+            r_free(obj);
+            nswept++;
+        }
+    }
+    return nswept;
+}
+/*@ %def page_empty
+
+A page without its [[.marked]] flag set has no live objects, so is
+empty. Empty pages are promptly removed from the pool. Counters (and the
+[[.open]] page) are kept up-to-date. Otherwise the page's objects must
+be examined.
+
+==pool_sweep*/
+static void pool_sweep(pool_t *pool)
+{
+    page_t *page, *tmp;
+    unsigned nswept = 0; // mmm, fresh garbage.
+
+    list_foreach_entry_safe(&pool->page_head, page, tmp, page_list)
+    {
+        if(!page->marked)
+        {
+            nswept += page_empty(page);
+            if(pool->open == page)
+                pool->open = NULL;
+            pool_remove_page(pool, page);
+        }
+        else
+            nswept += page_sweep(page);
+    }
+    pool->nalloc -= nswept;
+    pool->nfree += nswept;
+    pool->nswept = nswept;
+}
+/*@ %def pool_sweep
+
+Sweeping the heap just sweeps each pool in order ([[type_pool]] is the
+last element in [[pools]], so objects are destroyed before their types.)
+
+==collect_sweep*/
+static void collect_sweep()
+{
+    gc_vec_swept = 0;
+
+    for(int i=0; i<NPOOLS; i++)
+        pool_sweep(&pools[i]);
+}
+/*@ %def collect_sweep
+
+
+\subsection{Sizing}
+
+As the user program executes, the way it uses memory can change -- for
+example, during initialisation many long-lived objects might be
+allocated, but at other times most objects might become garbage
+relatively quickly.
+% cite the generational hypothesis?
+
+The allocator keeps a target value for the number of allocated chunks
+and a threshold for unmanaged memory (i.e. vector bodies.) At the end of
+each collection, these are recomputed.
+
+==sizing*/
+//div_round_up//
+//resize constants//
+//target_size//
+//target_vec_size//
+//collect_resize//
+/*@ %
+
+Rounding an integer division upwards slightly overestimates the result.
+
+%% XXX probably not optimally succinct
+==div_round_up*/
+static inline intmax_t div_round_up(intmax_t a, int b)
+    { return (a > 0) ? (a + b - 1) / b : a / b; }
+/*@ %def div_round_up
+
+==resize constants*/
+#define HEADROOM_DIV 4
+#define SWEPT_DIV 2
+/*@ %def HEADROOM_DIV SWEPT_DIV
+
+We want to ensure that, for each pool, at least
+[[(.nalloc / 4) + (.nswept / 2)]] objects can be allocated before
+needing to run another collection. These should preferably come from
+pages the pool already owns (i.e. [[.nfree]]), or from unallocated pages
+in existing chunks. If these are insufficient, the target heap size is
+increased.
+
+If there are more unallocated pages than desired, the heap might be too
+large. The target heap size is reduced, to allow some empty chunks
+(fragmentation permitting) to be freed.
+
+==target_size*/
+static unsigned target_size(unsigned nchunks, unsigned target)
+{
+    chunk_t *chunk;
+    page_t *page;
+    intmax_t delta = 0;
+
+    for(int i=0; i<NPOOLS; i++)
+    {
+        pool_t *pool = &pools[i];
+        intmax_t ndelta = div_round_up(pool->nalloc, HEADROOM_DIV);
+
+        ndelta += div_round_up(pool->nswept, SWEPT_DIV);
+        ndelta -= pool->nfree;
+        delta += max(0, ndelta) * (size_t)pool->objsz;
+    }
+    list_foreach_entry(&chunk_head, chunk, chunk_list)
+        list_foreach_entry(&chunk->free_head, page, page_list)
+            delta -= PAGESIZE;
+    target = nchunks + div_round_up(delta, CHUNKSIZE);
+    return max(1, target);
+}
+/*@ %def target_size
+
+The unmanaged memory threshold is updated proportional to the current
+value, if it's not within 30\% -- 70\% of the target. This is a very
+simple heuristic, similar to the one used in R
+\citep[src/main/memory.c]{rproject}.
+
+==target_vec_size*/
+static size_t target_vec_size(size_t bytes, size_t target)
+{
+    size_t delta = 0;
+
+    if(bytes > target * 0.7)
+        delta = (80 * 1024) + bytes * 0.1;
+    else if(bytes < target * 0.3)
+        delta = bytes * -0.2;
+    return max(target + delta, 0);
+}
+/*@ %def target_vec_size
+
+As the final step in collection, the target sizes are recomputed and the
+chunk list traversed. Empty chunks which are surplus to the new maximum
+are freed. The list is reordered (via a temporary) -- chunks with free
+pages sorting before those without (so that the loop over chunks in
+[[pool_get_page]] terminates sooner.)
+
+==collect_resize*/
+static void collect_resize()
+{
+    list_t tmp_head = LIST_INIT(tmp_head);
+    chunk_t *chunk, *tmp;
+
+    gc_nchunks_target = target_size(gc_nchunks, gc_nchunks_target);
+    gc_vec_target = target_vec_size(gc_vec_bytes, gc_vec_target);
+    list_foreach_entry_safe(&chunk_head, chunk, tmp, chunk_list)
+    {
+        if(chunk->nlive == 0 && gc_nchunks > gc_nchunks_target)
+        {
+            chunk_free(chunk);
+        }
+        else
+        {
+            list_remove(&chunk->chunk_list);
+            if(chunk->nlive == NPAGES)
+                list_add_before(&tmp_head, &chunk->chunk_list);
+            else
+                list_add(&tmp_head, &chunk->chunk_list);
+            chunk->nlive = 0;
+        }
+    }
+    assert(list_isempty(&chunk_head));
+    list_splice_after(&chunk_head, &tmp_head);
+}
+/*@ %def collect_resize
+
+Note that a single live object suffices to keep a chunk from being
+empty. The inflation of process working set this induces has not been an
+issue so far, but might be detrimental to longer-running workloads.
+
+
+\section{Entry Points}
+\label{gc:alloc}
+
+==interface*/
+//gc_alloc_vec//
+//gc_free_vec//
+//gc_release//
+//gc_set_enabled//
+//gc_was_requested//
+//gc_collect_stats//
+//gc_init//
+//gc_fini//
+/*@ %
+
+The main entry point to this module is the [[gc_alloc_vec]] function. It
+allocates and returns an object of the given size [[sz]] and type
+[[type]].
+
+Note that the latter may be [[NULL]] during runtime bootstrap, when
+[[r_type_type]] hasn't yet been constructed.
+
+==gc_alloc_vec*/
+void *gc_alloc_vec(rtype_t *type, size_t sz, size_t vecsz, void **pvec)
+{
+    robject_t *obj;
+    pool_t *pool;
+
+    if(!type || type == r_type_type)
+        pool = type_pool;
+    else
+        pool = pool_for_size(sz);
+
+    obj = alloc_from_pool(pool, vecsz); // may collect
+    obj->type = type;
+    gc_stats.obj_bytes += sz;
+
+    if(pvec)
+      *pvec = alloc_for_vec(vecsz);
+    return obj;
+}
+/*@ %def gc_alloc_vec
+
+If the caller requires some unmanaged memory (e.g. for a vector or array
+body stored out-of-line,) it will pass a non-[[NULL]] [[pvec]]; this
+will be set, on return, to an allocation of [[vecsz]] bytes. It may be
+freed (usually in the object's type's [[.ops.free]] function) by calling
+[[gc_free_vec]].
+
+==gc_free_vec*/
+void gc_free_vec(void *ptr, size_t sz)
+{
+    xfree(ptr);
+    gc_vec_bytes -= sz;
+    gc_stats.vec_bytes -= sz;
+    gc_vec_swept += sz;
+}
+/*@ %def gc_free_vec
+
+Most callers will invoke the convenience function [[gc_alloc]], since
+most objects don't require extra memory.
+
+==gc_alloc*/
+static inline void *gc_alloc(rtype_t *type, size_t sz)
+{
+    return gc_alloc_vec(type, sz, 0, NULL);
+}
+/*@ %
+
+Some global counters keep track of collector events and bytes allocated.
+
+==gc_stats_t*/
+typedef struct
+{
+    unsigned ncollect;
+    unsigned nchunks;
+    size_t obj_bytes;
+    size_t vec_bytes;
+} gc_stats_t;
+/*@ %def gc_stats_t
+
+==gc_stats*/
+static gc_stats_t gc_stats;
+/*@
+
+These are returned and zeroed with [[gc_collect_stats]].
+
+==gc_collect_stats*/
+void gc_collect_stats(gc_stats_t *stats)
+{
+    *stats = gc_stats;
+    gc_stats = (gc_stats_t) { 0 };
+}
+/*@ %def gc_collect_stats
+
+To simplify implementation, the compiler runs with garbage collection
+disabled.
+
+==interface globals*/
+static bool gc_enabled;
+static bool gc_request;
+/*@ %
+
+The collection that can be triggered by allocation is disabled with
+[[gc_set_enabled]].
+
+==gc_set_enabled*/
+void gc_set_enabled(bool enable)
+{
+    gc_enabled = enable;
+    if(!enable)
+        gc_request = false;
+}
+/*@ %def gc_set_enabled
+
+Instead of running a collection, the allocator will set the
+[[gc_request]] flag will instead. This may be inspected with
+[[gc_was_requested]].
+
+==gc_was_requested*/
+bool gc_was_requested()
+{
+    return gc_request;
+}
+/*@ %def gc_was_requested
+
+If the compiler determines an object was allocated unnecessarily, it can
+explicitly release its memory by calling [[gc_release]]. This doesn't
+modify the pool's [[.open]] page or the chunk's free list, so
+[[gc_collect]] should be called at the earliest opportunity.
+
+==gc_release*/
+void gc_release(void *ptr)
+{
+    if(ptr)
+    {
+        page_t *page = page_for_object(ptr);
+        pool_t *pool = pool_for_size(page->objsz);
+        unsigned idx = page_object_index(page, ptr);
+        assert(!object_is_free(ptr));
+        bitmap_clear_bit(page->markbits, idx);
+        page_free_object(page, ptr);
+        pool->nalloc--;
+        pool->nfree++;
+    }
+}
+/*@ %def gc_release
+
+[[gc_init]] initialises the managed heap. Each pool is initialised with
+[[pool_init]], and the [[sizepools]] array populated. Collection is
+initially disabled.
+
+==gc_init*/
+void gc_init()
+{
+    list_init(&chunk_head);
+    for(int i=0; i<NPOOLS-1; i++)
+    {
+        objsz_t sz = objwords[i] << WORDSHIFT;
+
+        pool_init(sz, &pools[i]);
+    }
+    pool_init(sizeof(rtype_t), type_pool);
+    for(int i=1, j=0; i<MAX_WORDS; i++)
+    {
+        if(i > objwords[j])
+            j++;
+        sizepools[i] = &pools[j];
+    }
+    gc_enabled = false;
+}
+/*@ %def gc_init
+
+[[gc_fini]] tears down the heap structures and releases mapped memory to
+the system.
+
+==gc_fini*/
+void gc_fini()
+{
+    chunk_t *chunk, *tmp;
+
+    for(int i=0; i<NPOOLS-1; i++)
+        pool_fini(&pools[i]);
+    pool_fini(type_pool);
+
+    list_foreach_entry_safe(&chunk_head, chunk, tmp, chunk_list)
+        chunk_free(chunk);
+}
+/*@ %def gc_fini
+
+
+\section*{Miscellanea}
+
+==includes*/
+#define HAS_VALGRIND
+//#define STRESS_GC
+#include "global.h"
+#include <errno.h>
+#include <sys/mman.h>
+#ifdef HAS_VALGRIND
+#include <valgrind/memcheck.h>
+#endif
+/*@ %
+
+==rt/gc.h*/
+//gc_root_t//
+//gc_stats_t//
+//prototypes//
+//gc_alloc//
+/*@ %
+
+==prototypes*/
+void gc_register(gc_root_t *root);
+void gc_unregister(gc_root_t *root);
+void gc_collect();
+void gc_mark(void *ptr);
+void gc_collect_stats(gc_stats_t *stats);
+void *gc_alloc_vec(rtype_t *type, size_t sz, size_t vecsz, void **pvec);
+void gc_free_vec(void *ptr, size_t vecsz);
+void gc_release(void *ptr);
+void gc_set_enabled(bool enable);
+bool gc_was_requested();
+void gc_init();
+void gc_fini();
+/*@ %
+
+%% TEMP stash, possibly for later rework
+
+%% bool gc_is_marked(robject_t *obj)
+%% {
+%%     page_t *page = page_for_object(obj);
+%%     unsigned idx = page_object_index(page, obj);
+%%     return bitmap_get_bit(page->markbits, idx);
+%% }
+
+%% #if 0
+%% // FIXME drop the 'machine word' thing, just use byte sizes?
+%% // FIXME actually pick a minimal set of size classes given the runtime objects we have
+%% // 3 ptr + 4 size_t + 1 int = rfunction_t, 8 words max
+%% // can't make the minimum just +int though, because free_obj_t needs +ptr!
+
+%% // sizes of all possible concrete runtime objects
+%% const static size_t sizes[] = { sizeof(rsymbol_t), sizeof(rstring_t), sizeof(rtype_t),
+%%     sizeof(rfunction_t), sizeof(rclosure_t), sizeof(rbuiltin_t), sizeof(rvector_t),
+%%     sizeof(rarray_t),
+%%     sizeof(robject_t) + sizeof(rboolean_t), sizeof(robject_t) + sizeof(rint_t),
+%%     sizeof(robject_t) + sizeof(rdouble_t) };
+%% // current size classes, 32-bit body words: 1, 2, 3, 5, 8
+%%
+%% bytes - check vs 64-bit
+%% bool: 5
+%% ------- illegal above, need 8 at minimum
+%% string, int: 8
+%% symbol, double: 12
+%% closure, builtin, vector: 16
+%% type, array: 24
+%% function: 36
+%%
+
+%% // 64-bit body words: 1, 2, 3, 4, 8
+%% // also with added slack.
+%% // sooo, use 4-byte words on sizeof(), and nobody cares about alignment, right??
+%%
+%% bool: 9
+%% int: 12
+%% -------
+%% string, double: 16
+%% symbol: 20
+%% closure, builtin, vector: 28
+%% type, array: 40
+%% function: 68 (4 ptr + 4 size + 1 int)
+%%
+
+%% 32-bit words total - 2, 3, 4, 6, 9
+%% 64-bit words total - 2, 3, 4, 5, 9
+
+%% // minimum viable set: rstring_t, rsymbol_t, rclosure_t, rtype_t, rfunction_t
+%% #define bodywords(t) ((sizeof(t) - sizeof(robject_t)) >> WORDSHIFT)
+%% #define MAX_WORDS (sizeof(rfunction_t) >> WORDSHIFT)
+%% static const size_t objwords[] = {
+%%     bodywords(rstring_t), bodywords(rsymbol_t), bodywords(rvector_t),
+%%     bodywords(rarray_t), bodywords(rfunction_t)
+%% };
+
+%% static void pool_sizes()
+%% {
+%%     DBG("current size classes:\n");
+%%     for(int i=0; i<lengthof(sizes); i++)
+%%         DBG("%d: %zu\n", sizes[i]);
+%% }
+%% #endif
+
+% */

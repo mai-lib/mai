@@ -1,0 +1,469 @@
+/*@
+\chapter{Live Range Analysis}
+\label{gen_range}
+
+A value is \textit{live} at every point in the program that lies between
+its definition and some subsequent use \citep{brandner11}. This module
+computes the \textit{live range} of each node in the input program. The
+values produced by two nodes can be stored in the same location if their
+live ranges do not intersect.
+
+Location allocation (\autoref{gen_loc}) takes advantage of this fact to
+reduce the size of stack frame required for each function; via processor
+cache effects, this is expected to improve run-time performance. Dead
+values of reference type may also be reclaimed more promptly by the
+garbage collector.
+
+%% the property a live range captures is that of assignment interference:
+%% given "i. a = f(b)", if b.start <= i < b.end, a can't be stored in the same location as b.
+%% (precise formulation a variation of Mossenbock & Pfeiffer '02? not an ideal example)
+==gen_range.c*/
+//includes//
+//intervals//
+//ranges//
+//cfunc_liveranges//
+/*@
+
+
+\section{Points, Intervals \& Ranges}
+\label{gen_range:int}
+
+Nodes (\autoref{ir:node}) are taken as defining program points.
+[[cfunc_rdfo]] (\autoref{ir_pre:rdfo}) has assigned to them [[.id]]
+numbers in reverse-depth-first order. % XXX more explicit?
+
+The [[range_t]] structure descrives the live range of a single
+[[.node]]. The [[.it_head]] list contains the non-contiguous intervals,
+ordered by increasing start point, within which the value produced by
+the node is live. The start of the first interval is stored in
+[[.start]]; the end of the last, in [[.end]]. When a location is
+assigned or allocated for the node, it's stored in [[.loc]].
+
+==range_t*/
+typedef struct
+{
+    cnode_t *node;
+    list_t it_head;
+    list_t range_list;
+    unsigned start, end;
+} range_t;
+/*@
+
+An [[interval_t]] structure denotes the half-open interval
+$[{}[[.start]], [[.end]])$. It's linked, through its [[.it_list]] field,
+to the [[.it_head]] of its containing range.
+
+%% \citep[Definition 2.2]{budimlic02}
+==interval_t*/
+typedef struct
+{
+    unsigned start, end;
+    list_t it_list;
+} interval_t;
+/*@
+
+==intervals*/
+//interval_covers//
+//interval_create_after//
+//interval_add//
+//interval_extend//
+/*@
+
+The [[interval_covers]] predicate returns [[true]] if and only if the
+interval [[it]] covers the given [[point]].
+
+An interval ends at the use of a value, but does not cover it -- for
+example, if [[b]] is not live beyond the assignment [[a = fn(b)]], [[a]]
+and [[b]] can occupy the same location.
+
+==interval_covers*/
+static inline bool interval_covers(interval_t *it, unsigned point)
+    { return it->start <= point && point < it->end; }
+/*@
+
+[[interval_add]] returns an interval in [[range]] that ends at or covers
+the [[point]] -- finding one which already exists, or creating and
+adding a new interval of zero length.
+% XXX explicate the delicate dance of prev
+%(when it's empty, [[&prev->it_list == &range->it_head]])
+
+==interval_add*/
+static interval_t *interval_add(range_t *range, unsigned point)
+{
+    interval_t *prev;
+
+    list_foreach_entry_reverse(&range->it_head, prev, it_list)
+    {
+        if(prev->end < point)
+            break;
+        else if(prev->start <= point)
+            return prev;
+    }
+    return interval_create_after(range, prev, point);
+}
+/*@
+
+[[interval_create_after]] constructs the interval $[$[[point]], [[point]]$)$,
+inserting it into [[range]] after the interval [[prev]]. This is chosen
+appropriately by the caller so that the [[.it_head]] list is maintained
+in sorted order.
+
+==interval_create_after*/
+static interval_t *interval_create_after(range_t *range, interval_t *prev,
+                                         unsigned point)
+{
+    interval_t *it = xmalloc(sizeof(*it));
+
+    it->start = it->end = point;
+    list_init(&it->it_list);
+    list_add(&prev->it_list, &it->it_list);
+    return it;
+}
+/*@
+
+[[interval_extend]] extends the [[range]]'s interval [[it]] backwards,
+to start at or cover [[point]]. If there is an adjacent interval
+[[prev]] in that direction, and it would overlap, the two are coalesced
+([[it]]'s removed in favour of updating [[prev]]) and the result
+returned.
+
+==interval_extend*/
+static interval_t *interval_extend(range_t *range, interval_t *it,
+                                   unsigned point)
+{
+    if(it->it_list.prev != &range->it_head)
+    {
+        interval_t *prev = list_entry(it->it_list.prev, it, it_list);
+
+        if(prev->end >= point)
+        {
+            assert(prev->start <= point);
+            prev->end = it->end;
+            list_remove(&it->it_list);
+            xfree(it);
+            return prev;
+        }
+    }
+    if(it->start > point)
+        it->start = point;
+    return it;
+}
+/*@
+
+
+\section{Live Ranges}
+\label{gen_range:range}
+
+The [[liveranges_t]] structure holds the information required for
+location allocation, as well as its results. The elements in the
+[[.ranges]] array correspond to the nodes in the function being
+compiled. They're linked, in order of increasing [[.start]] point, to
+the [[.range_head]] list.
+
+==liveranges_t*/
+typedef struct
+{
+    range_t *ranges;
+    list_t range_head;
+} liveranges_t;
+/*@
+
+The [[live]] [[range_t]] of a [[node]] is accessed via the [[range_for]]
+helper.
+
+==range_for*/
+static inline range_t *range_for(liveranges_t *live, cnode_t *node)
+    { return &live->ranges[node->id]; }
+/*@
+
+==ranges*/
+//range_covers//
+//skip_empty//
+//range_extend//
+//range_free//
+//range_extents//
+//liveranges_compute//
+//liveranges_free//
+/*@
+
+A [[point]] is covered by a [[range]] if and only it's covered by one of
+the latter's intervals.
+
+==range_covers*/
+bool range_covers(range_t *range, unsigned point)
+{
+    interval_t *it;
+
+    list_foreach_entry(&range->it_head, it, it_list)
+    {
+        if(interval_covers(it, point))
+            return true;
+        if(it->start > point)
+            return false;
+    }
+    return false;
+}
+/*@
+
+The module entry point [[cfunc_liveranges]] constructs, populates and
+returns the [[live]] ranges structure for the given function [[fn]].
+
+==cfunc_liveranges*/
+liveranges_t *cfunc_liveranges(cfunction_t *fn)
+{
+    liveranges_t *live = xmalloc(sizeof(*live));
+
+    *live = (liveranges_t) {
+        .ranges = xcalloc(fn->nnodes, sizeof(range_t))
+    };
+    list_init(&live->range_head);
+    liveranges_compute(fn, live);
+    return live;
+}
+/*@
+
+When code generation is complete, the structure is deallocated with
+[[liveranges_free]].
+
+==liveranges_free*/
+void liveranges_free(cfunction_t *fn, liveranges_t *live)
+{
+    range_t *range;
+
+    for(int i = 0; i < fn->nnodes; i++)
+    {
+        range = &live->ranges[i];
+
+        if(!list_isempty(&range->it_head))
+            range_free(range);
+    }
+    xfree(live->ranges);
+    xfree(live);
+}
+/*@
+
+Freeing a [[range]] entails freeing its consitutent intervals.
+
+==range_free*/
+static void range_free(range_t *range)
+{
+    interval_t *it, *itmp;
+
+    list_foreach_entry_safe(&range->it_head, it, itmp, it_list)
+        xfree(it);
+    //list_init(&range->it_head);
+    //list_remove(&range->range_list);
+}
+/*@
+
+
+\subsection{Path Exploration}
+\label{gen_range:path}
+
+The [[liveranges_compute]] function discovers the [[live]] ranges of the
+nodes in the function [[fn]]. They're visited in list order, which is
+the same order as their [[.id]] numbers (again, thanks to
+[[cfunc_rdfo]]).
+
+==liveranges_compute*/
+static void liveranges_compute(cfunction_t *fn, liveranges_t *live)
+{
+    cblock_t *block;
+
+    list_foreach_entry(&fn->cblock_head, block, cblock_list)
+    {
+        cnode_t *node;
+
+        list_foreach_entry(&block->cnode_head, node, cnode_list)
+        {
+            //compute range//
+        }
+    }
+}
+/*@
+
+Each [[node]] has a corresponding [[range]]. If the former doesn't
+yield a value, no further work need be done for the latter.
+
+==compute range*/
+range_t *range = range_for(live, node);
+cnode_t *user;
+
+list_init(&range->it_head);
+list_init(&range->range_list);
+if(!cnode_yields_value(node))
+    continue;
+/*@
+
+Otherwise, the live range is computed in a backwards traversal,
+beginning at each [[use]] of the node and ending at the node itself
+\citep[Section 5, Algorithm 6]{brandner11}. This is performed by
+[[range_extend]], which is passed the block from which to [[begin]],
+and an interval [[it]] which ends at the point of use.
+
+If the node is used as an argument of a [[PHI]], it is is live out of
+the corresponding predecessor block, so traversal [[begin]]s there. The
+interval [[it]] covers the [[.end]] of the block.
+
+Otherwise, the interval ends at (but does not cover) the [[use]] itself,
+and traversal [[begin]]s at its containing block.
+
+==compute range*/
+range->node = node;
+array_foreach_entry(&node->users, user)
+{
+    cblock_t *begin;
+    interval_t *it;
+
+    if(user->type == CN_PHI)
+    {
+        int i = index_of_node(&user->phi.args, node);
+        assert(i >= 0);
+        begin = skip_empty(aref(&user->block->pred, i));
+        it = interval_add(range, begin->end + 1);
+    }
+    else
+    {
+        begin = user->block;
+        it = interval_add(range, user->id);
+    }
+    range_extend(range, begin, node, it);
+}
+/*@
+
+Even if the node isn't used, its value still has to go somewhere; a
+zero-length interval is added to its range in this case.
+
+==compute range*/
+if(!cnode_is_used(node))
+    interval_add(range, node->id);
+/*@
+
+The [[.start]] and [[.end]] of the range are set by [[range_extents]].
+Since nodes are visited in order of increasing [[.id]], their ranges are
+appended to the [[.range_list]] in order also.
+
+==compute range*/
+range_extents(range);
+list_add_before(&live->range_head, &range->range_list);
+/*@
+
+Empty blocks have been inserted on critical edges
+(\autoref{ir_pre:critedge}). They hold no program points so can be
+ignored when encountered, a task performed by the [[skip_empty]] helper.
+
+==skip_empty*/
+static inline cblock_t *skip_empty(cblock_t *block)
+{
+    if(list_isempty(&block->cnode_head))
+        return aref(&block->pred, 0);
+    return block;
+}
+/*@
+
+The [[range_extend]] function walks backwards in the control-flow graph
+towards a [[node]], growing its live [[range]] along the way. The
+interval [[it]] ends at or covers the end of the [[block]] being
+processed.
+
+This is based on the algorithm described in \citet[Section
+  5.2]{brandner11} adapted to operate on live ranges instead of live
+sets, in a similar vein to \citet[Section 4.4]{mossenbock02}.
+
+==range_extend*/
+static void range_extend(range_t *range, cblock_t *block, cnode_t *node,
+                         interval_t *it)
+{
+    unsigned point;
+    cblock_t *pred;
+
+    //extend range//
+}
+/*@
+
+If the [[node]] is defined in this [[block]], it provides the target
+program [[point]]. Otherwise the traversal will continue upwards, so the
+target [[point]] is given by the block [[.start]] -- this is also the
+case if it's a [[PHI]] node, as the result of a $\phi$-function is live
+into its containing block \citep[Section 4]{brandner11}.
+
+==extend range*/
+if(node->block == block && node->type != CN_PHI)
+    point = node->id;
+else
+    point = block->start;
+/*@
+
+If continuing up this path won't extend the interval, it's already been
+covered by another invocation, so this one is done.
+
+==extend range*/
+if(interval_covers(it, point))
+    return;
+/*@
+
+The interval is extended backward to cover the target point.
+
+==extend range*/
+interval_extend(range, it, point);
+/*@
+
+If the definition has been reached, the traversal is complete.
+
+==extend range*/
+if(node->block == block)
+    return;
+/*@
+
+Otherwise, each [[pred]]ecessor of the [[block]] is recursively
+traversed with an interval covering its [[.end]].
+
+==extend range*/
+array_foreach_entry(&block->pred, pred)
+{
+    pred = skip_empty(pred);
+    it = interval_add(range, pred->end + 1);
+    range_extend(range, pred, node, it);
+}
+/*@
+
+The [[range_extents]] helper sets the overall extrema of the [[range]].
+[[first]] and [[last]] may be the same interval.
+
+==range_extents*/
+static void range_extents(range_t *range)
+{
+    interval_t *first = NULL, *last = NULL;
+
+    assert(!list_isempty(&range->it_head));
+    first = list_entry(range->it_head.next, first, it_list);
+    last = list_entry(range->it_head.prev, last, it_list);
+    range->start = first->start;
+    range->end = last->end;
+    assert(range->start <= range->end);
+}
+/*@
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+#include "ir.h"
+#include "gen.h"
+#include "gen_range.h"
+/*@
+
+==gen_range.h*/
+//interval_t//
+//range_t//
+//liveranges_t//
+//range_for//
+bool range_covers(range_t *range, unsigned point);
+void liveranges_free(cfunction_t *fn, liveranges_t *live);
+liveranges_t *cfunc_liveranges(cfunction_t *fn);
+op_stack_t *gen_locations(cfunction_t *fn, liveranges_t *live,
+                          op_offset_t *pscalsz, op_offset_t *psz); // HACK
+/*@
+
+% */

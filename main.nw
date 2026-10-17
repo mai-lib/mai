@@ -1,0 +1,328 @@
+/*@
+\chapter{Executable}
+\label{main}
+
+The system, composed of a compiler and run-time support module, is
+realised as a single monolithic executable (modulo the usual
+dynamically-loaded platform libraries such as the \texttt{libc}.)
+
+==main.c*/
+//includes//
+//execute//
+//evaluate//
+//source//
+//load//
+//readline//
+//init_default//
+//init_name//
+//load_init//
+//repl//
+//usage//
+//main//
+/*@
+
+Depending how the main executable is invoked, the system runs in one of
+two modes, \textit{batch} or \textit{interactive}.
+
+The \textit{runtime} subsystem (\autoref{rt}) is initialised before
+anything else; parts of its functionality are used extensively by the
+compiler itself.
+
+==main*/
+int main(int argc, char *argv[])
+{
+    runtime_init();
+    if(argc == 1)
+        repl();
+    else if(argc == 2 && argv[1][0] != '-')
+        load(argv[1], true);
+    else
+        usage(argv[0]);
+    runtime_fini();
+    return 0;
+}
+/*@
+
+If neither mode is applicable (perhaps the user has asked for
+[[--help]],) a usage hint is printed.
+
+==usage*/
+static void usage(char *name)
+{
+    fprintf(stderr, "usage:\t%s [file]\n", name);
+    fprintf(stderr, "\tif file is not specified, INITFILE (default %s) is\n"
+            "\tloaded if it exists, and the REPL is entered.\n", init_name());
+    exit(-1);
+}
+/*@
+
+
+\section{Batch}
+
+In this mode, the system loads the given file and prints the result.
+
+==load*/
+static void load(char *filename, bool print)
+{
+    evaluate(source(filename), print);
+}
+/*@ %
+
+[[source]] reads and parses a file to an \textit{abstract syntax tree},
+[[compile]]s it to a callable [[rclosure_t]], and returns the result.
+[[c_begin]] and [[c_end]] delimit the lifetime of the compiler; the
+latter also prints any errors or warnings encountered.
+
+==source*/
+rclosure_t *source(char *filename)
+{
+    int r;
+    rclosure_t *cl = NULL;
+    ast_t ast;
+
+    c_begin();
+    r = p_source(filename, &ast);
+    if(r == 0)
+        cl = compile(&ast, filename);
+    else if(r < 0)
+        c_error("sourcing %s - %s", filename, strerror(errno));
+    c_end();
+    return cl;
+}
+/*@
+
+
+\section{Interactive}
+
+Interactive use is ideal for exploratory data analysis. Each iteration
+of the \textit{read-evaluate-print loop} accepts an expression from the
+user. It's parsed, compiled, evaluated, and its result printed.
+%FIXME get a citation for interactivity??
+
+Before entry, the \textit{init file}, if present, is loaded, and the
+\texttt{readline} library is initialised.
+
+==repl*/
+static void repl()
+{
+    ast_t ast;
+    int status;
+
+    load_init();
+    readline_init();
+    c_begin();
+    while((status = p_readline("> ", "+ ", &ast)) != -1)
+    {
+        rclosure_t *cl = NULL;
+        if(status == 0)
+            cl = compile(&ast, NULL);
+        c_end();
+        evaluate(cl, true);
+        c_begin();
+    }
+    c_end();
+    putchar('\n');
+}
+/*@
+
+
+\section{Evaluation}
+
+Successfully executing a closure results in an object -- the value
+computed by the compiled expression. The runtime function [[r_print]]
+can then be used to output its printed representation, if requested. If
+an error occurs during execution, an error string is returned which
+needs [[free]]ing after printing.
+
+==evaluate*/
+static void evaluate(rclosure_t *cl, bool print)
+{
+    void *res = NULL;
+
+    if(!cl)
+        return;
+    if(execute(cl, &res))
+    {
+        putchar('\n');
+        printf("%s", (char *)res);
+        xfree(res);
+    }
+    else if(print)
+    {
+        putchar('\n');
+        r_print(stdout, res);
+    }
+    putchar('\n');
+}
+/*@
+
+The \textit{virtual machine} is responsible for execution of compiled
+code. A [[vm_ctx_t]] context is initialised, passing the address and
+size of storage for the temporary stack. The VM (unlike the compiler)
+interoperates with the garbage collector, so the latter is enabled over
+its lifetime.
+
+==execute*/
+uint8_t stack[65536];
+static int execute(rclosure_t *cl, void **pres)
+{
+    vm_ctx_t ctx;
+
+    vm_init_ctx(&ctx, stack, sizeof(stack));
+    gc_set_enabled(true);
+    if(vm_execute(&ctx, cl) == 0 && pres)
+        *pres = ctx.ret_val;
+    vm_fini_ctx(&ctx);
+    gc_set_enabled(false);
+    if(ctx.err_msg)
+    {
+        if(pres)
+            *pres = ctx.err_msg;
+        else
+            xfree(ctx.err_msg);
+        return -1;
+    }
+    return 0;
+}
+/*@
+
+
+\section{Init File}
+
+Users may want to enrich the global environment with their own code.
+They can create an init file which includes these additions. Its
+existence is checked so [[source]] won't issue an error should it be
+absent.
+
+==load_init*/
+static void load_init()
+{
+    char *name = init_name();
+    struct stat sbuf;
+
+    if(stat(name, &sbuf) != 0)
+        return;
+    load(name, false);
+}
+/*@
+
+If the [[INITFILE]] environment variable is set, it specifies the file
+to (attempt to) load in lieu of the default.
+
+==init_name*/
+static const char *initvar = "INITFILE";
+static char *init_name()
+{
+    char *name = getenv(initvar);
+    return name ? name : init_default();
+}
+/*@
+
+This is named ``[[.maininit]]'', in the user's home directory (in the
+unlikely case of running outside a [[login]] session, the current
+directory is used instead.)
+
+==init_default*/
+static const char *initname = ".maininit";
+static inline char *init_default()
+{
+    static char buf[PATH_MAX];
+    char *base = getenv("HOME");
+
+    if(!base)
+        base = ".";
+    snprintf(buf, PATH_MAX, "%s/%s", base, initname);
+    return buf;
+}
+/*@
+
+
+\section{Readline}
+
+The interactive mode integrates the GNU \texttt{readline} library for
+line editing, command history and symbol completion.
+%cite GNU readline
+
+At the prompt, pressing the ``[[TAB]]'' key (by default) will print a
+list of possible completions for the identifier at the point. This list
+is populated with the names of the variables in the global environment
+\autoref{rt:global}.
+
+==readline*/
+//compl_ctx_t//
+//completions//
+//complete_global//
+//readline_init//
+/*@
+
+==readline_init*/
+#define HISTORY_MAX 500
+void readline_init()
+{
+    rl_initialize();
+    rl_completion_entry_function = complete_global;
+    rl_completer_quote_characters = "'`";
+    rl_completer_word_break_characters = " \t\n;(,)+-*/:<>={}[]";
+    using_history();
+    stifle_history(HISTORY_MAX);
+}
+/*@
+
+==compl_ctx_t*/
+typedef struct
+{
+    const char *text;
+    int len;
+    ARRAY(char *) strs;
+} compl_ctx_t;
+/*@
+
+==complete_global*/
+static char *complete_global(const char *text, int state)
+{
+    static int cur;
+    static compl_ctx_t ctx;
+
+    if(!state)
+    {
+        ctx = (compl_ctx_t) { text, strlen(text) };
+        array_init(&ctx.strs, 1);
+        hashmap_map(r_globals, completions, &ctx);
+        cur = 0;
+    }
+    else
+        cur++;
+    if(cur >= alen(&ctx.strs))
+    {
+        array_fini(&ctx.strs);
+        return NULL;
+    }
+    rl_completion_suppress_append = true;
+    return strdup(aref(&ctx.strs, cur));
+}
+/*@
+
+==completions*/
+static void completions(const void *key, void *value, void *ptr)
+{
+    compl_ctx_t *ctx = ptr;
+    const rsymbol_t *name = key;
+    char *str = name->string;
+
+    if(!strncmp(str, ctx->text, ctx->len))
+        array_push(&ctx->strs, str);
+}
+/*@
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+#include "ir.h"
+#include "ast.h"
+#include <errno.h>
+#include <sys/stat.h>
+#include <readline/readline.h>
+#include <readline/history.h>
+/*@

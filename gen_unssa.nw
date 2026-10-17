@@ -1,0 +1,302 @@
+/*@
+\chapter{SSA Form Destruction}
+\label{gen_unssa}
+
+The $\phi$-functions of static single assignment form are not part of
+the VM instruction set. They are removed, before generating code, by
+inserting copies \citep[Section 7]{cytron91}.
+
+==gen_unssa.c*/
+//includes//
+//make_copy//
+//mapelt_t//
+//schedmap_t//
+//map_get//
+//map_init//
+//schedule_init//
+//schedule_ready//
+//schedule_todo//
+//schedule_copies//
+//gen_un_ssa//
+/*@
+
+This is performed by the [[gen_un_ssa]] function, corresponding to
+\citet[Figure 7]{wimmer10}, or the first part of \citet[Figure 14,
+  ``Pass One'']{briggs98}.
+
+For each [[block]] in function [[fn]], each [[PHI]] [[node]] in each
+successor [[succ]] is considered.
+
+==gen_un_ssa*/
+void gen_un_ssa(cfunction_t *fn, op_offset_t temploc)
+{
+    cblock_t *block;
+    list_t copies = LIST_INIT(copies);
+
+    list_foreach_entry(&fn->cblock_head, block, cblock_list)
+    {
+        gen_block_t *rec = rec_for(block);
+        int i, ncopies = 0;
+
+        rec->copies = (list_t) LIST_INIT(rec->copies);
+        array_foreach(&block->succ, i)
+        {
+            cblock_t *succ = aref(&block->succ, i);
+            int j = index_of_block(&succ->pred, block);
+            cnode_t *node;
+
+            list_foreach_entry(&succ->cnode_head, node, cnode_list)
+            {
+                if(node->type != CN_PHI)
+                    break;
+                //copy for phi arg//
+            }
+        }
+        //schedule copies//
+    }
+}
+/*@
+
+The argument [[arg]] corresponds to the value of the [[PHI]] when
+control-flow enters [[succ]] from [[block]]. Locations on the VM stack
+have been allocated to each node (\autoref{gen_loc}). If the argument
+and the [[PHI]] itself were given different locations, a [[copy]] from
+the former to the latter is required.
+
+==copy for phi arg*/
+cnode_t *arg = aref(&node->phi.args, j);
+op_stack_t dest = loc_for(node), src = loc_for(arg);
+
+if(src != dest)
+{
+    gen_copy_t *copy = make_copy(dest, src, decl_type(node->decl));
+
+    list_add(&copies, &copy->list);
+    ncopies++;
+}
+/*@
+
+These [[copies]], performed in parallel, faithfully implement the
+semantics of the $\phi$-function, avoiding the ``swap problem'' of
+\citet[Subsection 5.1]{briggs98}. The ``lost-copy problem'' does not
+occur, as critical edges have been split.
+
+[[schedule_copies]] finds an equivalent sequential ordering for the
+copies, possibly requiring an additional temporary location [[temploc]].
+Its output is placed in the [[.copies]] field of the [[block]]'s record
+[[rec]], for use during code generation (\autoref{gen_code:code}).
+
+==schedule copies*/
+if(ncopies > 0)
+    schedule_copies(temploc, &copies, ncopies, &rec->copies);
+/*@
+
+The [[make_copy]] helper creates and returns a request to [[copy]] a
+value of certain [[type]] between the given locations.
+
+==make_copy*/
+static gen_copy_t *make_copy(op_stack_t dest, op_stack_t src, rtype_t *type)
+{
+    gen_copy_t *copy = xmalloc(sizeof(*copy));
+
+    *copy = (gen_copy_t) {
+        .dest = dest,
+        .src = src,
+        .type = type
+    };
+    return copy;
+}
+/*@
+
+\section{Copy Scheduling}
+
+The [[schedmap_t]] structure subsumes the loc and pred arrays of
+\citet[Algorithm 1]{boissinot08}, as stack locations are sparse. It
+could be replaced with a hash table or equivalent container with
+sublinear access time, if large numbers of entries are expected.
+
+==schedmap_t*/
+typedef struct {
+    int nelts;
+    mapelt_t *elts;
+} schedmap_t;
+/*@
+
+The [[mapelt_t]] entry with [[.el]] equal to $k$ stores loc($k$) in its
+[[.loc]] field. Its [[.pred]] field references the (unique) copy with
+[[.dest]] equal to pred($k$).
+
+==mapelt_t*/
+typedef struct {
+    op_stack_t el, loc;
+    gen_copy_t *pred;
+} mapelt_t;
+/*@
+
+The [[map_get]] helper returns the [[map]] element [[elt]] corresponding
+to the stack location [[el]].
+
+==map_get*/
+static inline mapelt_t *map_get(schedmap_t *map, op_stack_t el)
+{
+    for(int i = 0; i < map->nelts; i++)
+    {
+        mapelt_t *elt = &map->elts[i];
+        if(elt->el == el)
+            return elt;
+    }
+    return NULL;
+}
+/*@
+
+The [[map_init]] helper specifies that the initial location of [[map]]
+element [[i]] is at stack location [[el]].
+
+==map_init*/
+static inline void map_init(schedmap_t *map, int i, op_stack_t el)
+{
+    map->elts[i].el = el;
+    map->elts[i].loc = el;
+}
+/*@
+
+[[schedule_copies]] sequentializes the copies on the [[in]]put list,
+possibly with additional copies via [[temploc]]. The [[map]] contains
+one element per copy, and one for the temporary. A copy yet to be
+scheduled is linked into one of the [[ready]] and [[todo]] lists (a
+difference from algorithm 1, where it can appear on both.)
+
+After these are populated by [[schedule_init]] (algorithm 1, lines 1-9),
+the loops repeat until all copies have been moved to the [[out]]put list
+-- unblocked copies from the [[ready]] list by [[schedule_ready]] (lines
+12-16), and blocked ones from [[todo]] by [[schedule_todo]] (lines
+17-21).
+
+==schedule_copies*/
+static void schedule_copies(op_offset_t temploc, list_t *in, unsigned ncopies,
+                            list_t *out)
+{
+    list_t ready = LIST_INIT(ready), todo = LIST_INIT(todo);
+    schedmap_t map = {
+        .nelts = ncopies + 1,
+        .elts = xcalloc(ncopies + 1, sizeof(mapelt_t))
+    };
+
+    schedule_init(in, temploc, &map, &ready, &todo);
+    while(!list_isempty(&ready) || !list_isempty(&todo))
+    {
+        while(!list_isempty(&ready))
+            schedule_ready(container_of(ready.next, gen_copy_t, list),
+                           out, &map, &ready);
+        if(!list_isempty(&todo))
+            schedule_todo(container_of(todo.next, gen_copy_t, list),
+                          temploc, out, &map, &ready);
+    }
+    xfree(map.elts);
+}
+/*@
+
+[[schedule_init]] begins by adding an element to the [[map]] for each
+copy in the [[in]]put, and for the temporary.
+
+If the [[.dest]] of some [[copy]] coincides with the [[.src]] of
+another, the former is \textit{blocked} -- it must wait for the latter
+to copy the value at that location away before it can safely execute.
+The blocked copy is recorded in the [[.pred]] field of the element at
+[[.dest]], and is linked into the deferred [[todo]] list.
+
+An unblocked copy may be scheduled immediately, and is linked into the
+[[ready]] list.
+
+==schedule_init*/
+static inline void schedule_init(list_t *in, op_stack_t temploc, schedmap_t *map,
+                                 list_t *ready, list_t *todo)
+{
+    gen_copy_t *copy, *tmp;
+    int i = 0;
+
+    list_foreach_entry(in, copy, list)
+        map_init(map, i++, copy->src);
+    map_init(map, i, temploc);
+
+    list_foreach_entry_safe(in, copy, tmp, list)
+    {
+        mapelt_t *elt = map_get(map, copy->dest);
+
+        if(elt)
+        {
+            elt->pred = copy;
+            list_remove(&copy->list);
+            list_add(todo, &copy->list);
+        }
+        else
+        {
+            list_remove(&copy->list);
+            list_add(ready, &copy->list);
+        }
+    }
+}
+/*@
+
+A [[copy]] from the [[ready]] list is moved to the [[out]]put by
+[[schedule_ready]]. The [[map]] element [[elt]] for the copy's [[.src]]
+location is examined. If the value is still there, blocking another copy
+[[.pred]], the latter can now be made [[ready]]. The fields of copy and
+element are updated -- the value which began at [[.src]] has been
+copied, possibly via [[.loc]], to [[.dest]].
+
+==schedule_ready*/
+static void schedule_ready(gen_copy_t *copy, list_t *out, schedmap_t *map,
+                           list_t *ready)
+{
+    mapelt_t *elt = map_get(map, copy->src);
+
+    list_remove(&copy->list);
+    list_add_before(out, &copy->list);
+    if(copy->src == elt->loc && elt->pred)
+    {
+        list_remove(&elt->pred->list);
+        list_add(ready, &elt->pred->list);
+    }
+    copy->src = elt->loc;
+    elt->loc = copy->dest;
+}
+/*@
+
+A [[copy]] which remains on the [[todo]] list belongs to a cycle of
+blocked copies. Adding a copy from [[.src]] to a temporary location
+[[temploc]] breaks the cycle. The corresponding [[map]] element [[elt]]
+has its [[.loc]] field updated to reflect the value's new location. Now
+unblocked, the [[.pred]]ecessor copy can be made [[ready]]. The [[copy]]
+itself will be handled after it's unblocked in [[schedule_ready]].
+
+==schedule_todo*/
+static void schedule_todo(gen_copy_t *copy, op_offset_t temploc, list_t *out,
+                          schedmap_t *map, list_t *ready)
+{
+    mapelt_t *elt = map_get(map, copy->src);
+    gen_copy_t *tempcopy = make_copy(temploc, copy->src, copy->type);
+
+    elt->loc = temploc;
+    list_add_before(out, &tempcopy->list);
+    list_remove(&elt->pred->list);
+    list_add(ready, &elt->pred->list);
+    list_remove(&copy->list);
+}
+/*@
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+#include "ir.h"
+#include "gen.h"
+// for gen_code.h
+#include "vm/vm_ops.h"
+// for the globals and loc_for/rec_for
+#include "gen_code.h"
+/*@
+
+
+%*/

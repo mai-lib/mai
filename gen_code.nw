@@ -1,0 +1,1176 @@
+/*@
+\chapter{Code Generation}
+\label{gen_code}
+
+The compiler's execution target is a \textit{virtual machine}
+(\autoref{vm}) that interprets \textit{bytecode} instructions. The
+\textit{code generation} subsystem assigns storage locations to the
+values computed in the input program, inserts copies to replace the
+$\phi$-functions of SSA form, and creates a runtime object containing
+the generated instruction stream.
+
+==gen_code.c*/
+//includes//
+//context//
+//type_for//
+//control flow//
+//nodes//
+//blocks//
+//closure_env//
+//gen_child_function//
+//gen_function//
+/*@
+
+
+\section{Entry Point}
+
+The subsystem entry point [[gen_function]] mediates between compiler and
+runtime, creating an [[rfunction_t]] (\autoref{callable:func}) from a
+[[cfunction_t]] (\autoref{ir:func}).
+
+The [[live]] ranges of the nodes in the function [[fn]], computed by
+[[cfunc_liveranges]] (\autoref{gen_range}), are needed as input by
+[[gen_locations]] (\autoref{gen_loc}), which allocates to each node a
+specific location in the locals area of the VM stack frame to hold the
+value it computes. [[loc_scalsz]] and [[loc_sz]] receive the number of
+bytes occupied by scalar values, and all local values, respectively.
+
+If the function captures any lexical values (\autoref{ir_pre:closure}),
+they're assigned locations in the closure's environment by
+[[closure_env]]. Similarly, [[env_scalsz]] and [[env_sz]] receive the
+number of bytes taken by captured scalars and all captured values.
+
+The [[consts]] array is initialised; it will serve as the function's
+constant pool. The call to [[gen_code]] returns a buffer containing
+bytecode instructions, generated from the function's body.
+
+Passing these results to [[rfunc_create]] yields the runtime object
+[[rfn]], which is returned after recursing to child functions, storing
+the generated objects at their reserved indices in the constant pool.
+
+==gen_function*/
+rfunction_t *gen_function(cfunction_t *fn)
+{
+    liveranges_t *live = cfunc_liveranges(fn);
+    op_offset_t loc_scalsz = 0, loc_sz = 0;
+    op_stack_t *locs = gen_locations(fn, live, &loc_scalsz, &loc_sz);
+    op_offset_t env_scalsz = 0, env_sz = 0;
+    op_offset_t *env_ofs = !cfunc_has_closure(fn) ? NULL
+                         : closure_env(fn, &env_scalsz, &env_sz);
+    robject_array_t consts = ARRAY_INIT;
+    op_code_t *code = gen_code(fn, locs, loc_sz, env_ofs, &consts);
+    rfunction_t *rfn = rfunc_create(fn->cl_type, code, loc_scalsz, loc_sz,
+                                    env_scalsz, env_sz, &consts);
+    cfunction_t *child;
+
+    list_foreach_entry(&fn->cfunc_head, child, cfunc_list)
+        rfn->consts[child->id] = gen_child_function(child);
+    return rfn;
+}
+/*@
+
+If the closure of the [[child]] function doesn't capture any values,
+[[gen_child_function]] can create the [[rclosure_t]] ahead of time. The
+bytecode of the parent will refer to it with a [[const]] instruction
+instead of a [[lambda]]. Since each [[cfunction_t]] is one-to-one with
+its defining [[LAMBDA]] node, there's no unnecessary duplication.
+
+==gen_child_function*/
+rfunction_t *gen_function(cfunction_t *fn);
+static robject_t *gen_child_function(cfunction_t *child)
+{
+    rfunction_t *rfn = gen_function(child);
+
+    if(cfunc_has_closure(child))
+        return (robject_t *)rfn;
+    return (robject_t *)rcall_closure_create(rfn->cl_type, rfn);
+}
+/*@
+
+
+\subsection{Closure Environment}
+\label{gen_code:env}
+
+Each element of the [[ofs]] array records the byte offset in the
+closure's [[.env]] buffer of the corresponding value from the [[LAMBDA]]
+node's [[.closure]] array.
+
+Values are stored in a closure environment (\autoref{callable:closure})
+segregated by type. The first iteration of the outer loop operates on
+scalar values; the second, on pointers.
+
+Offsets are assigned to values in this two-phase traversal, [[*pscalsz]]
+and [[*psz]] receive the sizes of the two classes, and [[ofs]] is
+returned.
+
+==closure_env*/
+static op_offset_t *closure_env(cfunction_t *fn, op_offset_t *pscalsz,
+                                op_offset_t *psz)
+{
+    op_offset_t *ofs = xcalloc(alen(&fn->closure), sizeof(*ofs));
+    op_offset_t sz = 0;
+
+    for(int j = 0; j <= 1; j++)
+    {
+        int i;
+
+        array_foreach(&fn->closure, i)
+        {
+            cnode_t *val = aref(&fn->node->lambda.closure, i);
+            rtype_t *typ = type_for(val);
+
+            if(j == rtype_is_scalar(typ))
+                continue;
+            ofs[i] = sz;
+            sz += rtype_eltsz(typ);
+        }
+        if(j == 0)
+            *pscalsz = sz;
+        else
+            *psz = sz;
+    }
+    return ofs;
+}
+/*@
+
+
+\section{Context}
+\label{gen_code:ctx}
+
+Code generation state for the current function is kept in a
+[[gen_ctx_t]] context structure.
+
+The [[.code]] buffer contains the bytecode generated so far. Each
+element of the [[.records]] array corresponds to a block in the
+function.
+
+[[.locs]], [[.loc_sz]], [[.env_ofs]] and [[.consts]] retain the
+corresponding arguments of [[gen_code]]; [[.nfuncs]] and [[.closure]],
+the corresponding fields of the [[cfunction_t]] being processed.
+
+==gen_ctx_t*/
+typedef struct
+{
+    op_code_array_t code;
+    gen_block_t *records;
+    op_stack_t *locs;
+    op_offset_t loc_sz;
+    op_offset_t *env_ofs;
+    robject_array_t *consts;
+    unsigned nfuncs;
+    cvar_array_t *closure;
+} gen_ctx_t;
+/*@
+
+The context is global to the subsystem (although only one other module
+needs access.)
+
+==context*/
+gen_ctx_t ctx;
+/*@
+
+A [[gen_block_t]] structure tracks state for a single basic block. An
+instruction is addressed with a byte offset into the code buffer. When
+generating bytecode for a block, the address of its first instruction is
+stored in the [[.addr]] field and the [[.valid]] flag is set.
+
+If a previous control-flow instruction required this address, it will
+have appended the address of its relevant operand to the list of
+[[.fixups]]. These are patched when the block's address is determined.
+
+After generating code for a block, the [[.copies]] required by SSA
+deconstruction are appended, in list order.
+
+==gen_block_t*/
+typedef struct
+{
+    op_offset_t addr;
+    bool valid;
+    list_t copies;
+    SLIST(gen_fixup_t) fixups;
+} gen_block_t;
+/*@
+
+The [[gen_fixup_t]] structure requests that the bytecode at [[.addr]] be
+overwritten with the start address of the owning block.
+
+==gen_fixup_t*/
+typedef struct gen_fixup
+{
+    SLIST(struct gen_fixup) next;
+    op_offset_t addr;
+} gen_fixup_t;
+/*@
+
+The [[gen_copy_t]] structure requests that a [[mov]] instruction be
+generated to copy a value of given [[.type]] from the stack location
+[[.src]] to [[.dest]].
+
+==gen_copy_t*/
+typedef struct gen_copy
+{
+    list_t list;
+    op_stack_t dest, src;
+    rtype_t *type;
+} gen_copy_t;
+/*@
+
+Records of blocks, and stack locations of nodes, are accessed via the
+[[rec_for]] and [[loc_for]] helpers respectively.
+
+==context helpers*/
+static inline gen_block_t *rec_for(cblock_t *block)
+    { return &ctx.records[block->id]; }
+static inline op_stack_t loc_for(cnode_t *node)
+    { return ctx.locs[node->id]; }
+/*@
+
+The [[type_for]] helper returns the statically determined type of the
+[[node]]; or [[object]], for those which are neither declared or
+inferred.
+
+==type_for*/
+static inline rtype_t *type_for(cnode_t *node)
+    { return decl_type(node->decl); }
+/*@
+
+
+\section{Assembly}
+\label{gen_code:asm}
+
+A set of helper functions are used to write and modify bytecode during
+generation. [[asm_extend]] grows the bytecode buffer to encompass an
+additional [[sz]] bytes, returning a pointer to the start of the
+appended block.
+
+==asm_extend*/
+static inline uint8_t *asm_extend(size_t sz)
+{
+    size_t len = asm_len();
+    return array_extend(&ctx.code, sz) + len;
+}
+/*@
+
+[[asm_literal]] appends the [[sz]] bytes from memory referenced by [[ptr]].
+
+==asm_literal*/
+static inline void asm_literal(void *ptr, size_t sz)
+{
+    uint8_t *dest = asm_extend(sz);
+    memcpy(dest, ptr, sz);
+}
+/*@
+
+[[asm_op]] looks up an opcode in the direct-threading jump table
+(\autoref{vm:exec}) and appends the address it finds there to the
+bytecode buffer. [[asm_subop]] appends an opcode directly.
+
+==asm_op*/
+static inline void asm_subop(op_code_t v)
+{
+    *(asm_extend(sizeof(op_code_t))) = v;
+}
+static inline void asm_op(op_code_t v)
+{
+    *(const void **)(asm_extend(sizeof(vm_instr_t))) = vm_instr[v];
+}
+/*@
+
+Some opcodes are grouped by operand width (\autoref{vm:ops}).
+[[asm_op_width]] appends the instruction, with base opcode [[op]],
+applicable to values the same size as those of [[type]].
+
+==asm_op_width*/
+static inline void asm_op_width(op_code_t op, rtype_t *type)
+    { asm_op(op + op_width_ofs[width_code(type)]); }
+/*@
+
+The [[width_code]] helper returns an index representing the [[type]]'s
+size.
+
+==width_code*/
+static inline int width_code(rtype_t *type)
+{
+    switch(rtype_eltsz(type))
+    {
+    case 1: return 0;
+    case 4: return 1;
+    case 8: return 2;
+    default: return -1;
+    } /* NOTREACHED */
+}
+/*@
+
+Other opcodes are grouped by operand type. [[asm_op_type]] appends the
+instruction, with base opcode [[op]], applicable to values of the
+given scalar [[type]].
+
+==asm_op_type*/
+static inline void asm_op_type(op_code_t op, rtype_t *type)
+    { assert(rtype_is_scalar(type)); asm_op(op + op_type_ofs[rscal_code(type)]); }
+/*@
+
+The conversion opcodes are grouped by both source type and destination
+type. [[asm_op_conv]] appends the appropriate opcode to convert from a
+value of [[stype]] to a value of [[dtype]].
+
+==asm_op_conv*/
+static inline void asm_op_conv(rtype_t *stype, rtype_t *dtype)
+{
+    assert(rtype_is_scalar(stype) && rtype_is_scalar(dtype));
+    scalar_code scode = rscal_code(stype), dcode = rscal_code(dtype);
+    scalar_code rcode = scode * (SC_MAX-1) + dcode - (scode < dcode);
+    asm_op(op_conv_ofs + rcode);
+}
+/*@
+
+[[asm_stack]] appends an operand containing a signed stack location.
+This will typically be interpreted relative to the VM's base pointer,
+and specify the location allocated to hold the value computed by a node.
+
+==asm_stack*/
+static inline void asm_stack(op_stack_t v)
+{
+    *(op_stack_t *)(asm_extend(sizeof(v))) = v;
+}
+/*@
+
+[[asm_offset]] appends an operand containing an unsigned offset. These
+are used to index into the constant pool or the closed environment, or
+to specify a bytecode address within a function.
+
+==asm_offset*/
+static inline void asm_offset(op_stack_t v)
+{
+    *(op_offset_t *)(asm_extend(sizeof(v))) = v;
+}
+/*@
+
+[[asm_args]] appends the stack location of each node [[arg]] in the
+[[args]] array; a convenience for the [[.generate_fn]] callback of
+certain builtin functions (\autoref{opt:builtin}).
+
+==asm_args*/
+static inline void asm_args(cnode_array_t *args)
+{
+    cnode_t *arg;
+    array_foreach_entry(args, arg)
+        asm_stack(loc_for(arg));
+}
+/*@
+
+[[asm_patch]] writes the relative address [[addr]] to the bytecode
+buffer at offset [[dest]].
+
+==asm_patch*/
+static inline void asm_patch(op_offset_t addr, op_offset_t dest)
+    { *(op_offset_t *)(ctx.code.ptr + addr) = dest; }
+/*@
+
+[[asm_len]] returns the buffer's current length.
+
+==asm_len*/
+static inline size_t asm_len()
+    { return alen(&ctx.code); }
+/*@
+
+
+\section{Blocks}
+\label{gen_code:code}
+
+%% XXX something in here?
+
+==blocks*/
+//gen_copies//
+//gen_fixups//
+//gen_block//
+//gen_code//
+/*@
+
+The [[gen_code]] function allocates and populates a buffer with the
+bytecode instructions generated for the body of the function [[fn]].
+
+The first [[.nfuncs]] elements of the [[consts]] array are reserved for
+the corresponding child functions, and will be filled later by
+[[gen_function]].
+
+After the context is initialised, the function is taken out of SSA form
+by [[gen_un_ssa]], which realises each [[PHI]] node as a sequence of
+copies (\autoref{gen_unssa}). It may require a temporary location --
+this is outside the local area of the stack frame, at offset [[loc_sz]]
+(and isn't tracked by the garbage collector, but is safe nonetheless,
+since the copies are always [[mov]]s that don't allocate.)
+
+Prerequisites now established, each [[block]] is processed by
+[[gen_block]], starting at the function [[.entry]] and continuing in
+reverse-depth-first order (as imposed by [[cfunc_rdfo]]).
+
+Temporaries and inputs are deallocated, the bytecode buffer is shrunk to
+size and its contents returned. The [[consts]] array has also been
+populated with the unique values used by the [[CONST]] instructions
+within.
+
+==gen_code*/
+static op_code_t *gen_code(cfunction_t *fn, op_stack_t *locs,
+                           op_offset_t loc_sz, op_offset_t *env_ofs,
+                           robject_array_t *consts)
+{
+    cblock_t *block;
+
+    array_resize(consts, fn->nfuncs);
+    ctx = (gen_ctx_t) {
+        .code = ARRAY_INIT,
+        .locs = locs,
+        .records = xcalloc(fn->nblocks, sizeof(gen_block_t)),
+        .consts = consts,
+        .nfuncs = fn->nfuncs,
+        .closure = &fn->closure,
+        .loc_sz = loc_sz,
+        .env_ofs = env_ofs
+    };
+    gen_un_ssa(fn, loc_sz);
+    list_foreach_entry(&fn->cblock_head, block, cblock_list)
+        gen_block(block);
+    xfree(ctx.records);
+    xfree(locs);
+    if(env_ofs)
+        xfree(env_ofs);
+
+    if(opt.dbg_dump_ir)
+        asm_dump(fn, &ctx.code, consts);
+
+    return array_cede(&ctx.code);
+}
+/*@
+
+[[gen_block]] generates bytecode instructions for a single [[block]].
+The start address [[addr]] is recorded in the block's record [[rec]],
+the latter being flagged [[.valid]]. Forward references in earlier code
+can now be patched by [[gen_fixups]].
+
+Each [[node]] in the block is processed by [[gen_node]] in control-flow
+order, after which [[gen_copies]] appends the copies that [[gen_un_ssa]]
+requested. If control flow [[fall]]s through the end of the block, a
+transfer to the next is generated by [[gen_jump]].
+
+==gen_block*/
+static void gen_block(cblock_t *block)
+{
+    op_offset_t addr = asm_len();
+    gen_block_t *rec = rec_for(block);
+    bool fall = true;
+    cnode_t *node;
+
+    rec->addr = addr;
+    rec->valid = true;
+    gen_fixups(rec);
+    list_foreach_entry(&block->cnode_head, node, cnode_list)
+    {
+        assert(fall);
+        fall = gen_node(block, node);
+    }
+    // no critical edges; copies after IF can't happen
+    assert(fall || list_isempty(&rec->copies));
+    gen_copies(rec);
+    if(fall)
+    {
+        assert(alen(&block->succ) == 1);
+        gen_jump(block, aref(&block->succ, 0));
+    }
+}
+/*@
+
+%% input is typed where node.decl is nonnull.
+%% boxing/unboxing/conversions are explicit cnodes in the IR.
+%% SET is only present for globals. REF is present for globals and closed variables.
+%% cells have been introduced where necessary.
+%% mutable closed variables have been lifted to immutable closure slots.
+%% by the time we get here, all necessary conversions and checks (i.e. COPY nodes) will have been added.
+%%   (unboxing and fullcall still have runtime checks in the vm)
+
+
+\subsection{Fixups \& Copies}
+
+[[gen_fixups]] resolves forward references to the block with record
+[[rec]], writing the address of the block's first instruction to each
+[[fixup]] address. The list of [[.fixups]] is empty on return.
+
+==gen_fixups*/
+static void gen_fixups(gen_block_t *rec)
+{
+    gen_fixup_t *fixup;
+
+    slist_while_pop(rec->fixups, fixup, next)
+    {
+        asm_patch(fixup->addr, rec->addr);
+        xfree(fixup);
+    }
+}
+/*@
+
+[[gen_copies]] appends, in the requested order, the copies realising the
+[[PHI]] nodes in the successor of the block with record [[rec]]. The
+list of [[.copies]] is empty on return.
+
+==gen_copies*/
+static void gen_copies(gen_block_t *rec)
+{
+    gen_copy_t *copy;
+
+    list_while_entry(&rec->copies, copy, list)
+    {
+        list_remove(&copy->list);
+        gen_copy(copy->dest, copy->src, copy->type, copy->type);
+        xfree(copy);
+    }
+}
+/*@
+
+
+\subsection{Control Flow}
+
+==control flow*/
+//is_fallthrough//
+//gen_transfer//
+//gen_jump//
+/*@
+
+The [[gen_transfer]] function appends an instruction with opcode [[op]]
+to transfer control flow from the block currently under construction
+[[to]] another block in the same function.
+
+When [[op]] is a conditional branch, it will take an [[extra]] operand,
+emitted before the start address of the target block. If the latter is not
+yet known, a [[fixup]] for the address operand will be requested.
+
+==gen_transfer*/
+static void gen_transfer(op_code_t op, cblock_t *to, op_stack_t *extra)
+{
+    gen_block_t *rec = rec_for(to);
+
+    asm_op(op);
+    if(extra)
+        asm_stack(*extra);
+    asm_offset(rec->addr);
+    if(!rec->valid)
+    {
+        gen_fixup_t *fixup = xmalloc(sizeof(*fixup));
+
+        *fixup = (gen_fixup_t) {
+            .addr = asm_len() - sizeof(op_offset_t),
+            .next = NULL
+        };
+        slist_push(rec->fixups, fixup, next);
+    }
+}
+/*@
+
+[[gen_jump]] appends a [[jump]] instruction to unconditionally transfer
+control flow [[from]] the start of one block [[to]] the end of another,
+if necessary.
+
+==gen_jump*/
+static void gen_jump(cblock_t *from, cblock_t *to)
+{
+    if(!is_fallthrough(from, to))
+        gen_transfer(OP_jump, to, NULL);
+}
+/*@
+
+Control flow falls through block [[pred]] to reach [[succ]] if the
+latter immediately succeeds the former in the function's
+[[.cblock_head]] list, since code is generated in list order.
+
+==is_fallthrough*/
+static inline bool is_fallthrough(cblock_t *pred, cblock_t *succ)
+    { return pred->cblock_list.next == &succ->cblock_list; }
+/*@
+
+
+\section{Nodes}
+\label{gen_code:node}
+
+==nodes*/
+//const_index//
+//gen_literal//
+//gen_node_const//
+//gen_copy//
+//gen_node_copy//
+//gen_node_builtin//
+//gen_node_if//
+//gen_node_return//
+//call//
+//gen_closure//
+//gen_node_lambda//
+//variables//
+//gen_node//
+/*@
+
+[[gen_node]] invokes the appropriate function to generate bytecode for
+each [[.type]] of [[node]], returning [[true]] when control flow
+continues to the next instruction.
+
+==gen_node*/
+static bool gen_node(cblock_t *block, cnode_t *node)
+{
+    switch(node->type)
+    {
+    case CN_IF: return gen_node_if(node, block);
+    case CN_RETURN: return gen_node_return(node);
+    case CN_CALL: return gen_node_call_universal(node);
+    case CN_CALL_FAST: return gen_node_call_fast(node);
+    case CN_LAMBDA: return gen_node_lambda(node);
+    case CN_CONST: return gen_node_const(node);
+    case CN_SET: return gen_node_set(node);
+    case CN_REF: return gen_node_ref(node);
+    case CN_COPY: return gen_node_copy(node);
+    case CN_BUILTIN: return gen_node_builtin(node);
+    default: return true;
+    } /* NOTREACHED */
+}
+/*@
+
+[[CONST]] nodes generate [[literal]] instructions for unboxed scalar
+constants, and [[const]] instructions for all others. A constant in
+bytecode is referred to by its index in the function's constant pool.
+
+==gen_node_const*/
+static bool gen_node_const(cnode_t *node)
+{
+    assert(r_subtypep(r_typeof(node->constant), node->decl));
+    if(rtype_is_scalar(node->decl))
+    {
+        assert(r_typeof(node->constant) == node->decl);
+        gen_literal(loc_for(node), BOXPTR(node->constant),
+                    node->decl);
+    }
+    else
+    {
+        asm_op(OP_const);
+        asm_stack(loc_for(node));
+        asm_offset(const_index(node->constant));
+    }
+    return true;
+}
+/*@
+
+The source operand for a [[literal]] instruction, of given [[type]], is
+copied by [[gen_literal]] from memory at [[ptr]] into the instruction
+stream.
+
+==gen_literal*/
+static void gen_literal(op_stack_t dest, void *ptr, rtype_t *type)
+{
+    asm_op_width(OP_literal, type);
+    asm_stack(dest);
+    asm_literal(ptr, rtype_eltsz(type));
+}
+/*@
+
+[[const_index]] returns the index of the value [[val]] in the
+[[.consts]] array (ignoring the reserved indices); adding it if not
+found. User constants have been interned in the constant table
+(\autoref{compiler:int}) and constants used by the compiler are unique
+by construction, so pointer equality is equivalent to object equality.
+
+==const_index*/
+op_offset_t const_index(void *val)
+{
+    for(int i = ctx.nfuncs; i < alen(ctx.consts); i++)
+        if(aref(ctx.consts, i) == val)
+            return i;
+    array_push(ctx.consts, val);
+    return alen(ctx.consts) - 1;
+}
+/*@
+
+A [[COPY]] node may also convert the copied value from one type to another.
+
+==gen_node_copy*/
+static bool gen_node_copy(cnode_t *node)
+{
+    cnode_t *val = node->copy.value;
+
+    gen_copy(loc_for(node), loc_for(val),
+             type_for(node), type_for(val));
+    return true;
+}
+/*@
+
+The [[gen_copy]] function generates one or more instructions to copy a
+value of type [[stype]] from stack location [[src]] to [[dest]], after
+which it is to be regarded as having type [[dtype]].
+
+Equal types result in a [[mov]] instruction (operating on the requisite
+number of bytes). Scalar conversion is realised with a [[conv]]
+instruction. Converting an [[object]] to a scalar requires an [[unbox]]
+operation; the converse, allocation of a [[box]].
+
+A value of one reference type can be considered to have some other
+reference type when the former is a subtype of the latter. The [[check]]
+instruction ensures that this is the case, followed by a [[mov]] where
+necessary.
+
+==gen_copy*/
+static void gen_copy(op_stack_t dest, op_stack_t src,
+                     rtype_t *dtype, rtype_t *stype)
+{
+    if(dtype == stype)
+        asm_op_width(OP_mov, stype);
+    else if(rtype_is_scalar(dtype) && rtype_is_scalar(stype))
+        asm_op_conv(stype, dtype);
+    else if(rtype_is_scalar(dtype))
+        asm_op_type(OP_unbox, dtype);
+    else if(rtype_is_scalar(stype))
+        asm_op_type(OP_box, stype);
+    else
+    {
+        asm_op(OP_check);
+        asm_stack(src);
+        asm_offset(const_index(dtype));
+        if(src == dest)
+            return;
+        asm_op_width(OP_mov, r_type_object);
+    }
+    asm_stack(dest);
+    asm_stack(src);
+}
+/*@
+
+A [[BUILTIN]] node defers to the [[.generate_fn]] callback
+(\autoref{opt:builtin}) specified by the [[cbuiltin_t]]. This will
+invoke the [[asm]] helpers to generate the instruction or instructions
+that implement its functionality.
+
+==gen_node_builtin*/
+static bool gen_node_builtin(cnode_t *node)
+{
+    const cbuiltin_t *bi = node->builtin.bi;
+    assert(bi->ops && bi->ops->generate_fn);
+    bi->ops->generate_fn(node);
+    return true;
+}
+/*@
+
+An [[IF]] node generates an [[if]] instruction, which branches to the
+consequent block when the condition is [[true]]. When [[false]], control
+flow is transferred to the alternative block.
+
+(An obvious optimisation would be to reverse the sense of the condition
+-- possibly with a distinct [[ifnot]] instruction -- when that allows
+control to fall through without an extra [[jump]].)
+
+==gen_node_if*/
+static bool gen_node_if(cnode_t *node, cblock_t *block)
+{
+    op_stack_t cond = loc_for(node->ifelse.cond);
+
+    gen_transfer(OP_if, aref(&block->succ, 0), &cond);
+    gen_jump(block, aref(&block->succ, 1));
+    return false;
+}
+/*@
+
+A [[RETURN]] node generates a [[ret]] instruction.
+
+==gen_node_return*/
+static bool gen_node_return(cnode_t *node)
+{
+    asm_op(OP_ret);
+    asm_stack(loc_for(node->ret.value));
+    return false;
+}
+/*@
+
+The previous two node types handle control flow themselves, so they
+return [[false]] via [[gen_node]] to [[gen_block]].
+
+
+\subsection{Call}
+\label{gen_code:call}
+
+==call*/
+//gen_node_call_fast//
+//gen_arg_rest//
+//gen_arg_kwd//
+//gen_arg_pos//
+//gen_arg_omit//
+//gen_node_call_universal//
+/*@
+
+The sequence of instructions generated by a [[CALL_FAST]] node
+implements the fast call convention (\autoref{call:fast}). The
+[[target]] function's signature [[sig]] is known, and the actual
+arguments have already been matched to their formal counterparts
+(\autoref{opt_post:call}).
+
+The initial [[frame]] instruction clears a call frame atop the stack of
+size [[.argsz]] and copies, as the implicit first argument, the
+[[.argbits]] from the call [[node]]. Each actual argument is [[mov]]ed
+into place at the correct [[.offset]] (when not omitted.)
+
+This is inefficient when the values aren't live beyond the call -- the
+location allocator could be improved to also operate on outgoing
+arguments, at the cost of making [[frame]] explicit in the IR.
+
+A [[call_fast]] instruction invokes the [[target]] function; the
+following [[complete]] instruction places the value returned at the
+stack location [[dest]].
+
+==gen_node_call_fast*/
+static bool gen_node_call_fast(cnode_t *node)
+{
+    op_stack_t target = loc_for(node->call.target);
+    op_stack_t dest = loc_for(node);
+    funsig_t *sig = type_for(node->call.target)->sig;
+    int i;
+    assert(rtype_is_callable(type_for(node->call.target)));
+    assert(alen(&node->call.args) == sig->nargs);
+    assert((node->call.argbits & sig->reqbits) == sig->reqbits);
+
+    asm_op(OP_frame);
+    asm_offset(sig->argsz);
+    asm_literal(&node->call.argbits, sizeof(argbits_t));
+    array_foreach(&node->call.args, i)
+    {
+        cnode_t *arg = aref(&node->call.args, i);
+        op_stack_t ofs = sig->args[i].offset;
+
+        if(!arg)
+            continue;
+        gen_copy(ctx.loc_sz + ofs, loc_for(arg),
+                 type_for(arg), type_for(arg));
+    }
+    asm_op(OP_call_fast);
+    asm_stack(target);
+    asm_op_width(OP_complete, type_for(node));
+    asm_stack(dest);
+    return true;
+}
+/*@
+
+The instructions generated by a [[CALL]] node enact the universal call
+convention (\autoref{call:uni}). No properties of the [[target]]
+function are assumed; argument matching, type checking and conversion
+all occur during execution.
+
+A [[call_uni]] instruction invokes the [[target]] after forming the
+argument frame at run-time. Sub-operations to perform this task are
+emitted by the [[gen_arg]] callbacks under control of the
+[[call_sequence]] function (\autoref{call:match}); a [[call_end]] sub-op
+terminates the sequence.
+
+The following [[complete_box]] instruction places the value returned at
+the stack location [[dest]], boxing it first if the [[target]]'s
+signature indicates a scalar return type.
+
+==gen_node_call_universal*/
+static bool gen_node_call_universal(cnode_t *node)
+{
+    op_stack_t target = loc_for(node->call.target);
+    op_stack_t dest = loc_for(node);
+    cnode_t **args = adata(&node->call.args);
+    int nargs = alen(&node->call.args);
+    rsymbol_t **names = call_has_names(node)
+                      ? adata(&node->call.names)
+                      : NULL;
+
+    asm_op(OP_call_uni);
+    asm_stack(target);
+    call_sequence(NULL, (void **)args, names, nargs,
+                  gen_arg_rest, gen_arg_kwd, gen_arg_pos, gen_arg_omit);
+    asm_subop(OP_call_end);
+    asm_op(OP_complete_box);
+    asm_stack(target);
+    asm_stack(dest);
+    return true;
+}
+/*@
+
+The [[call_pos]] sub-op specifies a positional argument with actual
+value given by the node [[arg]].
+
+==gen_arg_pos*/
+static bool gen_arg_pos(void *ptr, void *arg)
+{
+    asm_subop(OP_call_pos);
+    asm_stack(loc_for(arg));
+    return true;
+}
+/*@
+
+The[[call_kwd]] sub-op specifies a named argument, with the
+[[name]] a constant symbol and the actual value given by [[arg]].
+
+==gen_arg_kwd*/
+static bool gen_arg_kwd(void *ptr, rsymbol_t *name, void *arg)
+{
+    op_offset_t idx = const_index(name);
+
+    asm_subop(OP_call_kwd);
+    asm_offset(idx);
+    asm_stack(loc_for(arg));
+    return true;
+}
+/*@
+
+The [[call_omit]] sub-op marks an omitted positional argument.
+
+==gen_arg_omit*/
+static bool gen_arg_omit(void *ptr)
+{
+    asm_subop(OP_call_omit);
+    return true;
+}
+/*@
+
+The [[call_rest]] sub-op passes the value of [[arg]] as the rest
+vector ``[[...]]'' to the callee.
+
+==gen_arg_rest*/
+static bool gen_arg_rest(void *ptr, void *arg)
+{
+    asm_subop(OP_call_rest);
+    asm_stack(loc_for(arg));
+    return true;
+}
+/*@
+
+
+\subsection{Lambda}
+
+If the child function [[fn]] defined by a [[LAMBDA]] node captures any
+values, a [[lambda]] instruction is generated. When executed, this will
+create a closure from the [[rfunction_t]] at the constant pool index
+corresponding to the child's [[.id]]. It's followed by a sequence of
+sub-operations, generated by [[gen_closure]], that copy the captured
+values into the closed environment.
+
+Otherwise, a [[const]] instruction retrieves the closure itself from the
+constant pool at the corresponding reserved index, where it was stashed
+by [[gen_child_function]].
+
+==gen_node_lambda*/
+static bool gen_node_lambda(cnode_t *node)
+{
+    cfunction_t *fn = node->lambda.function;
+    bool clo = cfunc_has_closure(fn);
+    int id = fn->id;
+    assert(alen(&node->lambda.closure) == alen(&fn->closure));
+    asm_op(clo ? OP_lambda : OP_const);
+    asm_stack(loc_for(node));
+    asm_offset(id);
+    if(clo)
+        gen_closure(node, fn);
+    return true;
+}
+/*@
+
+The values captured by the child function [[fn]] are copied into the
+closure with [[lambda_mov]] sub-ops in the same order as their offsets
+are computed in [[closure_env]]. This fills the closure in two phases;
+first with the scalars, then the pointers. The sequence is terminated
+with a [[lambda_end]].
+
+==gen_closure*/
+static void gen_closure(cnode_t *node, cfunction_t *fn)
+{
+    for(int j = 0; j <= 1; j++)
+    {
+        int i;
+
+        array_foreach(&fn->closure, i)
+        {
+            cnode_t *val = aref(&node->lambda.closure, i);
+            assert(val);
+            rtype_t *typ = type_for(val);
+
+            if(j == rtype_is_scalar(typ))
+                continue;
+            asm_subop(OP_lambda_mov8 + width_code(typ));
+            asm_stack(loc_for(val));
+        }
+    }
+    asm_subop(OP_lambda_end);
+}
+/*@
+
+
+\subsection{Variables}
+
+==variables*/
+//gen_setvar//
+//gen_node_set//
+//gen_getvar//
+//env_offset//
+//gen_node_ref//
+/*@
+
+By now, [[SET]] nodes can only refer to global variables.
+
+A [[GLOBAL_INT]] variable is defined by the node [[.intl.set]] -- at
+this point, a [[defvar]] instruction will, when executed, add it to the
+global environment; its name and declared type (if any) are specified by
+constants.
+
+A [[GLOBAL_EXT]] variable already exists in the global environment, but
+may or may not have a declared type.
+
+Either way, [[gen_setvar]] will generate an appropriate [[set]]
+instruction.
+
+==gen_node_set*/
+static bool gen_node_set(cnode_t *node)
+{
+    cvar_t *var = node->set.var;
+    assert(r_subtypep(decl_type(node->set.value->decl), decl_type(var->decl)));
+    switch(var->type)
+    {
+    case GLOBAL_INT:
+    {
+        bool is_def = var->intl.set == node;
+
+        if(is_def)
+        {
+            asm_op(OP_defvar);
+            asm_offset(const_index(var->name));
+            asm_offset(const_index(decl_type(var->decl)));
+        }
+        gen_setvar(var, node->set.value, true, is_def & var->is_const);
+        break;
+    }
+    case GLOBAL_EXT:
+    {
+        bool has_decl = var->extl.global ? (assert(var->extl.global->decl),true) : false;
+        gen_setvar(var, node->set.value, has_decl, false);
+        break;
+    }
+    default: assert(!"reached"); break; /* NOTREACHED */
+    }
+    return true;
+}
+/*@
+
+When [[has_decl]] is [[true]], the variable [[var]] has a declared type;
+it is assigned a value with the [[setvar]] instruction appropriate to
+its size. An undeclared variable uses the [[setvar_uni]] instruction
+instead.
+
+The assigned value is given by the node [[val]], the variable [[.name]]
+specified by a constant. If [[has_decl]], the extra operand [[is_def]]
+is [[true]] when this is the initialising definition of a constant
+variable. It will set the [[.is_const]] flag and prevent further updates
+(\autoref{rt:global}).
+
+==gen_setvar*/
+static void gen_setvar(cvar_t *var, cnode_t *val,
+                       bool has_decl, bool is_def)
+{
+    if(has_decl)
+        asm_op_width(OP_setvar, decl_type(var->decl));
+    else
+        asm_op(OP_setvar_uni);
+    asm_stack(loc_for(val));
+    asm_offset(const_index(var->name));
+    if(has_decl)
+        asm_offset(is_def);
+}
+/*@
+
+[[REF]] nodes may refer to globals or captured lexical variables.
+[[gen_getvar]] handles the former case; in the latter, the [[env]]
+instruction will extract the value of the variable [[var]] from the
+closed environment at the offset given by [[env_offset]].
+
+==gen_node_ref*/
+static bool gen_node_ref(cnode_t *node)
+{
+    cvar_t *var = node->ref.var;
+
+    switch(var->type)
+    {
+    case GLOBAL_INT:
+        gen_getvar(var, node, true);
+        break;
+    case GLOBAL_EXT:
+        gen_getvar(var, node, var->extl.global);
+        break;
+    default:
+        asm_op_width(OP_env, type_for(node));
+        asm_stack(loc_for(node));
+        asm_offset(env_offset(var));
+        break;
+    }
+    return true;
+}
+/*@
+
+The elements of the [[.env_ofs]] array, the function's [[LAMBDA]] node's
+[[.closure]] array, and so the function's [[.closure]] array, are in the
+same order. The index of the variable [[var]] in the last is thus the
+index in the first at which its offset is stored.
+
+==env_offset*/
+static inline op_offset_t env_offset(cvar_t *var)
+    { return ctx.env_ofs[index_of_var(ctx.closure, var)]; }
+/*@
+
+Again, [[has_decl]] is [[true]] if the global variable [[var]] was
+declared; if so, the appropriate [[getvar]] instruction will be
+generated. An undeclared global will generate the [[getvar_uni]]
+instruction instead. Again, the [[.name]] is specified by a constant.
+
+==gen_getvar*/
+static void gen_getvar(cvar_t *var, cnode_t *node, bool has_decl)
+{
+    if(has_decl)
+        asm_op_width(OP_getvar, type_for(node));
+    else
+        asm_op(OP_getvar_uni);
+    asm_stack(loc_for(node));
+    asm_offset(const_index(var->name));
+}
+/*@
+
+
+\section*{Miscellanea}
+
+==includes*/
+#include "global.h"
+#include "ir.h"
+#include "opt.h"
+#include "vm/vm_ops.h"
+#include "gen.h"
+#include "gen_range.h"
+#include "gen_code.h"
+void gen_un_ssa(cfunction_t *fn, op_offset_t temploc); // HACK
+/*@
+
+==gen_code.h*/
+//gen_copy_t//
+//gen_fixup_t//
+//gen_block_t//
+//gen_ctx_t//
+//externs//
+//context helpers//
+//asm_len//
+//asm_extend//
+//asm_literal//
+//asm_op//
+//asm_stack//
+//asm_offset//
+//width_code//
+//asm_op_width//
+//asm_op_type//
+//asm_op_conv//
+//asm_args//
+//asm_patch//
+op_offset_t const_index(void *val);
+void asm_dump(cfunction_t *fn, op_code_array_t *code, robject_array_t *consts); // DEBUG
+/*@
+
+==externs*/
+extern gen_ctx_t ctx;
+/*@
+
+% */
