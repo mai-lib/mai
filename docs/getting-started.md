@@ -68,3 +68,10 @@ changes them:
 An option takes effect for code compiled after the call. Code in the same
 file was compiled before the call ran, so use `include` or `source()` to
 see its effect, as in the IR dump example in [Internals](internals.md).
+
+## From R and Python
+
+- [rmai](https://mai-lib.github.io/rmai/) runs mai from R, passes R vectors
+  and arrays in and out, and adds `{mai}` chunks to R Markdown and Quarto.
+- [pymai](../python/README.md) runs mai inside Python with numpy arrays in
+  and out, and adds a `%%mai` cell magic for Jupyter.
