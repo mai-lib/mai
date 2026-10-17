@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 300" width="880" height="300" font-family="Helvetica, Arial, sans-serif">
+  <title>mai compilation pipeline</title>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#52514e"/>
+    </marker>
+  </defs>
+  <rect width="880" height="300" fill="#fcfcfb"/>
+  <g font-size="14" fill="#0b0b0b">
+    <text x="100" y="14" font-size="13" fill="#52514e">COMPILER (thesis part I)</text>
+
+    <rect x="20" y="45" width="120" height="64" rx="6" fill="#eaf2fc" stroke="#2a78d6"/>
+    <text x="80" y="72" text-anchor="middle">Parser</text>
+    <text x="80" y="92" text-anchor="middle" font-size="11" fill="#52514e">ch. 4: text to AST</text>
+
+    <rect x="170" y="45" width="140" height="64" rx="6" fill="#eaf2fc" stroke="#2a78d6"/>
+    <text x="240" y="72" text-anchor="middle">SSA conversion</text>
+    <text x="240" y="92" text-anchor="middle" font-size="11" fill="#52514e">ch. 5 to 9: AST to SSA IR</text>
+
+    <rect x="340" y="45" width="190" height="64" rx="6" fill="#eaf2fc" stroke="#2a78d6"/>
+    <text x="435" y="72" text-anchor="middle">Optimisation</text>
+    <text x="435" y="92" text-anchor="middle" font-size="11" fill="#52514e">ch. 10 to 14: types, inlining, DVN</text>
+
+    <rect x="560" y="45" width="190" height="64" rx="6" fill="#eaf2fc" stroke="#2a78d6"/>
+    <text x="655" y="72" text-anchor="middle">Code generation</text>
+    <text x="655" y="92" text-anchor="middle" font-size="11" fill="#52514e">ch. 15 to 18: IR to bytecode</text>
+
+    <line x1="140" y1="77" x2="168" y2="77" stroke="#52514e" stroke-width="1.5" marker-end="url(#a)"/>
+    <line x1="310" y1="77" x2="338" y2="77" stroke="#52514e" stroke-width="1.5" marker-end="url(#a)"/>
+    <line x1="530" y1="77" x2="558" y2="77" stroke="#52514e" stroke-width="1.5" marker-end="url(#a)"/>
+    <path d="M655,109 L655,150" stroke="#52514e" stroke-width="1.5" fill="none" marker-end="url(#a)"/>
+
+    <text x="20" y="175" font-size="13" fill="#52514e">RUN-TIME ENVIRONMENT (thesis part II)</text>
+
+    <rect x="560" y="152" width="190" height="64" rx="6" fill="#fdf0ea" stroke="#eb6834"/>
+    <text x="655" y="179" text-anchor="middle">Virtual machine</text>
+    <text x="655" y="199" text-anchor="middle" font-size="11" fill="#52514e">ch. 26: direct-threaded</text>
+
+    <rect x="20" y="190" width="500" height="90" rx="6" fill="#fdf0ea" stroke="#eb6834"/>
+    <text x="270" y="215" text-anchor="middle">Run-time library</text>
+    <text x="270" y="238" text-anchor="middle" font-size="11" fill="#52514e">ch. 19 to 25: types, functions and closures, calling convention,</text>
+    <text x="270" y="255" text-anchor="middle" font-size="11" fill="#52514e">scalars, vectors and arrays, garbage-collected heap, built-ins</text>
+
+    <line x1="560" y1="200" x2="522" y2="220" stroke="#52514e" stroke-width="1.5" marker-end="url(#a)"/>
+    <path d="M750,184 C845,184 845,20 700,20 L80,20 L80,42" stroke="#52514e" stroke-width="1.2" stroke-dasharray="4 4" fill="none" marker-end="url(#a)"/>
+    <text x="808" y="136" font-size="11" fill="#52514e" text-anchor="end">source(), REPL</text>
+  </g>
+</svg>
