@@ -315,6 +315,7 @@ typedef struct
 #include <time.h>
 #include <sys/resource.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 
 static void builtin_rm(vm_ctx_t *vm, rbuiltin_t *fn, uint8_t *args, void *r)
 {
@@ -579,6 +580,74 @@ static void builtin_assert(vm_ctx_t *vm, rbuiltin_t *fn,
     builtin_return(r, robject_t *, NULL);
 }
 
+// raw binary vector I/O, so other programs (e.g. R) can exchange data with
+// mai without going through text. elements are written in native byte
+// order: int as 32-bit, double as 64-bit IEEE, boolean as one byte.
+static rtype_t *io_vec_type(rtype_t *etyp)
+{
+    if(etyp == r_type_double)
+        return r_type_vec_double;
+    if(etyp == r_type_int)
+        return r_type_vec_int;
+    if(etyp == r_type_boolean)
+        return r_type_vec_boolean;
+    return NULL;
+}
+
+static void builtin_read_vec(vm_ctx_t *vm, rbuiltin_t *fn,
+                             uint8_t *args, void *r)
+{
+    def_args {
+        rstring_t *file;
+        rtype_t *etyp;
+    } end_args(args, a);
+    rtype_t *vtyp = a->etyp ? io_vec_type(a->etyp) : NULL;
+    struct stat sbuf;
+    FILE *fp;
+
+    if(!a->file || !vtyp)
+        vm_error(vm, "read_vec", "invalid argument.");
+    size_t eltsz = rtype_eltsz(a->etyp);
+    if(stat(a->file->string, &sbuf) < 0 || !(fp = fopen(a->file->string, "rb")))
+        vm_error(vm, "read_vec", "can't open `%s`.", a->file->string);
+    if(sbuf.st_size % eltsz || sbuf.st_size / eltsz > INT_MAX)
+    {
+        fclose(fp);
+        vm_error(vm, "read_vec", "size of `%s` is not a whole number "
+                 "of elements.", a->file->string);
+    }
+    size_t n = sbuf.st_size / eltsz;
+    rvector_t *vec = rvec_create(vtyp, n);
+    size_t got = fread(rvec_elts(vec), eltsz, n, fp);
+    fclose(fp);
+    if(got != n)
+        vm_error(vm, "read_vec", "error reading `%s`.", a->file->string);
+    builtin_return(r, rvector_t *, vec);
+}
+
+static void builtin_write_vec(vm_ctx_t *vm, rbuiltin_t *fn,
+                              uint8_t *args, void *r)
+{
+    def_args {
+        robject_t *x;
+        rstring_t *file;
+    } end_args(args, a);
+    rtype_t *typ = a->x ? r_typeof(a->x) : NULL;
+    FILE *fp;
+
+    if(!a->file || !typ || !rtype_is_container(typ)
+       || !io_vec_type(typ->elt))
+        vm_error(vm, "write_vec", "invalid argument.");
+    rbuf_t *buf = (rbuf_t *)a->x;
+    size_t eltsz = rtype_eltsz(typ->elt);
+    if(!(fp = fopen(a->file->string, "wb")))
+        vm_error(vm, "write_vec", "can't open `%s`.", a->file->string);
+    size_t put = fwrite(buf->elts, eltsz, buf->length, fp);
+    if(fclose(fp) != 0 || put != (size_t)buf->length)
+        vm_error(vm, "write_vec", "error writing `%s`.", a->file->string);
+    builtin_return(r, rint_t, buf->length);
+}
+
 const builtin_init_t runtime_builtins[] = {
     defbuiltin("rm", builtin_rm, &r_type_boolean,
                { "name", &r_type_symbol }),
@@ -629,6 +698,12 @@ const builtin_init_t runtime_builtins[] = {
                { "message", &r_type_string }),
     defbuiltin("assert", builtin_assert, &r_type_object,
                { "expr", &r_type_boolean }),
+    defbuiltin("read_vec", builtin_read_vec, &r_type_vector,
+               { "file", &r_type_string },
+               { "type", &r_type_type }),
+    defbuiltin("write_vec", builtin_write_vec, &r_type_int,
+               { "x", &r_type_object },
+               { "file", &r_type_string }),
     { }
 };
 /*@ %
