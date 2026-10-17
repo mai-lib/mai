@@ -1,0 +1,12 @@
+# default and named arguments, closures, type annotations
+f = function(x, y = 2) x * y
+print(f(3))
+print(f(3, y = 4))
+counter = function() { var n = 0; function() { n = n + 1; n } }
+c1 = counter()
+c1()
+print(c1())
+const sq = function(double x) : double x * x
+print(sq(1.5))
+const apply_twice = function(function g, x) g(g(x))
+print(apply_twice(function(z) z + 10, 1))

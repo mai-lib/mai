@@ -1,0 +1,45 @@
+# a small, deterministic version of the section 1.2.1 regression example
+const dotprod = function(x, y) sum(x * y)
+const norm = function(x) sqrt(dotprod(x, x))
+const colscl = function(a, x) a * x
+const colswp = function(y, a, x) y - a * x
+const ncol = function(array x) : int { shape(x)[2] }
+const diag = function(int n) : array(double) {
+    let array(double) a = array(type(double), vec(n,n), 0.0)
+    for(int i=1; i <= n; i = i + 1)
+        a[i,i] = 1.0
+    return a
+}
+const reg = function(array(double) X, vector(double) y,
+                     double eps = 1e-7) : list
+{
+    var p = ncol(X), R = diag(p),
+        b = dbl(p), xnorm = dbl(p), s = 0.0
+    for(int j = 1; j <= p; j = j+1)
+        xnorm[j] = norm(X[,j])
+    for(int j = 1; j <= p; j = j+1) {
+        s = norm(X[,j])
+        if (s/xnorm[j] < eps)
+            stop("singular X matrix")
+        s = 1/s
+        X[,j] = colscl(s, X[,j])
+        R[,j] = colscl(s, R[,j])
+        if (j < p) {
+            for(int k = j+1; k <= p; k = k+1) {
+                s = dotprod(X[,j], X[,k])
+                X[,k] = colswp(X[,k], s, X[,j])
+                R[,k] = colswp(R[,k], s, R[,j])
+            }
+        }
+        s = dotprod(X[,j], y)
+        y = colswp(y, s, X[,j])
+        b = colswp(b, -s, R[,j])
+    }
+    vec(Q = X, residuals = y, Rinv = R, coeff = b)
+}
+n = 8
+X = array(type(double), vec(n, 2), 1.0)
+X[, 2] = 1.0 * 1:n
+y = 2 + 3 * X[, 2]
+fit = reg(X, y)
+print(fit[4])

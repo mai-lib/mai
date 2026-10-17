@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # x86-64 Linux is the platform the thesis targeted; arm64 Linux is being
+    # tried out and is allowed to fail for now. macOS is not built yet: the
+    # runtime includes glibc's <mcheck.h> and valgrind's client header.
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            experimental: false
+          - os: ubuntu-24.04-arm
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y bison m4 libreadline-dev valgrind
+
+      - name: Build (portable, no -march=native)
+        run: make build CTUNE=
+
+      - name: Smoke tests
+        run: ./tests/run.sh build/main

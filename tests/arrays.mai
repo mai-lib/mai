@@ -1,0 +1,8 @@
+# arrays, shape and column assignment
+m = array(type(double), vec(2, 3), 0.0)
+m[1, 2] = 5.0
+m[, 3] = 7.0
+print(m)
+print(shape(m))
+const ncol = function(array x) : int { shape(x)[2] }
+print(ncol(m))

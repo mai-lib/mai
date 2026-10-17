@@ -1,0 +1,2 @@
+# stop() reports its message
+stop("expected failure")

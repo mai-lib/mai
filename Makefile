@@ -15,7 +15,7 @@ DOC ?= final
 # XXX could remove this, at the cost of lifting the includes and build target above all
 .DEFAULT_GOAL := build
 
-.PHONY: all doc build $(admin)
+.PHONY: all doc build check $(admin)
 .SECONDARY: $(out).bbl
 
 all: build doc
@@ -73,6 +73,10 @@ $(out).pdf: $(out).tex $(texs) $(bib).bib config.tex.inc vers.tex.inc
 	$(call echo,"WEAVE","$<")
 	$(call remarkup,$<) | noweave -latex -delay -filter ./esc-und.sh > $@
 
+# mai: a git checkout does not preserve mtimes, so the .nw files can look
+# newer than the sources and dependency fragments extracted from them. Only
+# re-extract when noweb is installed; otherwise use the shipped src/ and deps/.
+ifneq (,$(shell command -v notangle 2>/dev/null))
 # code from noweb
 $(srcdir)/%:
 # make sure some dep rule has given us a prereq; can probably be
@@ -89,6 +93,7 @@ $(depdir)/%.e: %.nw
 	$(call echo,"SRCDEPS","$<")
 	$(call mkoutdir)
 	$(call mknwdeps,$<,$@)
+endif
 
 
 # -L'#line %L "%F"%N'
@@ -103,6 +108,10 @@ endif
 # extract sources and run build
 build: $(sources)
 	$(MAKE) -f Build.mk
+
+# mai: run the smoke tests in tests/
+check: build
+	./tests/run.sh $(builddir)/main
 
 # bootstrap sources from a designated file
 #bootsrcs := (shell $(call nwchunks,$(boot)))
