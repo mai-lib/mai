@@ -1,0 +1,23 @@
+int
+double
+vector(int)
+boolean
+symbol
+3
+3.5
+NA
+2147483648.0
+5.0
+vector(double) [3]
+[1] 1.0 2.0 3.0
+3
+vector(double) [3]
+[1] 1.0 2.0 3.0
+55
+vector(double) [3]
+[1] 1.0  NA 3.0
+vector(boolean) [3]
+[1] false  true false
+NA
+
+<nil>

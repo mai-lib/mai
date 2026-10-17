@@ -1,6 +1,6 @@
 #!/bin/sh
-# Run each tests/*.mai script and compare its output with the matching .out
-# file. The interpreter exits 0 even on errors, so output is the oracle.
+# Run each tests/*.mai and examples/*.mai script and compare its output with
+# the matching .out file. The interpreter exits 0 even on errors, so output is the oracle.
 # usage: tests/run.sh [path/to/main]   (default build/main)
 # set MAI_UPDATE=1 to regenerate the .out files instead of comparing.
 
@@ -12,10 +12,10 @@ to=""
 command -v timeout > /dev/null 2>&1 && to="timeout 60"
 pass=0
 fail=0
-for t in "$dir"/*.mai; do
+for t in "$dir"/*.mai "$dir"/../examples/*.mai; do
     exp="${t%.mai}.out"
     name=$(basename "$t")
-    got=$(cd "$dir" && $to "$bin" "$name" 2>&1)
+    got=$(cd "$(dirname "$t")" && $to "$bin" "$name" 2>&1)
     if [ -n "$MAI_UPDATE" ]; then
         printf '%s\n' "$got" > "$exp"
         echo "updated $name"

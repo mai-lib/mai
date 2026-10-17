@@ -1,0 +1,13 @@
+# Newton's method for square roots, with a while loop and a tolerance.
+
+const newton_sqrt = function(double a, double tol = 1e-12) : double {
+    var x = a
+    while(abs_diff(x * x, a) > tol)
+        x = 0.5 * (x + a / x)
+    x
+}
+const abs_diff = function(double p, double q) : double if(p > q) p - q else q - p
+
+print(newton_sqrt(2.0))
+print(sqrt(2.0))
+print(newton_sqrt(1e6))

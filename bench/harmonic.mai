@@ -1,0 +1,8 @@
+# scalar loop: sum of 1/i for i = 1..n
+const harmonic = function(int n) : double {
+    var s = 0.0
+    for(int i = 1; i <= n; i = i + 1)
+        s = s + 1.0 / i
+    s
+}
+const run = function() harmonic(10000000)

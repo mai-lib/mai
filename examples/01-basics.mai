@@ -1,0 +1,30 @@
+# Basics: scalars, vectors, and printing.
+# A script prints only what you print(), plus the value of its last expression.
+
+x = 42                  # an int scalar
+y = 2.5                 # a double scalar
+print(x * y)
+
+v = 1:10                # an integer vector
+print(v)
+print(v * 2.5)          # arithmetic is element-wise and promotes int -> double
+print(sum(v))
+print(length(v))
+print(v[3])             # 1-based indexing, as in R
+print(v[2:4])
+print(v > 5)            # comparison gives a boolean vector
+print(any(v > 9))
+print(all(v > 0))
+
+w = vec(1.5, 2.5, 3.5)  # vec() is the closest thing to R's c()
+print(w)
+named = vec(a = 1, b = 2, c = 3)
+print(named)
+print(names(named))
+
+z = dbl(3)              # zero-filled storage: dbl(n), int(n), bool(n)
+z[2] = 9.0
+print(z)
+
+print("strings are scalars too")
+print(true && !false)   # logical constants are true and false
