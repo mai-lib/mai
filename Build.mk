@@ -2,16 +2,28 @@ include files.mk
 include defs.mk
 include config.mk
 
-.PHONY: all
+.PHONY: all lib
 
 # don't delete sources or headers if they happen to be intermediates
 .SECONDARY: $(srcs) $(hdrs)
 
 all: $(outbin)
 
-$(outbin): $(objs)
+$(outbin): $(binobjs)
 	$(call echo,"LINK","$@")
 	$(LINK.o) $^ $(LOADLIBES) $(LDLIBS) -o $@
+
+# mai: the embedding library, shared and static
+lib: $(outlib) $(outarc)
+
+$(outlib): $(libobjs)
+	$(call echo,"LINK","$@")
+	$(LINK.o) -shared $^ $(LOADLIBES) $(LDLIBS) -o $@
+
+$(outarc): $(libobjs)
+	$(call echo,"AR","$@")
+	rm -f $@
+	$(AR) rcs $@ $^
 
 # objdeps from source
 # all headers as prereqs, so it picks up correct paths

@@ -135,6 +135,20 @@ int p_source(char *name, ast_t *result)
         r = -errno;
     return r;
 }
+int p_string(const char *code, ast_t *result)
+{
+    int r;
+    FILE *fp = fmemopen((void *)code, strlen(code), "r");
+
+    if(fp)
+    {
+        r = p_file(fp, result);
+        fclose(fp);
+    }
+    else
+        r = -errno;
+    return r;
+}
 void yyerror(pctx_t *ctx, const char *err)
 {
     c_error("%s", err);

@@ -15,7 +15,7 @@ DOC ?= final
 # XXX could remove this, at the cost of lifting the includes and build target above all
 .DEFAULT_GOAL := build
 
-.PHONY: all doc build check $(admin)
+.PHONY: all doc build lib check $(admin)
 .SECONDARY: $(out).bbl
 
 all: build doc
@@ -109,9 +109,14 @@ endif
 build: $(sources)
 	$(MAKE) -f Build.mk
 
-# mai: run the smoke tests in tests/
-check: build
+# mai: the embedding library, build/libmai.so and build/libmai.a
+lib: $(sources)
+	$(MAKE) -f Build.mk lib
+
+# mai: run the smoke tests in tests/, and the embedding test
+check: build lib
 	./tests/run.sh $(builddir)/main
+	./tests/embed/run.sh $(builddir)
 
 # bootstrap sources from a designated file
 #bootsrcs := (shell $(call nwchunks,$(boot)))

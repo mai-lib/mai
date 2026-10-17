@@ -11,6 +11,7 @@ to bytecode for a fast virtual machine.
 | [Differences from R](differences-from-r.md) | What an R user trips over first, in one table |
 | [Built-in functions](builtins.md) | Every built-in, grouped by purpose |
 | [Performance](performance.md) | Benchmarks against R, and how to reproduce them |
+| [Embedding](embedding.md) | Run mai from C, R or Python through `libmai` and `mai.h` |
 | [Internals](internals.md) | How the compiler and VM fit together, and where each part lives in the thesis |
 
 Worked examples live in [`../examples`](../examples). Each `.mai` script has

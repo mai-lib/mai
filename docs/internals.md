@@ -89,6 +89,7 @@ together. `src/` is the code extracted from them.
 | 24 Vectors and Arrays | `vector.nw` | `src/rt/vector.c` |
 | 25 Memory Management | `gc.nw` | `src/rt/gc.c` |
 | 26 Virtual Machine | `vm.nw` | `src/vm/` |
+| Embedding (new) | `embed.nw` | `src/embed.c`, `src/mai.h` |
 | Appendices | `rt.nw`, `arith.nw`, `hash.nw`, `util.nw`, `debug.nw` | built-ins, options, maths library and RNG in `src/rt/`; M4-generated arithmetic kernels in `src/arith/`; hash tables and utilities |
 
 ## Changing the code

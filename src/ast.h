@@ -26,4 +26,5 @@ static inline bool ast_is_omitted(ast_t *ast)
 void ast_fini(ast_t *ast);
 const char *ast_str(ast_t *ast);
 int p_source(char *name, ast_t *ast);
+int p_string(const char *code, ast_t *ast);
 int p_readline(char *p1, char *p2, ast_t *result);

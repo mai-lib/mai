@@ -32,3 +32,6 @@ jobs:
 
       - name: Smoke tests
         run: ./tests/run.sh build/main
+
+      - name: Embedding library
+        run: make lib CTUNE= && ./tests/embed/run.sh build

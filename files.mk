@@ -21,6 +21,9 @@ bib := writeup
 
 # outputs
 outbin := $(builddir)/main
+# mai: the embedding library (embed.nw); see docs/embedding.md
+outlib := $(builddir)/libmai.so
+outarc := $(builddir)/libmai.a
 outdoc := $(root:%.nw=%.pdf)
 out := $(root:%.nw=%)
 
@@ -36,3 +39,6 @@ hdrs += $(call srcfilt,%.h.in,%.h)
 hdrs += $(call srcfilt,%.y,%.h)
 # all object files
 objs = $(srcs:$(srcdir)/%.c=$(builddir)/%.o)
+# mai: the executable has its own driver, the library its own embedding layer
+binobjs = $(filter-out $(builddir)/embed.o,$(objs))
+libobjs = $(filter-out $(builddir)/main.o,$(objs))

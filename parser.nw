@@ -1341,6 +1341,7 @@ functions is the purpose of the [[parser.c]] module.
 //p_readline//
 //p_file//
 //p_source//
+//p_string//
 //yyerror//
 /*@
 
@@ -1477,6 +1478,26 @@ int p_source(char *name, ast_t *result)
 {
     int r;
     FILE *fp = fopen(name, "r");
+
+    if(fp)
+    {
+        r = p_file(fp, result);
+        fclose(fp);
+    }
+    else
+        r = -errno;
+    return r;
+}
+/*@ %
+
+[[p_string]] parses a string held in memory, for programs that embed
+mai rather than run it from a file (see \autoref{embed}).
+
+==p_string*/
+int p_string(const char *code, ast_t *result)
+{
+    int r;
+    FILE *fp = fmemopen((void *)code, strlen(code), "r");
 
     if(fp)
     {
@@ -1632,6 +1653,7 @@ const int tok_empty = YYEMPTY;
 void ast_fini(ast_t *ast);
 const char *ast_str(ast_t *ast);
 int p_source(char *name, ast_t *ast);
+int p_string(const char *code, ast_t *ast);
 int p_readline(char *p1, char *p2, ast_t *result);
 /*@ %
 

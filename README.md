@@ -64,6 +64,9 @@ build/main script.mai    # run a file and print the value of its last expression
 build/main               # start the interactive REPL
 ```
 
+To run mai from another program, `make lib` builds `build/libmai.so` and
+`build/libmai.a`; see [Embedding](docs/embedding.md).
+
 When it starts without a file, the REPL loads `~/.maininit` if it exists
 (override this with the `INITFILE` environment variable).
 
@@ -113,7 +116,7 @@ numbers.
 | `src/` | C, Bison and M4 sources extracted from the `.nw` files |
 | `deps/` | generated dependency fragments so that `make build` works without noweb |
 | `Makefile`, `*.mk` | the original build system |
-| `tests/` | smoke tests: `*.mai` scripts with expected `*.out` output |
+| `tests/` | smoke tests: `*.mai` scripts with expected `*.out` output, and `tests/embed` for the library |
 | `examples/` | worked examples, each with its expected output (also run by `make check`) |
 | `docs/` | the documentation |
 | `bench/` | benchmarks against R |
