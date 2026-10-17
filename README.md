@@ -31,12 +31,13 @@ is easy to find, build, document and extend.
 
 ## Build
 
-You need a C11 compiler (GCC or Clang), GNU Bison 3, GNU M4, sed and GNU
-readline.
+You need Linux with glibc, a C11 compiler (GCC or Clang), GNU Bison 3, GNU
+M4, sed, GNU readline, and the valgrind headers (the garbage collector
+annotates memory for valgrind).
 
 ```sh
 # Debian / Ubuntu
-sudo apt-get install build-essential bison m4 libreadline-dev
+sudo apt-get install build-essential bison m4 libreadline-dev valgrind
 
 make build          # produces build/main
 make check          # runs the smoke tests in tests/
@@ -50,8 +51,11 @@ architecture, use:
 make build CTUNE=
 ```
 
-x86-64 Linux is the tested platform. Linux arm64 and macOS are tried in CI
-but are not yet expected to work.
+x86-64 Linux is the tested platform. Linux arm64 is tried in CI. macOS does
+not build yet, because the runtime includes glibc's `<mcheck.h>`.
+
+You don't need noweb to build. If it is installed, `make` re-extracts `src/`
+from the `.nw` files whenever they look newer.
 
 ## Use
 
